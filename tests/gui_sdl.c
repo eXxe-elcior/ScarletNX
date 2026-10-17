@@ -334,6 +334,16 @@ static void launcher(App* app, bool on) {
     assert(gui_settings_set(&app->settings, "libgccjit", on && SNX_GUI_HAS_GCCJIT ? "on" : "off"));
     assert(gui_settings_set(&app->settings, "gdbstub", on ? "on" : "off"));
 }
+/* the focus on the game of Games named name, its page shown */
+static void focus_game(App* app, const char* name) {
+    size_t i = 0;
+    list_games(app);
+    layout(app);
+    while (i < app->games.count && strcmp(app->games.names[i], name)) ++i;
+    assert(i < app->games.count && app->browser.page_size);
+    app->browser.page = i / app->browser.page_size;
+    app->browser.selected = app->browser.head + i % app->browser.page_size;
+}
 static void finish(App* app, int status) {
     assert(app->menu.running && !app->finished && !app->aborting && !app->abnormal_exit);
     int selected = app->menu.selected;
@@ -859,6 +869,13 @@ int main(int argc, char** argv) {
         puts("Recompiling picked folders\nScarletNX - picked folders");
         return 0;
     }
+    if (argc > 2 && !strcmp(argv[1], "-r") && strstr(argv[2], "room dump")) { /* R's, its room asked: not played */
+        int i = 3;
+        if (SNX_GUI_HAS_GCCJIT) assert(!strcmp(argv[i++], "--backend=gcc"));
+        assert(i + 2 == argc && !strcmp(argv[i], "--repo") && argv[i + 1][0]);
+        puts("Recompiling room dump");
+        return 0;
+    }
     if (argc > 1 && strstr(argv[1], "room dump")) { /* asked about its room first */
         int i = 2;
         char* folder = snx_dirname(argv[1]);
@@ -878,6 +895,20 @@ int main(int argc, char** argv) {
         assert(!strcmp(argv[i++], "-S") && !strcmp(argv[i++], "-s"));
         assert(!strcmp(argv[i++], "--repo") && argv[i++][0] && i == argc);
         puts("Recompiling option flags\nScarletNX - option flags"); /* the runner's banner: now loading */
+        return 0;
+    }
+    if (argc > 2 && !strcmp(argv[1], "-r") && strstr(argv[2], "folder game")) { /* R on it: recompiled, not played */
+        int i = 3;
+        assert(strstr(argv[0], "runtime") && snx_is_file(argv[2]));
+        if (SNX_GUI_HAS_GCCJIT) assert(!strcmp(argv[i++], "--backend=gcc"));
+        assert(i + 2 == argc && !strcmp(argv[i], "--repo") && argv[i + 1][0]);
+        puts("Recompiling folder game (1 modules)\nBuilt folder game");
+        return 0;
+    }
+    if (argc > 1 && strstr(argv[1], "folder game")) { /* a game in a folder of its own, through the menu's driver */
+        assert(strstr(argv[0], "runtime") && argc == 6 && snx_is_file(argv[1]) && !strcmp(argv[2], "--fullscreen=1") &&
+               !strcmp(argv[3], "--controls=0") && !strcmp(argv[4], "--repo") && argv[5][0]);
+        puts("Recompiling folder game (1 modules)\nBuilt folder game\nScarletNX - folder game");
         return 0;
     }
     if (argc > 1) {
@@ -1393,7 +1424,7 @@ int main(int argc, char** argv) {
     key(&app, SDLK_RETURN);
     assert(app.form == GUI_FORM_APP && app.editor.row == GUI_APP_THEME && GUI_APP_ROWS == 6);
     {
-        char first[64], line[96];
+        char first[64], line[1024];
         snprintf(first, sizeof first, "%s", app.theme.name);
         render(&app);
         shows(&app, "- App", yellow); /* the group open, as focused while its rows have the focus */
@@ -1401,7 +1432,28 @@ int main(int argc, char** argv) {
         shows(&app, line, yellow);
         shows(&app, "- Text size          Auto", normal);
         shows(&app, "- Theme editor", normal);
+        /* under the rows, the three folders Folders moves, whole: the extractions too */
         shows(&app, "- Folders            Defaults", normal);
+        shows(&app, "Extractions:", rgb(app.theme.soft));
+        { /* out of the data folder, as XDG's cache has them: without XDG (Windows) they are in it and read work/ */
+            char *games = app.games_dir, *work = app.work_dir;
+            app.work_dir = snx_path_join(temporary, "extractions");
+            app_values(&app);
+            snprintf(line, sizeof line, "Data: %s  Games: %s  Extractions: %s", app.data_dir, app.games_dir,
+                     app.work_dir);
+            assert(!strcmp(app.places_note, line));
+            /* one in the data folder, from it: the note stays short on a phone, whose data folder is a long path */
+            app.games_dir = snx_path_join(app.data_dir, "games");
+            app_values(&app);
+            snprintf(line, sizeof line, "Data: %s  Games: games%c  Extractions: %s", app.data_dir,
+                     app.games_dir[strlen(app.data_dir)], app.work_dir);
+            assert(!strcmp(app.places_note, line));
+            free(app.games_dir);
+            free(app.work_dir);
+            app.games_dir = games;
+            app.work_dir = work;
+            app_values(&app);
+        }
         shows(&app, "- Clean old settings", normal);
         hides(&app, "- Layout", normal);
         key(&app, SDLK_RIGHT);
@@ -1562,7 +1614,7 @@ int main(int argc, char** argv) {
        (SDL_FILE_DIALOG_DRIVER=none); Del or Enter twice takes one off, the folder staying */
     key(&app, SDLK_DOWN);
     render(&app);
-    shows(&app, "- Game folders       games/", yellow);
+    shows(&app, "- Library            games/", yellow);
     key(&app, SDLK_RETURN);
     assert(app.form == GUI_FORM_FOLDERS && gui_editor_rows(&app.editor) == 2 && app.editor.row == 0);
     /* Back over the rows, for a click or a finger: it does what ESC does, back on the App's row; the groups' list has
@@ -1607,7 +1659,7 @@ int main(int argc, char** argv) {
         assert(!snx_mkdirs(more) && !snx_write_file(file, "fixture", 7));
         kept_as = snx_absolute(more); /* as the system writes the folder once it is there: backslashes on Windows */
         render(&app);
-        shows(&app, "Game folders", normal);
+        shows(&app, "Library", normal);
         shows(&app, "The data folder's", normal);
         snprintf(line, sizeof line, "- %.20s", app.games_dir);
         shows(&app, line, yellow);
@@ -1797,6 +1849,8 @@ int main(int argc, char** argv) {
         shows(&app, "- Games", yellow);
         shows(&app, "picked", yellow);
         assert(!strcmp(app.place_line[GUI_PLACE_GAMES], app.games_dir));
+        app_values(&app); /* App's note, the folder now */
+        assert(!strcmp(app.app_form.places, "1 picked") && strstr(app.places_note, app.games_dir));
         /* read back as the menu opens, a path not from the root left out and named */
         free(app.place[GUI_PLACE_GAMES]);
         app.place[GUI_PLACE_GAMES] = NULL;
@@ -2112,6 +2166,17 @@ int main(int argc, char** argv) {
         key(&app, SDLK_RETURN);
         assert(!app.confirm.shown && app.menu.running && !app.room_ok && app.menu.selected == GUI_SWITCH);
         finish(&app, 0);
+        /* R's recompile of a dump is asked about too, and Run anyway prepares it again, playing nothing */
+        app.recompile = true;
+        launch(&app, snx_strdup(dump), false);
+        app.recompile = false;
+        assert(app.confirm.shown && app.confirm.ask == GUI_ASK_ROOM && !app.menu.running);
+        key(&app, SDLK_DOWN);
+        key(&app, SDLK_RETURN);
+        key(&app, SDLK_RETURN);
+        assert(!app.confirm.shown && app.menu.running && !app.recompile);
+        finish(&app, 0);
+        assert(gui_steps_last(&app.steps, "RECOMPILE") && !gui_steps_last(&app.steps, "LAUNCH"));
         /* a finger: the first tap arms Run anyway, the second runs it */
         launch(&app, snx_strdup(dump), false);
         ask_boxes(&app, &r, &l);
@@ -2498,7 +2563,7 @@ int main(int argc, char** argv) {
     render(&app);
     shows(&app, "- Add a folder", yellow);
     shows(&app, "Pick a folder of games", normal); /* beside it, what it does */
-    /* it opens the folder picker of Settings > App > Game folders, whose answer (none here) the message says */
+    /* it opens the folder picker of Settings > App > Library, whose answer (none here) the message says */
     key(&app, SDLK_RETURN);
     {
         SDL_Event answer;
@@ -2507,8 +2572,8 @@ int main(int argc, char** argv) {
             while (SDL_PollEvent(&answer)) event(&app, &answer);
     }
     assert(app.menu.view == GUI_LOAD_GAMES && !app.editing &&
-           (!strcmp(app.message, "Game folders: No folder was picked.") ||
-            !strncmp(app.message, "Game folders: The folder picker could not open: ", 48)));
+           (!strcmp(app.message, "Library: No folder was picked.") ||
+            !strncmp(app.message, "Library: The folder picker could not open: ", 43)));
     app.message[0] = 0;
     for (int i = 0; i < 35; ++i) {
         char name[40];
@@ -2601,7 +2666,7 @@ int main(int argc, char** argv) {
         app.folder_count = 2;
         list_games(&app);
         assert(app.games.count == 36 && strstr(app.message, "/nonexistent/snx-games") &&
-               strstr(app.message, "Settings > App > Game folders"));
+               strstr(app.message, "Settings > App > Library"));
         free(app.folders[1]);
         app.folder_count = 1;
         assert(!snx_remove_tree(zed));
@@ -2660,6 +2725,70 @@ int main(int argc, char** argv) {
     point(&app, game_box(&app, 1, false), true); /* native prepared game, not another extraction */
     assert(app.menu.running && app.native && screen(&app) == GUI_SCREEN_LOADING);
     finish(&app, 0);
+    /* a game in a folder of its own beside its data goes through the menu's driver with the settings and the data
+       folder (Game00 above, an older version's beside the others, runs as it is): the driver plays it, recompiled
+       first when another build made it, which the run shows as compiling until the game loads */
+    {
+        char *folder = snx_path_join(app.games_dir, "folder game"), *data = snx_path_join(folder, "folder game_data");
+#ifdef _WIN32
+        char* program = snx_path_join(folder, "folder game.exe");
+#else
+        char* program = snx_path_join(folder, "folder game");
+#endif
+        int item = app.menu.selected;
+        assert(!snx_mkdirs(data) && !snx_copy_file(self, program) && !snx_make_executable(program));
+        leave_run(&app);
+        app.menu.selected = GUI_SWITCH;
+        launch(&app, snx_strdup(program), true);
+        assert(app.menu.running && app.native && screen(&app) == GUI_SCREEN_LOADING);
+        {
+            char name[64];
+            run_name(&app, name, sizeof name);
+            assert(!strcmp(name, "FOLDER GAME")); /* its file's, until its recompile names it */
+            gui_steps_feed(&app.steps, "Recompiling Folder Quest 2.0 (1 modules)\n", 41, 0);
+            run_name(&app, name, sizeof name);
+            assert(!strcmp(name, "FOLDER QUEST 2.0") && screen(&app) == GUI_SCREEN_COMPILING);
+        }
+        gui_steps_feed(&app.steps, "ScarletNX - folder game\n", 24, 0);
+        assert(screen(&app) == GUI_SCREEN_LOADING);
+        gui_steps_reset(&app.steps);
+        finish(&app, 0);
+        assert(gui_steps_last(&app.steps, "RECOMPILE") && gui_steps_last(&app.steps, "LAUNCH"));
+        app.menu.selected = item;
+        /* R on it recompiles it through the driver with the backend picked and no option of a run (-S -s, the
+           settings), playing nothing; R on Add a folder or a CIA says why it does nothing. The foot says so, and its
+           word presses R as the key does */
+        {
+            char* cia = snx_path_join(app.games_dir, "r test.cia");
+            assert(!snx_write_file(cia, "fixture", 7));
+            go_tab(&app, GUI_TAB_GAMES);
+            render(&app);
+            shows_foot(&app, "R", yellow); /* its key, then what it does */
+            shows_foot(&app, "recompile", normal);
+            assert(hint_keys[hint_pick("R", 0)].key == SDLK_R && hint_keys[hint_pick("R", 5)].key == SDLK_R);
+            assert(hint_keys[hint_pick("Recompile", 3)].key == SDLK_R); /* Android's: no R to name */
+            app.browser.selected = 0;
+            key(&app, SDLK_R);
+            assert(!app.menu.running && !strcmp(app.message, "No game in focus to recompile."));
+            focus_game(&app, "r test.cia");
+            key(&app, SDLK_R);
+            assert(!app.menu.running && !strcmp(app.message, "R recompiles Switch games only."));
+            focus_game(&app, "folder game");
+            launcher(&app, true);
+            key(&app, SDLK_R);
+            assert(app.menu.running && app.native && !app.recompile);
+            finish(&app, 0);
+            assert(gui_steps_last(&app.steps, "BUILT") && !gui_steps_last(&app.steps, "LAUNCH"));
+            launcher(&app, false);
+            app.menu.selected = item;
+            assert(!snx_remove_tree(cia));
+            free(cia);
+        }
+        assert(!snx_remove_tree(folder));
+        free(program);
+        free(data);
+        free(folder);
+    }
     go_tab(&app, GUI_TAB_GAMES); /* back from the run on the menu */
     key(&app, SDLK_DOWN);
     char* removed = snx_path_join(app.games_dir, app.games.names[0]);
