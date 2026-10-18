@@ -28,8 +28,7 @@ void kobj_unref(KObj* o) {
 /* A handle is (linear id << 15) | index, as the console's: the linear id (1 to 0x7FFF, counting up and wrapping) tells
    a stale handle from the one now in its slot, and bits 30 and 31 stay clear, so a handle fits the owner field of a
    mutex word beside its waiters bit. 1024 entries is the most the console's table holds. Free entries are a list
-   through next, with -1 at its end; entries above h_top were never used */
-#define H_MAX 1024
+   through next, with -1 at its end; entries above h_top were never used (H_MAX, kernel_int.h) */
 typedef struct {
     KObj* obj;
     u16 linear;
@@ -120,7 +119,7 @@ int h_close(u32 h) {
     i = h_index_nl(h);
     if (i < 0) {
         pm_unlock(&g_klock);
-        return R_BADHANDLE;
+        R_THROW(R_BADHANDLE);
     }
     o = g_htab[i].obj;
     g_htab[i].obj = NULL;
@@ -128,7 +127,7 @@ int h_close(u32 h) {
     g_hfree = i;
     pm_unlock(&g_klock);
     kobj_unref(o);
-    return 0;
+    R_SUCCEED();
 }
 
 /* ============================================================ waiting and waking */

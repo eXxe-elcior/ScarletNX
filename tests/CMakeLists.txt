@@ -293,22 +293,14 @@ endif()
 snx_cpu_helpers_flags(snx-test-a64-fp)
 add_test(NAME a64_fp_witnesses COMMAND snx-test-a64-fp)
 
-# one build per snx_crc32 path: the nibble table, PCLMULQDQ, PCLMULQDQ with SSE4.2
-function(snx_crc32_test name)
-    add_executable(snx-test-${name} crc32_helper.c "${PROJECT_SOURCE_DIR}/src/common/cpu/aarch64/cpu_helpers.c")
-    snx_test_target(snx-test-${name} 11)
-    snx_cpu_helpers_flags(snx-test-${name})
-    target_compile_options(snx-test-${name} PRIVATE ${ARGN})
-    if(NOT WIN32)
-        target_link_libraries(snx-test-${name} PRIVATE m)
-    endif()
-    add_test(NAME ${name} COMMAND snx-test-${name})
-endfunction()
-snx_crc32_test(crc32_helper)
-if(snx_test_x86)
-    snx_crc32_test(crc32_helper_clmul -mpclmul)
-    snx_crc32_test(crc32_helper_x86 -msse4.2 -mpclmul)
+# snx_crc32's nibble tables against the bit-serial definition (the helpers have no host-specific paths)
+add_executable(snx-test-crc32-helper crc32_helper.c "${PROJECT_SOURCE_DIR}/src/common/cpu/aarch64/cpu_helpers.c")
+snx_test_target(snx-test-crc32-helper 11)
+snx_cpu_helpers_flags(snx-test-crc32-helper)
+if(NOT WIN32)
+    target_link_libraries(snx-test-crc32-helper PRIVATE m)
 endif()
+add_test(NAME crc32_helper COMMAND snx-test-crc32-helper)
 
 add_executable(snx-test-a64-fp-arithmetic a64_fp_arithmetic_test.c
     "${PROJECT_SOURCE_DIR}/src/common/cpu/aarch64/cpu_helpers.c")
@@ -430,13 +422,14 @@ if(TARGET OpenSSL::SSL)
     set_tests_properties(ssl_service PROPERTIES TIMEOUT 60)
 endif()
 
-# mm:u and hid's IHidServer (misc.c, hid.c), with the kernel objects stubbed
-if(TARGET OpenSSL::Crypto)
+# mm:u and the smaller services, hid's IHidServer and acc (misc.c, hid.c, acc.c, whose user picture snx_splash draws),
+# with the kernel objects stubbed
+if(TARGET OpenSSL::Crypto AND TARGET snx_splash)
     add_executable(snx-test-misc-service misc_service.c "${PROJECT_SOURCE_DIR}/src/nx/hle/services/hid_touch.c"
         "${PROJECT_SOURCE_DIR}/src/nx/hle/services/hid_motion.c")
     snx_test_target(snx-test-misc-service 23)
-        snx_service_swipc(snx-test-misc-service hle/services/hid.swipc hle/services/misc.swipc)
-    target_link_libraries(snx-test-misc-service PRIVATE OpenSSL::Crypto)
+        snx_service_swipc(snx-test-misc-service hle/services/hid.swipc hle/services/misc.swipc hle/services/acc.swipc)
+    target_link_libraries(snx-test-misc-service PRIVATE OpenSSL::Crypto snx_splash)
     if(NOT WIN32)
         target_link_libraries(snx-test-misc-service PRIVATE m)
     endif()
@@ -462,17 +455,41 @@ snx_test_target(snx-test-am-nacp 23)
 snx_service_swipc(snx-test-am-nacp hle/services/am.swipc)
 add_test(NAME am_nacp COMMAND snx-test-am-nacp)
 
+# acc's profile through its dispatchers: the user's picture, Wimsy as a 256x256 JPEG of the size GetImageSize tells
+# (acc.c, the splash's drawing), decoded by plutovg
+if(NOT SNX_TOOLS_ONLY AND NOT SNX_HACTOOL_ONLY)
+    add_executable(snx-test-acc-service acc_service.c)
+    snx_test_target(snx-test-acc-service 23)
+    snx_service_swipc(snx-test-acc-service hle/services/acc.swipc)
+    target_link_libraries(snx-test-acc-service PRIVATE snx_splash)
+    target_include_directories(snx-test-acc-service SYSTEM PRIVATE "${plutovg_SOURCE_DIR}/include")
+    target_compile_definitions(snx-test-acc-service PRIVATE PLUTOVG_BUILD_STATIC)
+    set_target_properties(snx-test-acc-service PROPERTIES LINKER_LANGUAGE CXX)
+    add_test(NAME acc_service COMMAND snx-test-acc-service)
+endif()
+
 # set and set:sys: the firmware version's layout and the language codes (set.c)
 add_executable(snx-test-set-service set_service.c)
 snx_test_target(snx-test-set-service 23)
 snx_service_swipc(snx-test-set-service hle/services/set.swipc)
 add_test(NAME set_service COMMAND snx-test-set-service)
 
+# sm: the service names it accepts, and an application's RegisterService and UnregisterService (sm.c)
+add_executable(snx-test-sm-service sm_service.c)
+snx_test_target(snx-test-sm-service 23)
+snx_service_swipc(snx-test-sm-service hle/services/sm.swipc)
+add_test(NAME sm_service COMMAND snx-test-sm-service)
+
 # vi's binder: the native window and the buffer queue's parcels (vi.c), with the GPU thread and the renderer stubbed
 add_executable(snx-test-vi-service vi_service.c)
 snx_test_target(snx-test-vi-service 23)
 snx_service_swipc(snx-test-vi-service hle/services/vi.swipc)
 add_test(NAME vi_service COMMAND snx-test-vi-service)
+
+# the guest clock and vi's presenting side (clock.c, present.c): the system tick, fps_limit's pacing, CPU-read buffers
+add_executable(snx-test-runtime-present runtime_present.c)
+snx_test_target(snx-test-runtime-present 11)
+add_test(NAME runtime_present COMMAND snx-test-runtime-present)
 
 # nvdrv's IPC side (nvdrv.c), with the GPU and host1x stand-ins in the test
 add_executable(snx-test-nvdrv-service nvdrv_service.c)
@@ -538,6 +555,10 @@ add_test(NAME ini COMMAND snx-test-ini)
 add_executable(snx-test-ini-lines ini_lines.c "${PROJECT_SOURCE_DIR}/src/common/utilities/ini_lines.c")
 snx_test_target(snx-test-ini-lines 90)
 add_test(NAME ini_lines COMMAND snx-test-ini-lines)
+# the R_ result helpers (src/nx/hle/result.h), strict C90 as the code that may use them
+add_executable(snx-test-result-macros result_macros.c)
+snx_test_target(snx-test-result-macros 90)
+add_test(NAME result_macros COMMAND snx-test-result-macros)
 
 # generated and checked in (the controls' atlas, their shaders, the VIC's): their sources must still make them
 if(Python3_Interpreter_FOUND)
@@ -547,8 +568,6 @@ if(Python3_Interpreter_FOUND)
         COMMAND "${Python3_EXECUTABLE}" "${PROJECT_SOURCE_DIR}/scripts/build-ui-shaders.py" --check)
     add_test(NAME vic_shader_current
         COMMAND "${Python3_EXECUTABLE}" "${PROJECT_SOURCE_DIR}/scripts/build-vic-shader.py" --check)
-    add_test(NAME astc_shader_current
-        COMMAND "${Python3_EXECUTABLE}" "${PROJECT_SOURCE_DIR}/scripts/build-astc-shader.py" --check)
     add_test(NAME generators_crlf COMMAND "${Python3_EXECUTABLE}" "${PROJECT_SOURCE_DIR}/tests/generators_crlf.py")
     # no keys, dumps, stray binaries, piracy sites or the console maker's name in prose among the tracked files: the
     # checks on planted ones (self test), then on the checkout. Skipped (77) without git or outside a checkout
@@ -719,6 +738,13 @@ add_test(NAME fermi2d_blit COMMAND snx-test-fermi2d-blit)
 add_executable(snx-test-vic-compose vic_compose.c)
 snx_test_target(snx-test-vic-compose 23)
 add_test(NAME vic_compose COMMAND snx-test-vic-compose)
+if(NOT WIN32)
+    # host1x.c's channels with pthread stand-ins for the platform: IOVAs, GET_SYNCPOINT, SUBMIT's checks and fences,
+    # the command stream, a host class wait and a close that runs the queue first
+    add_executable(snx-test-host1x-channel host1x_channel.c)
+    snx_test_target(snx-test-host1x-channel 23)
+    add_test(NAME host1x_channel COMMAND snx-test-host1x-channel)
+endif()
 if(NOT SNX_TOOLS_ONLY)
     # tex_upload (gpu/vk/texture.c) into the staging buffer: block-linear rows against the layout, mip levels, 3D,
     # pitch linear, a converted format; a format uploaded as it is needs no level-sized buffer
@@ -826,6 +852,12 @@ add_test(NAME native_codegen COMMAND snx_codegen_test "${CMAKE_C_COMPILER}" "${P
 add_executable(snx-test-astc astc_decode.c "${PROJECT_SOURCE_DIR}/src/nx/gpu/texture/astc.c")
 snx_test_target(snx-test-astc 23)
 add_test(NAME astc_decode COMMAND snx-test-astc)
+# the ASTC shader's GLSL run on the CPU (tests/glsl/glsl.hpp) against the same decoder: no GPU needed
+add_executable(snx-test-astc-glsl glsl/astc_glsl.cpp "${PROJECT_SOURCE_DIR}/src/nx/gpu/texture/astc.c")
+snx_test_target(snx-test-astc-glsl 23)
+target_compile_options(snx-test-astc-glsl PRIVATE -fwrapv)
+target_include_directories(snx-test-astc-glsl PRIVATE glsl)
+add_test(NAME astc_glsl COMMAND snx-test-astc-glsl)
 
 # the shared fonts pl.c hands out when a game folder has none: the stand-ins compiled in (cmake/shared_fonts.cmake)
 if(NOT SNX_TOOLS_ONLY)
@@ -843,12 +875,18 @@ if(SNX_TOOLS_ONLY)
     snx_test_target(snx-test-audio-out 11)
     snx_service_swipc(snx-test-audio-out hle/services/audio.swipc)
     target_compile_definitions(snx-test-audio-out PRIVATE SNX_NO_H264)
+    if(NOT WIN32)
+        target_link_libraries(snx-test-audio-out PRIVATE m)
+    endif()
     add_test(NAME audio_out COMMAND snx-test-audio-out)
 else()
     add_executable(snx-test-audio-opus audio_out.c)
     snx_test_target(snx-test-audio-opus 11)
     snx_service_swipc(snx-test-audio-opus hle/services/audio.swipc)
     target_link_libraries(snx-test-audio-opus PRIVATE FFmpeg::avcodec)
+    if(NOT WIN32)
+        target_link_libraries(snx-test-audio-opus PRIVATE m)
+    endif()
     add_test(NAME audio_opus COMMAND snx-test-audio-opus)
 endif()
 
@@ -858,6 +896,11 @@ if(UNIX)
         target_link_libraries(snx-test-audren PRIVATE m)
     add_test(NAME audren_render COMMAND snx-test-audren)
 endif()
+
+# audren.c's host side with the DSP stubbed: the output device's volume on every renderer's host stream
+add_executable(snx-test-audren-host audren_host.c)
+snx_test_target(snx-test-audren-host 23)
+add_test(NAME audren_host COMMAND snx-test-audren-host)
 
 add_executable(snx-test-render-enable render_enable.c "${PROJECT_SOURCE_DIR}/src/nx/gpu/maxwell/engines.c"
     "${PROJECT_SOURCE_DIR}/src/nx/gpu/maxwell/maxwell3d.c" "${PROJECT_SOURCE_DIR}/src/nx/gpu/maxwell/write_pages.c")
@@ -912,6 +955,15 @@ if(UNIX)
     snx_test_target(snx-test-memory 11)
         add_test(NAME memory_accounting COMMAND snx-test-memory)
     set_tests_properties(memory_accounting PROPERTIES TIMEOUT 60 SKIP_RETURN_CODE 77) # as ldr_service
+    # views through the alias pool, with the real POSIX platform layer (77 where the host has no pool)
+    add_executable(snx-test-memory-alias memory_alias.c
+        "${PROJECT_SOURCE_DIR}/src/nx/memory/mem.c" "${PROJECT_SOURCE_DIR}/src/nx/hle/svc/svc_mem.c"
+        "${PROJECT_SOURCE_DIR}/src/nx/runtime/platform/plat_posix.c"
+        "${PROJECT_SOURCE_DIR}/src/common/filesystem/host.c")
+    snx_test_target(snx-test-memory-alias 11)
+    target_link_libraries(snx-test-memory-alias PRIVATE ${CMAKE_DL_LIBS})
+    add_test(NAME memory_alias COMMAND snx-test-memory-alias)
+    set_tests_properties(memory_alias PROPERTIES TIMEOUT 120 SKIP_RETURN_CODE 77)
 endif()
 
 endif() # SNX_BUILD_NX
@@ -941,6 +993,17 @@ add_executable(snx-test-unattended-script unattended_script.c "${PROJECT_SOURCE_
 snx_test_target(snx-test-unattended-script 11)
 target_link_libraries(snx-test-unattended-script PRIVATE m)
 add_test(NAME unattended_script COMMAND snx-test-unattended-script)
+# the log's file, early lines, stamps, redirect, limits, fatal and crash mode (platform/plat.c)
+add_executable(snx-test-platform-log platform_log.c "${PROJECT_SOURCE_DIR}/src/common/filesystem/host.c")
+snx_test_target(snx-test-platform-log 11)
+add_test(NAME platform_log COMMAND snx-test-platform-log "${CMAKE_CURRENT_BINARY_DIR}")
+if(NOT WIN32)
+    # written-page tracking, decommit, pread, file maps, replace, folders, waits and threads (platform/plat_posix.c)
+    add_executable(snx-test-platform-posix platform_posix.c "${PROJECT_SOURCE_DIR}/src/common/filesystem/host.c")
+    snx_test_target(snx-test-platform-posix 11)
+    target_link_libraries(snx-test-platform-posix PRIVATE ${CMAKE_DL_LIBS})
+    add_test(NAME platform_posix COMMAND snx-test-platform-posix "${CMAKE_CURRENT_BINARY_DIR}")
+endif()
 if(SNX_BUILD_NX AND NOT SNX_TOOLS_ONLY)
     add_executable(snx-test-shader-brx shader_brx.c)
     snx_test_target(snx-test-shader-brx 23)
@@ -949,6 +1012,35 @@ if(SNX_BUILD_NX AND NOT SNX_TOOLS_ONLY)
         target_link_libraries(snx-test-shader-brx PRIVATE m)
     endif()
     add_test(NAME shader_brx COMMAND snx-test-shader-brx)
+    # the decoder generated by tools/shaderdec from src/nx/gpu/shader/maxwell_opcodes.def
+    add_executable(snx-test-shader-decode shader_decode.c)
+    snx_test_target(snx-test-shader-decode 23)
+    target_link_libraries(snx-test-shader-decode PRIVATE snx_shader)
+    if(NOT WIN32)
+        target_link_libraries(snx-test-shader-decode PRIVATE m)
+    endif()
+    add_test(NAME shader_decode COMMAND snx-test-shader-decode)
+    # dual vertex programs, the static CRS stack and the corpus files (gpu/shader/shader.c, corpus.c)
+    add_executable(snx-test-shader-program shader_program.c)
+    snx_test_target(snx-test-shader-program 23)
+    target_link_libraries(snx-test-shader-program PRIVATE snx_shader)
+    if(NOT WIN32)
+        target_link_libraries(snx-test-shader-program PRIVATE m)
+    endif()
+    add_test(NAME shader_program COMMAND snx-test-shader-program "${CMAKE_CURRENT_BINARY_DIR}")
+    if(NOT CMAKE_CROSSCOMPILING)
+        # the SVC registers tools/svcgen lays out from src/nx/hle/svc/hos.svc, in both ABIs
+        include("${PROJECT_SOURCE_DIR}/cmake/svcgen.cmake")
+        add_test(NAME svcgen_layout COMMAND "${CMAKE_COMMAND}" "-DSVCGEN=$<TARGET_FILE:snx-svcgen>"
+                 "-DSPEC=${PROJECT_SOURCE_DIR}/src/nx/hle/svc/hos.svc"
+                 "-DEXPECTED=${CMAKE_CURRENT_SOURCE_DIR}/svcgen_layout.txt"
+                 -P "${CMAKE_CURRENT_SOURCE_DIR}/svcgen_layout.cmake")
+    endif()
+    if(Python3_Interpreter_FOUND AND NOT CMAKE_CROSSCOMPILING)
+        include("${PROJECT_SOURCE_DIR}/cmake/shaderdec.cmake")
+        add_test(NAME shaderdec_spec COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/shaderdec_test.py"
+            $<TARGET_FILE:snx-shaderdec> "${PROJECT_SOURCE_DIR}/src/nx/gpu/shader/maxwell_opcodes.def")
+    endif()
     add_executable(snx-test-vulkan-release vulkan_release.c)
     snx_test_target(snx-test-vulkan-release 11)
     add_test(NAME vulkan_release COMMAND snx-test-vulkan-release)

@@ -25,7 +25,7 @@ is to bring the right prior art into that design, not to transplant another emul
   GPL-2.0-only: read it for behavior, never port it). Anything else (Cemu and Skyline are MPL-2.0) is a question for
   the user before code is copied. Citra's files carry GPL-2.0-or-later headers too. Describing an approach is always
   fine.
-- Use WebFetch and WebSearch for upstream source, Atmosphère and Switchbrew. Cite file paths and revisions (a commit
+- Use WebFetch and WebSearch for the emulators' source, Atmosphère and Switchbrew. Cite file paths and revisions (a commit
   hash or tag), not just a project name.
 
 ## Expertise to apply
@@ -56,7 +56,7 @@ is to bring the right prior art into that design, not to transplant another emul
   them.
 - The dispatching prompt says which mode you are in. **Consult**: answer a question with evidence. **Design**:
   propose a change with the alternatives you rejected and why. **Implement**: make the change in the file's style,
-  run `scripts/format.sh` on what you touched, and leave committing to the main session.
+  and leave committing to the main session.
 - Build and run the game only when the prompt says the tree is yours. A build deploys into `games/` and a run is
   timing-sensitive, so two agents doing it at once corrupt each other's results. Otherwise say exactly what to
   build, run and look for.

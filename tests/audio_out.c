@@ -156,6 +156,8 @@ int audren_open(SvcObj* o, const u8* params) {
     return !test_audren.refuse;
 }
 void audren_tick(void) {}
+static float test_renderer_gain = 1.0f;
+void audren_volume(float gain) { test_renderer_gain = gain; }
 KEvent* kevent_new(const char* name) {
     KEvent* e = calloc(1, sizeof *e);
     CHECK(e != NULL);
@@ -350,6 +352,37 @@ static void test_open_audio_out(SvcObj* manager) {
     CHECK(!strcmp((char*)GP(0x1100), "DeviceOut") && GP(0x1100)[0x100] == 0xCC);
 }
 
+/* the channels an out opens with: 1, 2, 4 or 6 as asked, two for anything else; an AudioOutBuffer of the SDK's first
+   0x20 bytes (no data_offset), and one whose samples overrun its capacity, which isn't played on the host */
+static void test_audout_layouts(SvcObj* manager) {
+    static const u16 asked[5] = {1, 4, 3, 0, 6}, given[5] = {1, 4, 2, 2, 6};
+    for (u32 i = 0; i < 5; i++) {
+        nn_audio_AudioOutParameter params = {48000, asked[i], 0};
+        u32 rate, channels, format, state;
+        SvcObj* o = NULL;
+        CHECK(nn_audio_detail_IAudioOutManager_OpenAudioOut(NULL, &params, 0, 1, buffer(0, 0), buffer(0, 0), &rate,
+                                                            &channels, &format, &state, &o) == 0);
+        CHECK(channels == given[i] && ((AudOut*)o->data)->channels == given[i]);
+        CHECK(((AudOut*)o->data)->output->channels == given[i]);
+        svcobj_unref(o);
+    }
+    SvcObj* o = open_output(manager);
+    AudOut* q = o->data;
+    PAudio* host = q->output;
+    u64 old[4] = {0, 0x2000, 96, 96};
+    memcpy(GP(0x100), old, sizeof old);
+    CHECK(nn_audio_detail_IAudioOut_AppendAudioOutBuffer(o, 0x31, buffer(0x100, sizeof old)) == 0);
+    CHECK(q->nqueued == 1 && q->frames[(q->first + q->nreleased) % AUDOUT_BUFFERS] == 24 && host->bytes == 96);
+    CHECK(nn_audio_detail_IAudioOut_AppendAudioOutBuffer(o, 0x32, buffer(0x100, 0x18)) == 0); /* holds nothing */
+    CHECK(q->nqueued == 2 && host->bytes == 96);
+    unsigned before = host->queued;
+    CHECK(append(o, 3, 0x33, 0x2000, 64, 96, 0) == 0); /* 96 bytes in a 64 byte buffer: timed, not played */
+    CHECK(q->nqueued == 3 && host->queued == before);
+    CHECK(append(o, 3, 0x34, 0x2000, 96, 64, 64) == 0); /* past the capacity from its offset */
+    CHECK(q->nqueued == 4 && host->queued == before);
+    svcobj_unref(o);
+}
+
 /* the Auto commands' AutoSelect buffers, sent through the pointer buffer: X for an input, C for an output. A mapped
    descriptor without an address leaves the pointer one in charge, and one with an address wins */
 static void test_auto_pointer_buffers(SvcObj* manager) {
@@ -453,6 +486,17 @@ static void test_renderer(void) {
     u32 limit = 75;
     c = request(8, &limit, sizeof limit);
     CHECK(r->dispatch(r, &c) == 0 && query32(r, 9) == 75);
+    /* the voice drop parameter starts at 1 and reads back as set */
+    float drop;
+    u32 bits = query32(r, 13);
+    memcpy(&drop, &bits, sizeof drop);
+    CHECK(drop == 1.0f);
+    drop = 0.5f;
+    c = request(12, &drop, sizeof drop);
+    CHECK(r->dispatch(r, &c) == 0);
+    bits = query32(r, 13);
+    memcpy(&drop, &bits, sizeof drop);
+    CHECK(drop == 0.5f);
     /* RequestUpdate (4): the input in A, the output in B0 and the performance buffer in B1, which audren.c doesn't
        take. Its result is the command's */
     c = request(4, NULL, 0);
@@ -493,6 +537,10 @@ static void test_device(void) {
     IpcCtx c = request(2, &aruid, sizeof aruid);
     CHECK(manager->dispatch(manager, &c) == 0 && c.nout_objs == 1);
     SvcObj* d = c.out_objs[0];
+    /* its system, input and output events: three, each signaled from the start */
+    AudDevice* dev = d->data;
+    CHECK(dev->ev[0] != dev->ev[1] && dev->ev[1] != dev->ev[2] && dev->ev[0] != dev->ev[2]);
+    CHECK(dev->ev[0]->signaled && dev->ev[1]->signaled && dev->ev[2]->signaled);
     /* ListAudioDeviceName (0): AudioDeviceName entries of 0x100 bytes in B */
     sentinel(0x1000, 0x220);
     c = request(0, NULL, 0);
@@ -536,8 +584,78 @@ static void test_device(void) {
     CHECK(query32(d, 5) == 2); /* GetActiveChannelCount */
     c = request(4, NULL, 0);   /* QueryAudioDeviceSystemEvent */
     CHECK(d->dispatch(d, &c) == 0 && c.nout_copy == 1 && c.out_copy[0] == 7);
+    /* SetAudioDeviceOutputVolume (1) and GetAudioDeviceOutputVolume (2), the name in A: the device keeps the volume set
+       on it, and another name has 1 and keeps nothing; the Auto ones (7, 8) through X */
+    float half = 0.5f, quarter = 0.25f, got = 0.0f;
+    memset(GP(0x1000), 0, 0x200);
+    strcpy((char*)GP(0x1000), "AudioTvOutput");
+    strcpy((char*)GP(0x1100), "AudioBuiltInSpeakerOutput");
+    c = request(1, &half, sizeof half);
+    c.na = 1;
+    c.a[0] = buffer(0x1000, 0x100);
+    CHECK(d->dispatch(d, &c) == 0 && c.out_size == 0);
+    c = request(1, &quarter, sizeof quarter);
+    c.na = 1;
+    c.a[0] = buffer(0x1100, 0x100);
+    CHECK(d->dispatch(d, &c) == 0);
+    c = request(2, NULL, 0);
+    c.na = 1;
+    c.a[0] = buffer(0x1000, 0x100);
+    CHECK(d->dispatch(d, &c) == 0 && c.out_size == 4 && (memcpy(&got, c.out, 4), got == 0.5f));
+    c.a[0] = buffer(0x1100, 0x100);
+    CHECK(d->dispatch(d, &c) == 0 && (memcpy(&got, c.out, 4), got == 1.0f));
+    c = request(7, &quarter, sizeof quarter);
+    auto_descriptors(&c, 1, 0);
+    c.x[0] = buffer(0x1000, 0x100);
+    CHECK(d->dispatch(d, &c) == 0);
+    c = request(8, NULL, 0);
+    auto_descriptors(&c, 1, 0);
+    c.x[0] = buffer(0x1000, 0x100);
+    CHECK(d->dispatch(d, &c) == 0 && (memcpy(&got, c.out, 4), got == 0.25f));
     svcobj_unref(d);
     svcobj_unref(manager);
+}
+
+/* the output device's volume on what plays: every audio out's host stream at its own volume times the device's, the
+   ones opened later too, and the renderers' (audren.c) at the device's */
+static void set_device_volume(SvcObj* d, float volume) {
+    IpcCtx c = request(1, &volume, sizeof volume);
+    c.na = 1;
+    c.a[0] = buffer(0x1000, 0x100);
+    CHECK(d->dispatch(d, &c) == 0);
+}
+static void test_device_gain(void) {
+    SvcObj* renderers = new_audren();
+    u64 aruid = 0;
+    IpcCtx c = request(2, &aruid, sizeof aruid);
+    CHECK(renderers->dispatch(renderers, &c) == 0 && c.nout_objs == 1);
+    SvcObj* d = c.out_objs[0];
+    memset(GP(0x1000), 0, 0x100);
+    strcpy((char*)GP(0x1000), "AudioTvOutput");
+    set_device_volume(d, 1.0f);
+    SvcObj* manager = new_audout();
+    SvcObj* first = open_output(manager);
+    PAudio* host = ((AudOut*)first->data)->output;
+    float half = 0.5f;
+    c = request(12, &half, sizeof half); /* SetAudioOutVolume */
+    CHECK(first->dispatch(first, &c) == 0 && host->volume == 0.5f);
+    set_device_volume(d, 0.5f);
+    CHECK(host->volume == 0.25f && test_renderer_gain == 0.5f);
+    float full = 1.0f;
+    c = request(12, &full, sizeof full); /* the out's own volume, under the device's */
+    CHECK(first->dispatch(first, &c) == 0 && host->volume == 0.5f);
+    c = request(12, &half, sizeof half);
+    CHECK(first->dispatch(first, &c) == 0 && host->volume == 0.25f);
+    SvcObj* second = open_output(manager);
+    PAudio* later = ((AudOut*)second->data)->output;
+    CHECK(later->volume == 0.5f);
+    set_device_volume(d, 1.0f);
+    CHECK(host->volume == 0.5f && later->volume == 1.0f && test_renderer_gain == 1.0f);
+    svcobj_unref(second);
+    svcobj_unref(first);
+    svcobj_unref(manager);
+    svcobj_unref(d);
+    svcobj_unref(renderers);
 }
 
 /* hwopus: GetWorkBufferSize (1) and OpenHardwareOpusDecoder (0), the parameters {sample rate, channels} at 0 and the
@@ -597,8 +715,7 @@ static void test_opus_decode(void) {
         CHECK(loud); /* the tone, still there after the switch to CELT */
     }
     CHECK(hwopus_decode(&h, opus_tone, 8, out, sizeof out, 0, &consumed, &samples) == RC(111, 17)); /* no payload */
-    SvcObj o = {.data = &h};
-    hwopus_destroy(&o);
+    hwopus_free(&h); /* opened by hand, so it holds none of the service's decoder slots */
 }
 #endif
 static void test_hwopus(void) {
@@ -606,6 +723,16 @@ static void test_hwopus(void) {
     u32 params[2] = {48000, 2};
     IpcCtx c = request(1, params, sizeof params);
     CHECK(manager->dispatch(manager, &c) == 0 && c.out_size == 4 && reply32(&c, 0) == 0x10000);
+    /* multistream: 32 KiB, and 32 KiB a stream; parameters too short to read are one stream's */
+    u32 multi[4] = {48000, 6, 4, 2}, size = 0;
+    memset(GP(0x3000), 0, 0x110);
+    memcpy(GP(0x3000), multi, sizeof multi);
+    CHECK(nn_codec_detail_IHardwareOpusDecoderManager_GetWorkBufferSizeForMultiStream(NULL, buffer(0x3000, 0x110),
+                                                                                     &size) == 0 &&
+          size == 0x28000);
+    CHECK(nn_codec_detail_IHardwareOpusDecoderManager_GetWorkBufferSizeForMultiStream(NULL, buffer(0x3000, 0x10),
+                                                                                     &size) == 0 &&
+          size == 0x10000);
     unsigned objects = test_objects;
     SvcObj* decoder;
     CHECK(open_opus(manager, 48000, 3, &decoder) == RC(111, 385));
@@ -617,6 +744,21 @@ static void test_hwopus(void) {
     CHECK(open_opus(manager, 24000, 1, &decoder) == 0 && ((HwOpus*)decoder->data)->step == 2);
     svcobj_unref(decoder);
     CHECK(open_opus(manager, 44100, 2, &decoder) == RC(111, 385)); /* not a rate Opus decodes at */
+    /* 24 live decoders, from any session; the 25th is refused as out of decoders until one closes */
+    SvcObj* other = new_hwopus();
+    SvcObj* live[24];
+    for (u32 i = 0; i < 24; i++) CHECK(open_opus(i & 1 ? other : manager, 48000, 2, &live[i]) == 0);
+    unsigned held = test_objects;
+    CHECK(open_opus(manager, 48000, 2, &decoder) == RC(111, 385));
+    CHECK(open_opus(other, 48000, 1, &decoder) == RC(111, 385));
+    CHECK(test_objects == held);
+    svcobj_unref(live[5]);
+    CHECK(open_opus(manager, 48000, 2, &live[5]) == 0);
+    CHECK(open_opus(manager, 48000, 2, &decoder) == RC(111, 385));
+    for (u32 i = 0; i < 24; i++) svcobj_unref(live[i]);
+    CHECK(open_opus(other, 48000, 2, &decoder) == 0);
+    svcobj_unref(decoder);
+    svcobj_unref(other);
     test_opus_decode();
 #else
     CHECK(open_opus(manager, 48000, 2, &decoder) == RC(111, 385)); /* this build has no Opus decoder */
@@ -680,13 +822,25 @@ int main(void) {
     unsigned before = host->queued;
     CHECK(append(o, 7, 1, 0x7FF0, 192, 192, 0) == 0); /* spans an unreadable allocation */
     CHECK(host->queued == before);
-    command(o, 11);
+    /* a stopped out keeps what was appended: Flush says it flushed nothing, and a Start of a started out is
+       refused */
+    {
+        IpcCtx f = request(11, NULL, 0);
+        CHECK(o->dispatch(o, &f) == 0 && f.out_size == 4 && reply32(&f, 0) == 0);
+        CHECK(released(o, 8) == 0 && query32(o, 9) == 1);
+        command(o, 1);
+        f = request(1, NULL, 0);
+        CHECK(o->dispatch(o, &f) == RC(153, 2));
+        f = request(11, NULL, 0);
+        CHECK(o->dispatch(o, &f) == 0 && f.out_size == 4 && reply32(&f, 0) == 1);
+    }
     CHECK(released(o, 8) == 1);
     for (u32 i = 0; i < 64; i++) CHECK(append(o, 7, 100 + i, 0x400, 196, 192, 0) == 0);
     CHECK(append(o, 7, 999, 0x400, 196, 192, 0) == RC(153, 8));
     CHECK(host->queued == before + 64); /* A full ring must reject the host copy too. */
     command(o, 11);
     CHECK(released(o, 8) == 64 && gr64(0x200) == 100 && gr64(0x3F8) == 163);
+    command(o, 2);
     svcobj_unref(o);
     CHECK(audio.outs == NULL);
 
@@ -701,10 +855,12 @@ int main(void) {
     test_no_device = 0;
     test_audout_queries(manager);
     test_open_audio_out(manager);
+    test_audout_layouts(manager);
     test_auto_pointer_buffers(manager);
     svcobj_unref(manager);
     test_renderer();
     test_device();
+    test_device_gain();
     test_hwopus();
     CHECK(test_objects == 0 && test_events == 0 && audio.outs == NULL);
     free(g_mem);

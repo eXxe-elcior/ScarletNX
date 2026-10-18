@@ -15,7 +15,7 @@ interface nn::apm::IManager is apm, apm:p, apm:am {
 }
 @fallback(quiet_ok)
 interface nn::apm::ISession {
-    @stub [0] SetPerformanceConfiguration(nn::apm::PerformanceMode mode, nn::apm::PerformanceConfiguration config);
+    [0] SetPerformanceConfiguration(nn::apm::PerformanceMode mode, nn::apm::PerformanceConfiguration config);
     [1] GetPerformanceConfiguration(nn::apm::PerformanceMode mode) -> nn::apm::PerformanceConfiguration config;
 }
 
@@ -30,7 +30,6 @@ interface nn::lm::ILogger {
 }
 
 # ================================================================ pctl
-@fallback(quiet_ok)
 interface nn::pctl::detail::ipc::IParentalControlServiceFactory is pctl, pctl:a, pctl:s, pctl:r {
     [0] CreateService(pid) -> object<nn::pctl::detail::ipc::IParentalControlService> service;
     [1] CreateServiceWithoutInitialize(pid) -> object<nn::pctl::detail::ipc::IParentalControlService> service;
@@ -57,7 +56,6 @@ type nn::friends::detail::ipc::SizedFriendFilter = bytes<0x10, 8>;
 type nn::friends::detail::ipc::SizedNotificationInfo = bytes<0x10, 8>;
 type nn::friends::detail::FriendImpl = bytes<0x200>;
 
-@fallback(quiet_ok)
 interface nn::friends::detail::ipc::IServiceCreator is friend:u, friend:v, friend:a {
     [0] CreateFriendService() -> object<nn::friends::detail::ipc::IFriendService> service;
     [1] CreateNotificationService(nn::account::Uid uid)
@@ -79,7 +77,6 @@ interface nn::friends::detail::ipc::INotificationService {
     [0] GetEvent() -> handle<copy, event> event;
     [2] Pop() -> nn::friends::detail::ipc::SizedNotificationInfo info;
 }
-@fallback(quiet_ok)
 interface nn::friends::detail::ipc::IDaemonSuspendSessionService {
 }
 
@@ -216,6 +213,8 @@ interface nn::nfp::detail::IUser {
     [22] GetApplicationAreaSize(nn::nfc::DeviceHandle device_handle) -> u32 size;
     [23] AttachAvailabilityChangeEvent() -> handle<copy, event> event;
     [24] RecreateApplicationArea(nn::nfc::DeviceHandle device_handle, u32 access_id, buffer<u8, 5> data);
+    # 23.0.0+, which a game built for it sends instead of 3; the filter after the device is not read
+    [25] StartDetectionWithFilter(nn::nfc::DeviceHandle device_handle);
 }
 # nfc's own IUser: the commands before 400 are the old numbers of 400 to 403. The Mifare and pass-through commands
 # need a device, and there is none
@@ -299,19 +298,19 @@ interface nn::bcat::detail::ipc::INotifierService {
 interface nn::bcat::detail::ipc::IDeliveryTaskSuspensionService {
 }
 
-# ================================================================ aoc:u: no add-on content
+# ================================================================ aoc:u: the add-on content in system/archives
 type nn::ec::srv::detail::PurchasedProductInfo = bytes<0x80, 8>;
 
 interface nn::aocsrv::detail::IAddOnContentManager is aoc:u {
-    @stub [0] CountAddOnContentByApplicationId(nn::ncm::ApplicationId application_id) -> i32 count;
-    @stub [1] ListAddOnContentByApplicationId(i32 offset, i32 count, nn::ncm::ApplicationId application_id,
-                                              array<i32, 6> indices) -> i32 out_count;
-    @stub [2] CountAddOnContent(pid) -> i32 count;
-    @stub [3] ListAddOnContent(i32 offset, i32 count, pid, array<i32, 6> indices) -> i32 out_count;
+    [0] CountAddOnContentByApplicationId(nn::ncm::ApplicationId application_id) -> i32 count;
+    [1] ListAddOnContentByApplicationId(i32 offset, i32 count, nn::ncm::ApplicationId application_id,
+                                        array<i32, 6> indices) -> i32 out_count;
+    [2] CountAddOnContent(pid) -> i32 count;
+    [3] ListAddOnContent(i32 offset, i32 count, pid, array<i32, 6> indices) -> i32 out_count;
     [4] GetAddOnContentBaseIdByApplicationId(nn::ncm::ApplicationId application_id) -> u64 base_id;
     [5] GetAddOnContentBaseId(pid) -> u64 base_id;
-    @stub [6] PrepareAddOnContentByApplicationId(i32 index, nn::ncm::ApplicationId application_id);
-    @stub [7] PrepareAddOnContent(i32 index, pid);
+    [6] PrepareAddOnContentByApplicationId(i32 index, nn::ncm::ApplicationId application_id);
+    [7] PrepareAddOnContent(i32 index, pid);
     [8] GetAddOnContentListChangedEvent() -> handle<copy, event> event;
     # 9 and 11 to 50: answered with nothing (as Eden does), declared as the SDK's client sends them
     @stub [9] GetAddOnContentLostErrorCode(array<i32, 5> indices, pid) -> bytes<8, 4> error_code;
@@ -358,11 +357,17 @@ type nn::mii::CharInfo = bytes<0x58, 4>;
 interface nn::mii::detail::IStaticService is mii:e, mii:u {
     [0] GetDatabaseService(i32 key_code) -> object<nn::mii::detail::IDatabaseService> database;
 }
+# the database (source 1) holds no Mii here: what is counted and given are the six defaults (source 2)
 interface nn::mii::detail::IDatabaseService {
     @stub [0] IsUpdated(i32 source_flag) -> b8 updated;
-    @stub [2] GetCount(i32 source_flag) -> i32 count;
-    @stub [3] Get(i32 source_flag, array<nn::mii::CharInfoElement, 6> elements) -> i32 count;
+    @stub [1] IsFullDatabase() -> b8 full;
+    [2] GetCount(i32 source_flag) -> i32 count;
+    [3] Get(i32 source_flag, array<nn::mii::CharInfoElement, 6> elements) -> i32 count;
+    [4] Get1(i32 source_flag, array<nn::mii::CharInfo, 6> infos) -> i32 count;
+    [5] UpdateLatest(nn::mii::CharInfo info, i32 source_flag) -> nn::mii::CharInfo latest;
+    [6] BuildRandom(u32 age, u32 gender, u32 race) -> nn::mii::CharInfo info;
     [7] BuildDefault(u32 index) -> nn::mii::CharInfo info;
+    [21] GetIndex(nn::mii::CharInfo info) -> i32 index;
     [22] SetInterfaceVersion(u32 version);
 }
 
@@ -370,6 +375,11 @@ interface nn::mii::detail::IDatabaseService {
 # station, scanning and connecting are not implemented and log
 interface nn::ldn::detail::IUserServiceCreator is ldn:u {
     [0] CreateUserLocalCommunicationService() -> object<nn::ldn::detail::IUserLocalCommunicationService> service;
+    # 18.0.0+: libnx's ldnInitialize asks for it and registers its process before anything else
+    [1] CreateClientProcessMonitor() -> object<nn::ldn::detail::IClientProcessMonitor> monitor;
+}
+interface nn::ldn::detail::IClientProcessMonitor {
+    @stub [0] RegisterClient(pid);
 }
 interface nn::ldn::detail::IUserLocalCommunicationService {
     [0] GetState() -> u32 state;
@@ -415,4 +425,23 @@ interface nn::audio::detail::IAudioInManager is audin:u {
         -> (u32 sample_rate, u32 channel_count, u32 sample_format, u32 state, object<nn::audio::detail::IAudioIn> in);
 }
 interface nn::audio::detail::IAudioIn {
+}
+
+# ================================================================ ngc:u and ngct:u: the profanity filter, with no word
+# lists, so nothing is found in a text and it comes back as it was sent. ngc:u takes the lists to look in (a
+# nn::ngc::ProfanityFilterPatternList) and the filter's options; ngct:u (9.0.0+) has one list
+type nn::ngc::detail::ProfanityFilterOption = bytes<0x20, 4>;
+interface nn::ngc::detail::IService is ngc:u {
+    [0] GetContentVersion() -> u32 version;
+    [1] Check(u32 languages, nn::ngc::detail::ProfanityFilterOption option, buffer<u8, 5> text) -> u32 found;
+    [2] Mask(u32 languages, nn::ngc::detail::ProfanityFilterOption option, buffer<u8, 5> text,
+             buffer<u8, 6> masked) -> u32 count;
+    [3] Reload();
+    [4] Check2(u32 languages, nn::ngc::detail::ProfanityFilterOption option, buffer<u8, 5> text) -> u32 found;
+    [5] Mask2(u32 languages, nn::ngc::detail::ProfanityFilterOption option, buffer<u8, 5> text,
+              buffer<u8, 6> masked) -> u32 count;
+}
+interface nn::ngct::detail::IService is ngct:u {
+    [0] Match(buffer<u8, 9> text) -> b8 matched;
+    [1] Filter(buffer<u8, 9> text, buffer<u8, 0xa> filtered);
 }

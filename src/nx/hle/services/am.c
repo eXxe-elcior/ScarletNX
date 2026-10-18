@@ -25,19 +25,23 @@
 #define AM_OUT_OF_MEMORY   RC(128, 600)
 
 /* nn::am::AppletMessage */
-#define AM_MSG_FOCUS_STATE_CHANGED 15
+#define AM_MSG_FOCUS_STATE_CHANGED      15
+#define AM_MSG_PERFORMANCE_MODE_CHANGED 31
+#define AM_MSG_STARTUP_LOGO_GONE        95 /* StartupLogoDisappeared, after EnableStartupLogoDisappearedMessage */
 #define AM_FOCUS_IN                1 /* nn::am::service::FocusState::InFocus */
 
 /* the AppletIds of the library applets that answer with data */
 #define AM_APPLET_CONTROLLER     0x0c
 #define AM_APPLET_PROFILE_SELECT 0x10
 #define AM_APPLET_SWKBD          0x11
+#define AM_APPLET_MII_EDIT       0x12
 #define AM_APPLET_WEB            0x13
+#define AM_APPLET_SHOP           0x14
 #define AM_APPLET_OFFLINE_WEB    0x17
+#define AM_APPLET_LOGIN_SHARE    0x18
 #define AM_APPLET_WEB_AUTH       0x19
 
 #define AM_PRESELECTED_USER_MAGIC 0xc79497cau /* LaunchParameterAccountPreselectedUser */
-#define AM_PERFORMANCE_CONFIG     0x00020003u /* apm's Config7, as misc.c answers it */
 
 /* the console's one user (acc.c). Fixed: a game may keep it in its saves, and the saves of existing installs
    belong to this one */
@@ -45,29 +49,47 @@ u64 g_user_id[2] = {0x0123456789ABCDEFull, 0xFEDCBA9876543210ull};
 
 /* the application's message queue: a message stays queued until ReceiveMessage takes it, and the event is signaled
    while one is */
-#define AM_MESSAGES 16
+#define AM_MESSAGES     16
+#define AM_USER_CHANNEL 8
 static struct {
     PMutex lock;
     KEvent* msg_event;
     KEvent* sleep_lock_event; /* the sleep lock is granted at once, so this is signaled from the first request on */
+    KEvent* launchable_event; /* library applets can be launched from the start */
+    KEvent* resolution_event; /* the default display resolution and HDCP state never change while running */
+    SvcObj* user_channel[AM_USER_CHANNEL]; /* copies of the storages unpopped, the last one on top */
+    u32 user_count;
+    u8 vr_mode; /* as the game turned it: the screen is not split for it */
     u32 msgs[AM_MESSAGES];
     u32 head, count;
     int preselected_popped; /* the preselected user launch parameter is given once */
     u64 next_layer;         /* CreateManagedDisplayLayer's ids, from 1 */
+    u32 idle_extension;     /* ISelfController's two settings a game reads back, as it made them */
+    u8 auto_sleep_disabled;
+    u8 vr_mode_3d;          /* on between BeginVrMode3d and EndVrMode3d */
     u8* nacp;               /* the game's control.nacp in its data folder, read on first use; NULL with none */
     u64 nacp_size;
     int nacp_read;
+    /* the normal and journal sizes ExtendSaveData gave the account's (0) and the device's (1) save, which
+       GetSaveDataSize answers from then on, for the rest of the run */
+    i64 save_size[2][2];
+    int save_extended[2];
 } am;
 
 void am_init(void) {
     pm_init(&am.lock);
     am.msg_event = owned_event("am:message");
     am.sleep_lock_event = owned_event("am:sleep lock");
+    am.launchable_event = owned_event("am:library applet launchable");
+    am.resolution_event = owned_event("am:display resolution change");
     am.next_layer = 1;
-    /* the application starts in focus, and is told so */
+    /* the application starts in focus, and is told so, then that the performance mode is set (the SDK reads it on
+       that message) */
     am.msgs[0] = AM_MSG_FOCUS_STATE_CHANGED;
-    am.count = 1;
+    am.msgs[1] = AM_MSG_PERFORMANCE_MODE_CHANGED;
+    am.count = 2;
     kevent_signal(am.msg_event);
+    kevent_signal(am.launchable_event);
 }
 
 /* ============================================================ storages */
@@ -110,10 +132,10 @@ static SvcObj* am_storage_new(u64 size, const void* data) {
 static int am_storage_tmem(i64 size, u32 handle, int handle_only, SvcObj** storage) {
     KTmem* t = (KTmem*)h_get_ref(handle, KO_TMEM);
     StorageData* s;
-    if (!t) return RC(1, 114); /* the kernel's InvalidHandle */
+    R_UNLESS(t, RC(1, 114)); /* the kernel's InvalidHandle */
     if (size < 0 || (u64)size > t->size) {
         kobj_unref(&t->o);
-        return AM_INVALID_OFFSET;
+        R_THROW(AM_INVALID_OFFSET);
     }
     *storage = am_storage_new(0, NULL);
     s = (StorageData*)(*storage)->data;
@@ -121,44 +143,44 @@ static int am_storage_tmem(i64 size, u32 handle, int handle_only, SvcObj** stora
     s->guest = t->addr;
     s->tmem = &t->o;
     s->handle_only = handle_only;
-    return 0;
+    R_SUCCEED();
 }
 
 static int nn_am_service_IStorage_Open(SvcObj* self, SvcObj** accessor) {
-    if (((StorageData*)self->data)->handle_only) return AM_INVALID_STORAGE;
+    R_UNLESS(!((StorageData*)self->data)->handle_only, AM_INVALID_STORAGE);
     *accessor = nn_am_service_IStorageAccessor_new(sizeof(AmAccessor));
     svcobj_ref(self);
     ((AmAccessor*)(*accessor)->data)->storage = self;
     (*accessor)->destroy = am_accessor_destroy;
-    return 0;
+    R_SUCCEED();
 }
 static int nn_am_service_IStorage_OpenTransferStorage(SvcObj* self, SvcObj** accessor) {
-    if (!((StorageData*)self->data)->guest) return AM_INVALID_STORAGE;
+    R_UNLESS(((StorageData*)self->data)->guest, AM_INVALID_STORAGE);
     *accessor = nn_am_service_ITransferStorageAccessor_new(sizeof(AmAccessor));
     svcobj_ref(self);
     ((AmAccessor*)(*accessor)->data)->storage = self;
     (*accessor)->destroy = am_accessor_destroy;
-    return 0;
+    R_SUCCEED();
 }
 
 static int nn_am_service_IStorageAccessor_GetSize(SvcObj* self, i64* size) {
     *size = (i64)((StorageData*)((AmAccessor*)self->data)->storage->data)->size;
-    return 0;
+    R_SUCCEED();
 }
 static int nn_am_service_IStorageAccessor_Write(SvcObj* self, i64 offset, IpcBuf data) {
     SvcObj* st = ((AmAccessor*)self->data)->storage;
     u64 size = ((StorageData*)st->data)->size;
-    if (offset < 0 || (u64)offset > size || data.size > size - (u64)offset) return AM_INVALID_OFFSET;
+    R_UNLESS(offset >= 0 && (u64)offset <= size && data.size <= size - (u64)offset, AM_INVALID_OFFSET);
     memcpy(am_storage_bytes(st) + offset, GP(data.addr), (size_t)data.size);
-    return 0;
+    R_SUCCEED();
 }
+/* the whole buffer, as Eden checks a read: one that runs past the end is refused, not cut */
 static int nn_am_service_IStorageAccessor_Read(SvcObj* self, i64 offset, IpcBuf data) {
     SvcObj* st = ((AmAccessor*)self->data)->storage;
-    u64 size = ((StorageData*)st->data)->size, n;
-    if (offset < 0 || (u64)offset > size) return AM_INVALID_OFFSET;
-    n = data.size < size - (u64)offset ? data.size : size - (u64)offset;
-    memcpy(GP(data.addr), am_storage_bytes(st) + offset, (size_t)n);
-    return 0;
+    u64 size = ((StorageData*)st->data)->size;
+    R_UNLESS(offset >= 0 && (u64)offset <= size && data.size <= size - (u64)offset, AM_INVALID_OFFSET);
+    memcpy(GP(data.addr), am_storage_bytes(st) + offset, (size_t)data.size);
+    R_SUCCEED();
 }
 
 /* ============================================================ proxies */
@@ -167,13 +189,13 @@ static int nn_am_service_IApplicationProxyService_OpenApplicationProxy(SvcObj* s
                                                                       SvcObj** proxy) {
     (void)self, (void)pid, (void)process;
     *proxy = am_proxy();
-    return 0;
+    R_SUCCEED();
 }
 static int nn_am_service_IAllSystemAppletProxiesService_OpenSystemApplicationProxy(SvcObj* self, u64 pid,
                                                                                   u32 process, SvcObj** proxy) {
     (void)self, (void)pid, (void)process;
     *proxy = am_proxy();
-    return 0;
+    R_SUCCEED();
 }
 SvcObj* new_appletoe(void) { return nn_am_service_IApplicationProxyService_new(0); }
 SvcObj* new_appletae(void) { return nn_am_service_IAllSystemAppletProxiesService_new(0); }
@@ -181,54 +203,63 @@ SvcObj* new_appletae(void) { return nn_am_service_IAllSystemAppletProxiesService
 static int nn_am_service_IApplicationProxy_GetCommonStateGetter(SvcObj* self, SvcObj** getter) {
     (void)self;
     *getter = nn_am_service_ICommonStateGetter_new(0);
-    return 0;
+    R_SUCCEED();
 }
 static int nn_am_service_IApplicationProxy_GetSelfController(SvcObj* self, SvcObj** controller) {
     (void)self;
     *controller = nn_am_service_ISelfController_new(0);
-    return 0;
+    R_SUCCEED();
 }
 static int nn_am_service_IApplicationProxy_GetWindowController(SvcObj* self, SvcObj** controller) {
     (void)self;
     *controller = nn_am_service_IWindowController_new(0);
-    return 0;
+    R_SUCCEED();
 }
+/* IAudioController's volumes, kept on each controller as Eden keeps them, from 0 to 1: what the game expects itself
+   and a library applet to play at */
+typedef struct {
+    float main_volume, library_volume;
+} AmVolumes;
 static int nn_am_service_IApplicationProxy_GetAudioController(SvcObj* self, SvcObj** controller) {
+    AmVolumes* v;
     (void)self;
-    *controller = nn_am_service_IAudioController_new(0);
-    return 0;
+    *controller = nn_am_service_IAudioController_new(sizeof(AmVolumes));
+    v = (AmVolumes*)(*controller)->data;
+    v->main_volume = 1.0f;
+    v->library_volume = 1.0f;
+    R_SUCCEED();
 }
 static int nn_am_service_IApplicationProxy_GetDisplayController(SvcObj* self, SvcObj** controller) {
     (void)self;
     *controller = nn_am_service_IDisplayController_new(0);
-    return 0;
+    R_SUCCEED();
 }
 static int nn_am_service_IApplicationProxy_GetProcessWindingController(SvcObj* self, SvcObj** controller) {
     (void)self;
     *controller = nn_am_service_IProcessWindingController_new(0);
-    return 0;
+    R_SUCCEED();
 }
 static int nn_am_service_IApplicationProxy_GetLibraryAppletCreator(SvcObj* self, SvcObj** creator) {
     (void)self;
     *creator = nn_am_service_ILibraryAppletCreator_new(0);
-    return 0;
+    R_SUCCEED();
 }
 static int nn_am_service_IApplicationProxy_GetApplicationFunctions(SvcObj* self, SvcObj** functions) {
     (void)self;
     *functions = nn_am_service_IApplicationFunctions_new(0);
-    return 0;
+    R_SUCCEED();
 }
 static int nn_am_service_IApplicationProxy_GetDebugFunctions(SvcObj* self, SvcObj** functions) {
     (void)self;
     *functions = nn_am_service_IDebugFunctions_new(0);
-    return 0;
+    R_SUCCEED();
 }
 
 /* ============================================================ ICommonStateGetter */
 static int nn_am_service_ICommonStateGetter_GetEventHandle(SvcObj* self, u32* event) {
     (void)self;
     *event = ev_handle(am.msg_event);
-    return 0;
+    R_SUCCEED();
 }
 static int nn_am_service_ICommonStateGetter_ReceiveMessage(SvcObj* self, nn_am_AppletMessage* message) {
     int rc = 0;
@@ -248,27 +279,27 @@ static int nn_am_service_ICommonStateGetter_ReceiveMessage(SvcObj* self, nn_am_A
 static int nn_am_service_ICommonStateGetter_GetOperationMode(SvcObj* self, u8* mode) {
     (void)self;
     *mode = g_opt_docked ? 1 : 0; /* nn::oe::OperationMode: Handheld, Console */
-    return 0;
+    R_SUCCEED();
 }
 static int nn_am_service_ICommonStateGetter_GetPerformanceMode(SvcObj* self, u32* mode) {
     (void)self;
     *mode = g_opt_docked ? 1 : 0; /* Boost when docked, as apm says */
-    return 0;
+    R_SUCCEED();
 }
 static int nn_am_service_ICommonStateGetter_GetCurrentFocusState(SvcObj* self, u8* state) {
     (void)self;
     *state = AM_FOCUS_IN;
-    return 0;
+    R_SUCCEED();
 }
 static int nn_am_service_ICommonStateGetter_RequestToAcquireSleepLock(SvcObj* self) {
     (void)self;
     kevent_signal(am.sleep_lock_event);
-    return 0;
+    R_SUCCEED();
 }
 static int nn_am_service_ICommonStateGetter_GetAcquiredSleepLockEvent(SvcObj* self, u32* event) {
     (void)self;
     *event = ev_handle(am.sleep_lock_event);
-    return 0;
+    R_SUCCEED();
 }
 
 /* ILockAccessor: granted whenever it is free, with an event signaled when it is released */
@@ -280,25 +311,27 @@ static void am_lock_destroy(SvcObj* o) { kobj_unref(&((AmLock*)o->data)->event->
 static SvcObj* am_lock_new(void) {
     SvcObj* o = nn_am_service_ILockAccessor_new(sizeof(AmLock));
     ((AmLock*)o->data)->event = owned_event("am:lock accessor");
+    /* the lock is free: libnx's TryLock and Lock wait on the event before they ask for it */
+    kevent_signal(((AmLock*)o->data)->event);
     o->destroy = am_lock_destroy;
     return o;
 }
 static int nn_am_service_ICommonStateGetter_GetHomeButtonReaderLockAccessor(SvcObj* self, SvcObj** accessor) {
     (void)self;
     *accessor = am_lock_new();
-    return 0;
+    R_SUCCEED();
 }
 static int nn_am_service_ICommonStateGetter_GetReaderLockAccessorEx(SvcObj* self, u32 button_type,
                                                                    SvcObj** accessor) {
     (void)self, (void)button_type;
     *accessor = am_lock_new();
-    return 0;
+    R_SUCCEED();
 }
 static int nn_am_service_ICommonStateGetter_GetWriterLockAccessorEx(SvcObj* self, u32 button_type,
                                                                    SvcObj** accessor) {
     (void)self, (void)button_type;
     *accessor = am_lock_new();
-    return 0;
+    R_SUCCEED();
 }
 static int nn_am_service_ILockAccessor_TryLock(SvcObj* self, u8 return_handle, u8* is_locked, u32* event) {
     AmLock* l = (AmLock*)self->data;
@@ -307,7 +340,7 @@ static int nn_am_service_ILockAccessor_TryLock(SvcObj* self, u8 return_handle, u
     l->locked = 1;
     pm_unlock(&am.lock);
     if (return_handle) *event = ev_handle(l->event);
-    return 0;
+    R_SUCCEED();
 }
 static int nn_am_service_ILockAccessor_Unlock(SvcObj* self) {
     AmLock* l = (AmLock*)self->data;
@@ -315,38 +348,109 @@ static int nn_am_service_ILockAccessor_Unlock(SvcObj* self) {
     l->locked = 0;
     pm_unlock(&am.lock);
     kevent_signal(l->event);
-    return 0;
+    R_SUCCEED();
 }
 static int nn_am_service_ILockAccessor_GetEvent(SvcObj* self, u32* event) {
     *event = ev_handle(((AmLock*)self->data)->event);
-    return 0;
+    R_SUCCEED();
 }
 static int nn_am_service_ILockAccessor_IsLocked(SvcObj* self, u8* is_locked) {
     AmLock* l = (AmLock*)self->data;
     pm_lock(&am.lock);
     *is_locked = (u8)l->locked;
     pm_unlock(&am.lock);
-    return 0;
+    R_SUCCEED();
+}
+
+static int am_set_vr_mode(u8 on) {
+    pm_lock(&am.lock);
+    am.vr_mode = on;
+    pm_unlock(&am.lock);
+    R_SUCCEED();
+}
+static int nn_am_service_ICommonStateGetter_IsVrModeEnabled(SvcObj* self, u8* enabled) {
+    (void)self;
+    pm_lock(&am.lock);
+    *enabled = am.vr_mode;
+    pm_unlock(&am.lock);
+    R_SUCCEED();
+}
+static int nn_am_service_ICommonStateGetter_SetVrModeEnabled(SvcObj* self, u8 enabled) {
+    (void)self;
+    return am_set_vr_mode(enabled != 0);
+}
+static int nn_am_service_ICommonStateGetter_BeginVrModeEx(SvcObj* self) {
+    (void)self;
+    return am_set_vr_mode(1);
+}
+static int nn_am_service_ICommonStateGetter_EndVrModeEx(SvcObj* self) {
+    (void)self;
+    return am_set_vr_mode(0);
 }
 
 static int nn_am_service_ICommonStateGetter_GetDefaultDisplayResolution(SvcObj* self, i32* width, i32* height) {
     (void)self;
     *width = g_opt_docked ? 1920 : 1280;
     *height = g_opt_docked ? 1080 : 720;
-    return 0;
+    R_SUCCEED();
 }
 static int nn_am_service_ICommonStateGetter_GetDefaultDisplayResolutionChangeEvent(SvcObj* self, u32* event) {
     (void)self;
-    return new_event(event, "am:display resolution change", 0);
+    *event = ev_handle(am.resolution_event);
+    R_SUCCEED();
 }
 static int nn_am_service_ICommonStateGetter_GetHdcpAuthenticationStateChangeEvent(SvcObj* self, u32* event) {
     (void)self;
-    return new_event(event, "am:hdcp state change", 0);
+    *event = ev_handle(am.resolution_event);
+    R_SUCCEED();
 }
+/* apm's configuration of the mode the console runs in */
 static int nn_am_service_ICommonStateGetter_GetCurrentPerformanceConfiguration(SvcObj* self, u32* configuration) {
     (void)self;
-    *configuration = AM_PERFORMANCE_CONFIG;
-    return 0;
+    *configuration = apm_configuration(g_opt_docked ? 1 : 0);
+    R_SUCCEED();
+}
+/* the clocks a game asks for around its loading screens, which apm keeps as Boost mode's configuration */
+static int nn_am_service_ICommonStateGetter_SetCpuBoostMode(SvcObj* self, u32 mode) {
+    (void)self;
+    apm_cpu_boost(mode);
+    R_SUCCEED();
+}
+/* there is no start-up logo here, so it is gone as soon as a game asks to be told */
+static int nn_am_service_ICommonStateGetter_EnableStartupLogoDisappearedMessage(SvcObj* self) {
+    (void)self;
+    pm_lock(&am.lock);
+    if (am.count < AM_MESSAGES) am.msgs[(am.head + am.count++) % AM_MESSAGES] = AM_MSG_STARTUP_LOGO_GONE;
+    kevent_signal(am.msg_event);
+    pm_unlock(&am.lock);
+    R_SUCCEED();
+}
+static int nn_am_service_ICommonStateGetter_GetSettingsPlatformRegion(SvcObj* self, u32* region) {
+    (void)self;
+    *region = 1; /* Global */
+    R_SUCCEED();
+}
+static void am_set_vr_mode_3d(u8 on) {
+    pm_lock(&am.lock);
+    am.vr_mode_3d = on;
+    pm_unlock(&am.lock);
+}
+static int nn_am_service_ICommonStateGetter_BeginVrMode3d(SvcObj* self) {
+    (void)self;
+    am_set_vr_mode_3d(1);
+    R_SUCCEED();
+}
+static int nn_am_service_ICommonStateGetter_EndVrMode3d(SvcObj* self) {
+    (void)self;
+    am_set_vr_mode_3d(0);
+    R_SUCCEED();
+}
+static int nn_am_service_ICommonStateGetter_IsVrModeEnabled3d(SvcObj* self, u8* enabled) {
+    (void)self;
+    pm_lock(&am.lock);
+    *enabled = am.vr_mode_3d;
+    pm_unlock(&am.lock);
+    R_SUCCEED();
 }
 
 /* ============================================================ ISelfController */
@@ -355,18 +459,19 @@ static int nn_am_service_ISelfController_Exit(SvcObj* self) {
     /* the frontend's loop ends the run, saving what outlives it, as when the window closes */
     LOG("am: the application exited\n");
     g_quit = 1;
-    return 0;
+    R_SUCCEED();
 }
 static int nn_am_service_ISelfController_GetLibraryAppletLaunchableEvent(SvcObj* self, u32* event) {
     (void)self;
-    return new_event(event, "am:library applet launchable", 1);
+    *event = ev_handle(am.launchable_event);
+    R_SUCCEED();
 }
 static int nn_am_service_ISelfController_CreateManagedDisplayLayer(SvcObj* self, u64* layer_id) {
     (void)self;
     pm_lock(&am.lock);
     *layer_id = am.next_layer++;
     pm_unlock(&am.lock);
-    return 0;
+    R_SUCCEED();
 }
 static int nn_am_service_ISelfController_CreateManagedDisplaySeparableLayer(SvcObj* self, u64* layer_id,
                                                                            u64* recording_layer_id) {
@@ -375,29 +480,77 @@ static int nn_am_service_ISelfController_CreateManagedDisplaySeparableLayer(SvcO
     *layer_id = am.next_layer++;
     *recording_layer_id = am.next_layer++;
     pm_unlock(&am.lock);
-    return 0;
+    R_SUCCEED();
 }
 static int nn_am_service_ISelfController_GetAccumulatedSuspendedTickChangedEvent(SvcObj* self, u32* event) {
     (void)self;
     return new_event(event, "am:suspended tick changed", 1);
+}
+static int nn_am_service_ISelfController_SetIdleTimeDetectionExtension(SvcObj* self, u32 extension) {
+    (void)self;
+    pm_lock(&am.lock);
+    am.idle_extension = extension;
+    pm_unlock(&am.lock);
+    R_SUCCEED();
+}
+static int nn_am_service_ISelfController_GetIdleTimeDetectionExtension(SvcObj* self, u32* extension) {
+    (void)self;
+    pm_lock(&am.lock);
+    *extension = am.idle_extension;
+    pm_unlock(&am.lock);
+    R_SUCCEED();
+}
+static int nn_am_service_ISelfController_SetAutoSleepDisabled(SvcObj* self, u8 disabled) {
+    (void)self;
+    pm_lock(&am.lock);
+    am.auto_sleep_disabled = disabled;
+    pm_unlock(&am.lock);
+    R_SUCCEED();
+}
+static int nn_am_service_ISelfController_IsAutoSleepDisabled(SvcObj* self, u8* disabled) {
+    (void)self;
+    pm_lock(&am.lock);
+    *disabled = am.auto_sleep_disabled;
+    pm_unlock(&am.lock);
+    R_SUCCEED();
 }
 
 static int nn_am_service_IWindowController_GetAppletResourceUserId(SvcObj* self,
                                                                    nn_applet_AppletResourceUserId* aruid) {
     (void)self;
     *aruid = K_PROCESS_ID;
-    return 0;
+    R_SUCCEED();
 }
 
+static float am_volume(float v) { return v < 0.0f ? 0.0f : v > 1.0f ? 1.0f : v; }
+static int nn_am_service_IAudioController_SetExpectedMasterVolume(SvcObj* self, float main_volume,
+                                                                  float library_volume) {
+    AmVolumes* v = (AmVolumes*)self->data;
+    pm_lock(&am.lock);
+    v->main_volume = am_volume(main_volume);
+    v->library_volume = am_volume(library_volume);
+    pm_unlock(&am.lock);
+    R_SUCCEED();
+}
 static int nn_am_service_IAudioController_GetMainAppletExpectedMasterVolume(SvcObj* self, float* volume) {
-    (void)self;
-    *volume = 1.0f;
-    return 0;
+    pm_lock(&am.lock);
+    *volume = ((AmVolumes*)self->data)->main_volume;
+    pm_unlock(&am.lock);
+    R_SUCCEED();
 }
 static int nn_am_service_IAudioController_GetLibraryAppletExpectedMasterVolume(SvcObj* self, float* volume) {
-    (void)self;
-    *volume = 1.0f;
-    return 0;
+    pm_lock(&am.lock);
+    *volume = ((AmVolumes*)self->data)->library_volume;
+    pm_unlock(&am.lock);
+    R_SUCCEED();
+}
+/* the fade is not played: nothing here plays the game at its expected volume */
+static int nn_am_service_IAudioController_ChangeMainAppletMasterVolume(SvcObj* self, float volume, i64 fade_time_ns) {
+    (void)fade_time_ns;
+    pm_lock(&am.lock);
+    ((AmVolumes*)self->data)->main_volume = am_volume(volume);
+    pm_unlock(&am.lock);
+    R_SUCCEED();
 }
 
 /* ============================================================ IApplicationFunctions */
@@ -405,12 +558,19 @@ static int nn_am_service_IApplicationFunctions_PopLaunchParameter(SvcObj* self, 
     u8* d;
     u32 v;
     (void)self;
-    if (kind != 2) return AM_NO_DATA; /* UserChannel: nothing was left there by a previous program */
+    if (kind == 1) { /* UserChannel: the last storage unpopped, which the channel's reference goes with */
+        pm_lock(&am.lock);
+        *storage = am.user_count ? am.user_channel[--am.user_count] : NULL;
+        pm_unlock(&am.lock);
+        R_UNLESS(*storage, AM_NO_DATA);
+        R_SUCCEED();
+    }
+    R_UNLESS(kind == 2, AM_NO_DATA); /* PreselectedUser (2) is the only other kind with data */
     pm_lock(&am.lock);
     v = (u32)am.preselected_popped;
     am.preselected_popped = 1;
     pm_unlock(&am.lock);
-    if (v) return AM_NO_DATA;
+    R_UNLESS(!v, AM_NO_DATA);
     /* AccountPreselectedUser: the console's user, selected */
     *storage = am_storage_new(0x88, NULL);
     d = am_storage_bytes(*storage);
@@ -419,7 +579,45 @@ static int nn_am_service_IApplicationFunctions_PopLaunchParameter(SvcObj* self, 
     v = 1;
     memcpy(d + 4, &v, 4);
     memcpy(d + 8, g_user_id, 16);
-    return 0;
+    R_SUCCEED();
+}
+
+static int nn_am_service_IApplicationFunctions_ClearUserChannel(SvcObj* self) {
+    SvcObj* drop[AM_USER_CHANNEL];
+    u32 i, n;
+    (void)self;
+    pm_lock(&am.lock);
+    n = am.user_count;
+    memcpy(drop, am.user_channel, n * sizeof drop[0]);
+    am.user_count = 0;
+    pm_unlock(&am.lock);
+    for (i = 0; i < n; i++) svcobj_unref(drop[i]);
+    R_SUCCEED();
+}
+/* a copy, as Eden keeps one: the game may write its storage again after */
+static int nn_am_service_IApplicationFunctions_UnpopToUserChannel(SvcObj* self, SvcObj* storage) {
+    SvcObj* copy;
+    (void)self;
+    if (!storage) R_SUCCEED();
+    copy = am_storage_new(((StorageData*)storage->data)->size, am_storage_bytes(storage));
+    if (!copy) R_THROW(AM_OUT_OF_MEMORY);
+    pm_lock(&am.lock);
+    if (am.user_count < AM_USER_CHANNEL) {
+        am.user_channel[am.user_count++] = copy;
+        copy = NULL;
+    }
+    pm_unlock(&am.lock);
+    if (!copy) R_SUCCEED();
+    svcobj_unref(copy);
+    WARN_LIMIT(4, "am: the user channel holds %d storages, no more\n", AM_USER_CHANNEL);
+    R_THROW(AM_OUT_OF_MEMORY);
+}
+
+/* -1: the game was launched by the system, not by another of its programs (ExecuteProgram is not followed here) */
+static int nn_am_service_IApplicationFunctions_GetPreviousProgramIndex(SvcObj* self, i32* index) {
+    (void)self;
+    *index = -1;
+    R_SUCCEED();
 }
 
 /* the game's control.nacp (nn::ns::ApplicationControlProperty), as the recompiler staged it beside the game's data:
@@ -484,7 +682,7 @@ static int nn_am_service_IApplicationFunctions_GetDesiredLanguage(SvcObj* self, 
     (void)self;
     if (p) memcpy(&supported, p, 4);
     set_language_code(am_desired_language(g_opt_lang, supported), code->v);
-    return 0;
+    R_SUCCEED();
 }
 /* the NACP's display version, "1.0.0" for a game without one */
 static int nn_am_service_IApplicationFunctions_GetDisplayVersion(SvcObj* self, nn_oe_DisplayVersion* version) {
@@ -495,17 +693,46 @@ static int nn_am_service_IApplicationFunctions_GetDisplayVersion(SvcObj* self, n
     else
         memcpy(version->v, "1.0.0", 6);
     version->v[15] = 0;
-    return 0;
+    R_SUCCEED();
 }
-/* the sizes the NACP gives the account's (type 1) and the device's (3) save data */
+/* the account's (type 1) and the device's (3) save data: the size ExtendSaveData gave it, else the NACP's, 64 MiB each
+   without a NACP */
+#define AM_DEFAULT_SAVE_SIZE 0x4000000
 static int nn_am_service_IApplicationFunctions_GetSaveDataSize(SvcObj* self, u8 type, const nn_account_Uid* uid,
                                                               i64* normal_size, i64* journal_size) {
+    int device = type == 3, extended = 0;
     (void)self, (void)uid;
     if (type == 1 || type == 3) {
-        *normal_size = (i64)am_nacp_u64(NACP_ACCOUNT_SAVE_SIZE + (type == 3 ? 16 : 0));
-        *journal_size = (i64)am_nacp_u64(NACP_ACCOUNT_SAVE_SIZE + 8 + (type == 3 ? 16 : 0));
+        pm_lock(&am.lock);
+        extended = am.save_extended[device];
+        if (extended) {
+            *normal_size = am.save_size[device][0];
+            *journal_size = am.save_size[device][1];
+        }
+        pm_unlock(&am.lock);
     }
-    return 0;
+    if (extended) R_SUCCEED();
+    if (!am_nacp(0, 0)) {
+        *normal_size = AM_DEFAULT_SAVE_SIZE;
+        *journal_size = AM_DEFAULT_SAVE_SIZE;
+    } else if (type == 1 || type == 3) {
+        *normal_size = (i64)am_nacp_u64(NACP_ACCOUNT_SAVE_SIZE + (device ? 16 : 0));
+        *journal_size = (i64)am_nacp_u64(NACP_ACCOUNT_SAVE_SIZE + 8 + (device ? 16 : 0));
+    }
+    R_SUCCEED();
+}
+static int nn_am_service_IApplicationFunctions_ExtendSaveData(SvcObj* self, u8 type, const nn_account_Uid* uid,
+                                                              i64 normal_size, i64 journal_size, i64* required_size) {
+    (void)self, (void)uid;
+    if (type == 1 || type == 3) {
+        pm_lock(&am.lock);
+        am.save_size[type == 3][0] = normal_size;
+        am.save_size[type == 3][1] = journal_size;
+        am.save_extended[type == 3] = 1;
+        pm_unlock(&am.lock);
+    }
+    *required_size = 0; /* the space still missing, when there isn't enough: there always is */
+    R_SUCCEED();
 }
 static int nn_am_service_IApplicationFunctions_GetLimitedApplicationLicenseUpgradableEvent(SvcObj* self,
                                                                                           u32* event) {
@@ -517,7 +744,7 @@ static int nn_am_service_IApplicationFunctions_GetPseudoDeviceId(SvcObj* self, n
     (void)self;
     memcpy(id->v, &g_title_id, 8);
     memcpy(id->v + 8, g_user_id, 8);
-    return 0;
+    R_SUCCEED();
 }
 static int nn_am_service_IApplicationFunctions_GetGpuErrorDetectedSystemEvent(SvcObj* self, u32* event) {
     (void)self;
@@ -530,7 +757,7 @@ static int nn_am_service_IApplicationFunctions_GetFriendInvitationStorageChannel
 static int nn_am_service_IApplicationFunctions_TryPopFromFriendInvitationStorageChannel(SvcObj* self,
                                                                                        SvcObj** storage) {
     (void)self, (void)storage;
-    return AM_NO_DATA;
+    R_THROW(AM_NO_DATA);
 }
 static int nn_am_service_IApplicationFunctions_GetNotificationStorageChannelEvent(SvcObj* self, u32* event) {
     (void)self;
@@ -538,7 +765,7 @@ static int nn_am_service_IApplicationFunctions_GetNotificationStorageChannelEven
 }
 static int nn_am_service_IApplicationFunctions_TryPopFromNotificationStorageChannel(SvcObj* self, SvcObj** storage) {
     (void)self, (void)storage;
-    return AM_NO_DATA;
+    R_THROW(AM_NO_DATA);
 }
 static int nn_am_service_IApplicationFunctions_GetHealthWarningDisappearedSystemEvent(SvcObj* self, u32* event) {
     (void)self;
@@ -550,7 +777,7 @@ static int nn_am_service_IApplicationFunctions_GetUnknownEvent210(SvcObj* self, 
 }
 
 /* ============================================================ library applets */
-#define AM_IN_DATA  4
+#define AM_IN_DATA  8
 #define AM_OUT_DATA 16
 
 /* the inline software keyboard (SwkbdState, SwkbdRequestCommand, SwkbdReplyType) */
@@ -633,26 +860,28 @@ static SvcObj* am_applet_new(u32 applet_id, u32 mode) {
     if (!am_is_inline(a)) {
         am_applet_finish(a);
         kevent_signal(a->out_ev);
-    }
-    LOG("am: library applet %#x (mode %u)\n", applet_id, mode);
+        if (applet_id != AM_APPLET_SWKBD)
+            LOG_LIMIT(4, "am: library applet %#x (mode %u) closed right away\n", applet_id, mode);
+    } else
+        LOG("am: library applet %#x (mode %u)\n", applet_id, mode);
     return o;
 }
 static int nn_am_service_ILibraryAppletCreator_CreateLibraryApplet(SvcObj* self, u32 applet_id,
                                                                    u32 library_applet_mode, SvcObj** accessor) {
     (void)self;
     *accessor = am_applet_new(applet_id, library_applet_mode);
-    return 0;
+    R_SUCCEED();
 }
 static int nn_am_service_ILibraryAppletCreator_CreateLibraryAppletEx(SvcObj* self, u32 applet_id,
                                                                      u32 library_applet_mode, u64 thread_id,
                                                                      SvcObj** accessor) {
     (void)self, (void)thread_id;
     *accessor = am_applet_new(applet_id, library_applet_mode);
-    return 0;
+    R_SUCCEED();
 }
 static int nn_am_service_ILibraryAppletCreator_CreateStorage(SvcObj* self, i64 size, SvcObj** storage) {
     (void)self;
-    if (size < 0) return AM_INVALID_OFFSET;
+    R_UNLESS(size >= 0, AM_INVALID_OFFSET);
     *storage = am_storage_new((u64)size, NULL);
     return *storage ? 0 : AM_OUT_OF_MEMORY;
 }
@@ -669,35 +898,35 @@ static int nn_am_service_ILibraryAppletCreator_CreateHandleStorage(SvcObj* self,
 
 static int nn_am_service_ILibraryAppletAccessor_GetAppletStateChangedEvent(SvcObj* self, u32* event) {
     *event = ev_handle(((LibApplet*)self->data)->state_ev);
-    return 0;
+    R_SUCCEED();
 }
 static int nn_am_service_ILibraryAppletAccessor_IsCompleted(SvcObj* self, u8* completed) {
     LibApplet* a = (LibApplet*)self->data;
     pm_lock(&am.lock);
     *completed = (u8)a->completed;
     pm_unlock(&am.lock);
-    return 0;
+    R_SUCCEED();
 }
 static int nn_am_service_ILibraryAppletAccessor_RequestExit(SvcObj* self) {
     LibApplet* a = (LibApplet*)self->data;
     pm_lock(&am.lock);
     am_applet_finish(a);
     pm_unlock(&am.lock);
-    return 0;
+    R_SUCCEED();
 }
 static int nn_am_service_ILibraryAppletAccessor_Terminate(SvcObj* self) {
     return nn_am_service_ILibraryAppletAccessor_RequestExit(self);
 }
 static int nn_am_service_ILibraryAppletAccessor_PushInData(SvcObj* self, SvcObj* storage) {
     LibApplet* a = (LibApplet*)self->data;
-    if (!storage) return 0;
+    if (!storage) R_SUCCEED();
     pm_lock(&am.lock);
     if (a->nin < AM_IN_DATA) {
         svcobj_ref(storage);
         a->in[a->nin++] = storage;
     }
     pm_unlock(&am.lock);
-    return 0;
+    R_SUCCEED();
 }
 
 /* UTF-16 (n units at in, stopping at a 0) to UTF-8, at most cap - 1 bytes and a terminator */
@@ -732,25 +961,40 @@ static void am_utf16_to_8(const u16* in, u64 n, char* out, size_t cap) {
     }
     out[k] = 0;
 }
-/* UTF-8 to UTF-16, at most max units (a surrogate pair is never split); returns the units written */
+/* UTF-8 to UTF-16, at most max units (a surrogate pair is never split); returns the units written. A byte that
+   can't start a character, a sequence cut short, an overlong form, a surrogate or a value past U+10FFFF each become
+   one U+FFFD, as the Unicode standard's maximal subparts */
 static u32 am_utf8_to_16(const char* in, u16* out, u32 max) {
     const unsigned char* s = (const unsigned char*)in;
-    u32 n = 0, c;
+    u32 n = 0, c, need, i;
     while (*s) {
-        if (*s < 0x80)
-            c = *s++;
-        else if ((*s & 0xe0) == 0xc0 && s[1]) {
-            c = (u32)(*s & 0x1f) << 6 | (s[1] & 0x3fu);
-            s += 2;
-        } else if ((*s & 0xf0) == 0xe0 && s[1] && s[2]) {
-            c = (u32)(*s & 0x0f) << 12 | (u32)(s[1] & 0x3f) << 6 | (s[2] & 0x3fu);
-            s += 3;
-        } else if ((*s & 0xf8) == 0xf0 && s[1] && s[2] && s[3]) {
-            c = (u32)(*s & 0x07) << 18 | (u32)(s[1] & 0x3f) << 12 | (u32)(s[2] & 0x3f) << 6 | (s[3] & 0x3fu);
-            s += 4;
+        unsigned char b = *s++, lo = 0x80, hi = 0xbf; /* the range of the second byte */
+        if (b < 0x80) {
+            c = b;
+            need = 0;
+        } else if (b >= 0xc2 && b <= 0xdf) {
+            c = b & 0x1fu;
+            need = 1;
+        } else if (b >= 0xe0 && b <= 0xef) {
+            c = b & 0x0fu;
+            need = 2;
+            if (b == 0xe0) lo = 0xa0; /* overlong */
+            if (b == 0xed) hi = 0x9f; /* surrogates */
+        } else if (b >= 0xf0 && b <= 0xf4) {
+            c = b & 0x07u;
+            need = 3;
+            if (b == 0xf0) lo = 0x90; /* overlong */
+            if (b == 0xf4) hi = 0x8f; /* past U+10FFFF */
         } else {
-            s++;
-            continue;
+            c = 0xfffd;
+            need = 0;
+        }
+        for (i = 0; i < need; i++, lo = 0x80, hi = 0xbf) {
+            if (*s < lo || *s > hi) { /* the NUL at the end too: it is never consumed */
+                c = 0xfffd;
+                break;
+            }
+            c = c << 6 | (*s++ & 0x3fu);
         }
         if (c >= 0x10000) {
             if (n + 2 > max) break;
@@ -766,52 +1010,73 @@ static u32 am_utf8_to_16(const char* in, u16* out, u32 max) {
 }
 static void am_put32(u8* p, u32 v) { memcpy(p, &v, 4); }
 
-/* the software keyboard as a whole applet: the host's text dialog with the game's initial text. KeyboardConfig
-   (SwkbdConfigCommon, the second storage) gives the length limit, whether the answer is UTF-8, and where the initial
-   text is in the work buffer (the third) */
-#define AM_SWKBD_OUT 0x7d8 /* SwkbdResult and the 0x7d4 byte string buffer */
+/* the software keyboard as a whole applet: the host's text dialog with the game's initial text, or the text of the
+   environment's SNX_SWKBD_TEXT (for scripted runs). KeyboardConfig (SwkbdConfigCommon, the second storage) gives the
+   length limits, whether the answer is UTF-8, and where the initial text is in the work buffer (the third). The
+   dialog is asked again until the text is long enough, or cancelled */
+#define AM_SWKBD_OUT   0x7d8                       /* SwkbdResult and the 0x7d4 byte string buffer */
+#define AM_SWKBD_UNITS ((AM_SWKBD_OUT - 4) / 2 - 1) /* the UTF-16 text that fits with its terminator */
 static SvcObj* am_swkbd(LibApplet* a) {
     char text[SWKBD_UTF8_SIZE], initial[SWKBD_UTF8_SIZE];
-    u16 wide[SWKBD_UTF8_SIZE / 2];
-    u32 max = SWKBD_UTF8_SIZE / 2 - 1, off = 0, len = 0, n;
+    u16 wide[AM_SWKBD_UNITS + 1];
+    u32 max = AM_SWKBD_UNITS, min = 0, off = 0, len = 0, n = 0, v;
     int utf8 = 0, r;
+    const char* env = getenv("SNX_SWKBD_TEXT");
     SvcObj* out;
     u8* d;
     initial[0] = 0;
-    if (a->nin > 1 && ((StorageData*)a->in[1]->data)->size >= 0x3d4) {
+    if (a->nin > 1) {
+        u64 size = ((StorageData*)a->in[1]->data)->size;
         const u8* cfg = am_storage_bytes(a->in[1]);
-        memcpy(&n, cfg + 0x3ac, 4); /* max_text_length */
-        if (n && n < max) max = n;
-        utf8 = cfg[0x3bd];
-        memcpy(&off, cfg + 0x3c0, 4); /* initial_string_offset and _length, in the work buffer */
-        memcpy(&len, cfg + 0x3c4, 4);
+        if (size >= 0x3b4) {
+            memcpy(&v, cfg + 0x3ac, 4); /* max_text_length: 0 for no limit */
+            if (v && v < max) max = v;
+            memcpy(&min, cfg + 0x3b0, 4); /* min_text_length */
+        }
+        if (size >= 0x3d4) {
+            utf8 = cfg[0x3bd];
+            memcpy(&off, cfg + 0x3c0, 4); /* initial_string_offset and _length, in the work buffer */
+            memcpy(&len, cfg + 0x3c4, 4);
+        }
+    }
+    if (min > max) {
+        WARN("am: the software keyboard asks for %u to %u characters, %u it is\n", min, max, max);
+        min = max;
     }
     if (len && a->nin > 2) {
         u64 size = ((StorageData*)a->in[2]->data)->size;
-        if (off < size && len <= (size - off) / 2 && len <= SWKBD_UTF8_SIZE / 2) {
+        if (off < size && len <= (size - off) / 2 && len <= AM_SWKBD_UNITS) {
             memcpy(wide, am_storage_bytes(a->in[2]) + off, (size_t)len * 2);
             am_utf16_to_8(wide, len, initial, sizeof initial);
         }
     }
-    r = plat_text_input(text, sizeof text, initial);
-    if (r < 0) { /* no dialog on this host: the initial text is accepted */
-        LOG("am: no text dialog on this host, the software keyboard answers \"%s\"\n", initial);
-        memcpy(text, initial, sizeof text);
-        r = 0;
-    }
+    if (env) {
+        n = am_utf8_to_16(env, wide, max);
+        r = n < min; /* too short: cancelled, as a player can't send it */
+    } else
+        for (;;) {
+            r = plat_text_input(text, sizeof text, initial);
+            if (r < 0) {
+                WARN_LIMIT(1, "am: no text dialog on this host (zenity or kdialog), the software keyboard is "
+                              "cancelled\n");
+                r = 1;
+            }
+            if (r) break;
+            n = am_utf8_to_16(text, wide, max);
+            if (n >= min) break;
+            LOG("am: the software keyboard needs %u characters or more, it asks again\n", min);
+            am_utf16_to_8(wide, n, initial, sizeof initial);
+        }
     out = am_storage_new(AM_SWKBD_OUT, NULL);
     d = am_storage_bytes(out);
     am_put32(d, r ? 1 : 0); /* SwkbdResult: Ok, Cancel */
     if (!r) {
-        if (utf8) {
-            size_t i = 0;
-            while (text[i] && i < AM_SWKBD_OUT - 5) i++;
-            memcpy(d + 4, text, i);
-        } else {
-            n = am_utf8_to_16(text, wide, max);
+        if (utf8)
+            am_utf16_to_8(wide, n, (char*)d + 4, AM_SWKBD_OUT - 4);
+        else
             memcpy(d + 4, wide, (size_t)n * 2);
-        }
     }
+    LOG("am: swkbd %s with %u UTF-16 code units\n", r ? "cancelled" : "accepted", r ? 0 : n);
     return out;
 }
 
@@ -917,9 +1182,9 @@ static int nn_am_service_ILibraryAppletAccessor_PushInteractiveInData(SvcObj* se
     StorageData* s;
     const u8* req;
     u32 cmd;
-    if (!storage || !am_is_inline(a)) return 0;
+    if (!storage || !am_is_inline(a)) R_SUCCEED();
     s = (StorageData*)storage->data;
-    if (s->size < 4) return 0;
+    if (s->size < 4) R_SUCCEED();
     req = am_storage_bytes(storage);
     memcpy(&cmd, req, 4);
     pm_lock(&am.lock);
@@ -934,9 +1199,44 @@ static int nn_am_service_ILibraryAppletAccessor_PushInteractiveInData(SvcObj* se
     default: break; /* the dictionaries and the V2 reply flags change nothing here */
     }
     pm_unlock(&am.lock);
-    return 0;
+    R_SUCCEED();
 }
 
+/* the Mii editor (nn::mii::AppletInput, 0x100 bytes: version, mode, then a v4's special key code and CharInfo), with
+   no editor and no database to add to: an edit gives the Mii back unchanged, the modes that only show something
+   succeed, and adding or creating a Mii is cancelled, as when the player backs out of the editor. The answer is
+   nn::mii::AppletOutput {result, index} or, for create and edit, AppletOutputForCharInfoEditing {result, CharInfo} */
+#define MII_EDIT_SHOW         0
+#define MII_EDIT_APPEND       1
+#define MII_EDIT_CREATE       4
+#define MII_EDIT_EDIT         5
+#define MII_EDIT_SUCCESS      0
+#define MII_EDIT_CANCEL       1
+#define MII_EDIT_INPUT_SIZE   0x100
+#define MII_EDIT_CHARINFO     0xc /* the v4 input's CharInfo, after the version, the mode and the special key code */
+#define MII_EDIT_CHARINFO_LEN 0x58
+static SvcObj* am_mii_edit(LibApplet* a) {
+    const u8* in = NULL;
+    u32 mode = MII_EDIT_APPEND, result;
+    SvcObj* out;
+    int i;
+    for (i = 0; i < a->nin && !in; i++)
+        if (((StorageData*)a->in[i]->data)->size >= MII_EDIT_INPUT_SIZE) in = am_storage_bytes(a->in[i]);
+    if (in) memcpy(&mode, in + 4, 4);
+    if (mode == MII_EDIT_CREATE || mode == MII_EDIT_EDIT) {
+        result = mode == MII_EDIT_EDIT && in ? MII_EDIT_SUCCESS : MII_EDIT_CANCEL;
+        out = am_storage_new(0x80, NULL);
+        memcpy(am_storage_bytes(out), &result, 4);
+        if (result == MII_EDIT_SUCCESS)
+            memcpy(am_storage_bytes(out) + 4, in + MII_EDIT_CHARINFO, MII_EDIT_CHARINFO_LEN);
+        return out;
+    }
+    result = mode == MII_EDIT_APPEND || mode > MII_EDIT_EDIT ? MII_EDIT_CANCEL : MII_EDIT_SUCCESS;
+    out = am_storage_new(0x20, NULL);
+    memcpy(am_storage_bytes(out), &result, 4);
+    LOG("am: Mii editor mode %u answered %s\n", mode, result == MII_EDIT_SUCCESS ? "success" : "cancel");
+    return out;
+}
 static int nn_am_service_ILibraryAppletAccessor_PopOutData(SvcObj* self, SvcObj** storage) {
     LibApplet* a = (LibApplet*)self->data;
     u8* d;
@@ -946,28 +1246,41 @@ static int nn_am_service_ILibraryAppletAccessor_PopOutData(SvcObj* self, SvcObj*
     popped = a->out_popped || am_is_inline(a);
     a->out_popped = 1;
     pm_unlock(&am.lock);
-    if (popped) return AM_NO_DATA;
+    R_UNLESS(!popped, AM_NO_DATA);
     switch (a->applet_id) {
-    case AM_APPLET_CONTROLLER: /* ControllerSupportResultInfo: the players connected and the first of them */
+    case AM_APPLET_CONTROLLER: { /* ControllerSupportResultInfo: the players connected and the first of them */
+        /* ControllerSupportArg, the last storage pushed, starts with the fewest players the game accepts */
+        int players = hid_connected_players(&first);
+        int least = a->nin ? (signed char)am_storage_bytes(a->in[a->nin - 1])[0] : 0;
         *storage = am_storage_new(0xc, NULL);
         d = am_storage_bytes(*storage);
-        d[0] = (u8)hid_connected_players(&first);
+        d[0] = (u8)players;
         memcpy(d + 4, &first, 4);
+        if (players < least) { /* nobody to pick: the player closed the applet */
+            LOG("am: the controller applet wants %d players, %d are connected: cancelled\n", least, players);
+            am_put32(d + 8, 2); /* the result: cancelled */
+        }
         break;
+    }
     case AM_APPLET_PROFILE_SELECT: /* UiReturnArg: success, the console's user */
         *storage = am_storage_new(0x18, NULL);
         memcpy(am_storage_bytes(*storage) + 8, g_user_id, 16);
         break;
     case AM_APPLET_SWKBD: *storage = am_swkbd(a); break;
+    case AM_APPLET_MII_EDIT: *storage = am_mii_edit(a); break;
     case AM_APPLET_WEB:
+    case AM_APPLET_SHOP:
     case AM_APPLET_OFFLINE_WEB:
+    case AM_APPLET_LOGIN_SHARE:
     case AM_APPLET_WEB_AUTH: /* WebCommonReturnValue: the page was closed (0), no last URL */
         *storage = am_storage_new(0x1010, NULL);
         break;
-    default: return AM_NO_DATA;
+    default: /* the other applets' results start with a zero result code */
+        *storage = am_storage_new(0x10, NULL);
+        break;
     }
     kevent_clear(a->out_ev);
-    return 0;
+    R_SUCCEED();
 }
 static int nn_am_service_ILibraryAppletAccessor_PopInteractiveOutData(SvcObj* self, SvcObj** storage) {
     LibApplet* a = (LibApplet*)self->data;
@@ -986,16 +1299,16 @@ static int nn_am_service_ILibraryAppletAccessor_PopInteractiveOutData(SvcObj* se
 }
 static int nn_am_service_ILibraryAppletAccessor_GetPopOutDataEvent(SvcObj* self, u32* event) {
     *event = ev_handle(((LibApplet*)self->data)->out_ev);
-    return 0;
+    R_SUCCEED();
 }
 static int nn_am_service_ILibraryAppletAccessor_GetPopInteractiveOutDataEvent(SvcObj* self, u32* event) {
     *event = ev_handle(((LibApplet*)self->data)->interactive_ev);
-    return 0;
+    R_SUCCEED();
 }
 static int nn_am_service_ILibraryAppletAccessor_GetLibraryAppletInfo(SvcObj* self,
                                                                     nn_am_service_LibraryAppletInfo* info) {
     LibApplet* a = (LibApplet*)self->data;
     info->applet_id = a->applet_id;
     info->library_applet_mode = a->mode;
-    return 0;
+    R_SUCCEED();
 }

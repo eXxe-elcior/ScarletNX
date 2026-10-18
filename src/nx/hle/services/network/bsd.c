@@ -154,7 +154,8 @@ static int addr_in(u64 a, u64 n, SnxSockAddr* out) {
     }
     return -SNX_EAFNOSUPPORT;
 }
-/* writes what fits of the address, and returns its whole size (the addrlen the guest gets back) */
+/* writes what fits of the address, and returns the length written (the addrlen the guest gets back), as a BSD stack
+   answers getsockname, getpeername, accept and recvfrom */
 static u32 addr_out(const SnxSockAddr* a, u64 dst, u64 cap) {
     u8 p[BSD_SOCKADDR_IN6];
     u32 n = a->family == SNX_AF_INET6 ? BSD_SOCKADDR_IN6 : BSD_SOCKADDR_IN;
@@ -168,7 +169,9 @@ static u32 addr_out(const SnxSockAddr* a, u64 dst, u64 cap) {
         memcpy(p + 24, &a->scope_id, 4);
     } else
         memcpy(p + 4, a->addr, 4);
-    if (dst) memcpy(GP(dst), p, cap < n ? cap : n);
+    if (!dst) return 0;
+    if (cap < n) n = (u32)cap;
+    memcpy(GP(dst), p, n);
     return n;
 }
 
@@ -225,7 +228,7 @@ static void bsd_destroy(SvcObj* o) {
 static int reply(int64_t r, i32* ret, u32* bsd_errno) {
     *ret = r < 0 ? -1 : (i32)r;
     *bsd_errno = r < 0 ? (u32)-r : 0;
-    return 0;
+    R_SUCCEED();
 }
 /* and an address's or an option's length, 0 on failure */
 static int reply_len(int64_t r, u32 len, i32* ret, u32* bsd_errno, u32* out_len) {
@@ -237,7 +240,7 @@ static int bsd_unknown(SvcObj* self, IpcCtx* c) {
     if (ipc_warn_once(self->name, c->cmd)) WARN("  [not implemented] %s cmd %u -> EOPNOTSUPP\n", self->name, c->cmd);
     out32(c, (u32)-1);
     out32(c, SNX_EOPNOTSUPP);
-    return 0;
+    R_SUCCEED();
 }
 #define WITH_SOCKET(fdarg)                                                                                             \
     BsdFd d;                                                                                                           \
@@ -253,7 +256,7 @@ static int bsd_register(SvcObj* self, u64 pid) {
     g_client = self;
     g_client_pid = pid;
     pm_unlock(&g_client_lk);
-    return 0;
+    R_SUCCEED();
 }
 static int nn_socket_sf_IClient_RegisterClient(SvcObj* self, const nn_socket_sf_LibraryConfigData* config, u64 pid,
                                                u64 transfer_memory_size, u32 transfer_memory, u32* bsd_errno) {
@@ -364,7 +367,7 @@ static int nn_socket_sf_IClient_Poll(SvcObj* self, i32 nfds, i32 timeout, IpcBuf
     /* Eden: no entries is -1 with errno 0 */
     if (!nfds) {
         *ret = -1;
-        return 0;
+        R_SUCCEED();
     }
     if (nfds < 0) return reply(-SNX_EINVAL, ret, bsd_errno);
     if (nfds > 4096 || !ia || is < (u64)nfds * 8 || (oa && os < (u64)nfds * 8))
@@ -545,9 +548,15 @@ static int nn_socket_sf_IClient_SetSockOpt(SvcObj* self, i32 fd, i32 level_in, i
     int level, name, k = sockopt_in(glevel, gname, &level, &name), r = 0;
     if (k > 0) {
         u8 v[32];
+        i64 sec;
         memset(v, 0, sizeof v);
         if (a) memcpy(v, GP(a), n < sizeof v ? n : sizeof v);
-        r = snx_socket_setsockopt(s, level, name, v, n);
+        memcpy(&sec, v, sizeof sec);
+        /* FreeBSD's sosetopt: a timeout before zero is out of range, where Linux (and the stack) take it as expired */
+        if (level == SNX_SOL_SOCKET && (name == SNX_SO_RCVTIMEO || name == SNX_SO_SNDTIMEO) && n >= 16 && sec < 0)
+            r = -SNX_EDOM;
+        else
+            r = snx_socket_setsockopt(s, level, name, v, n);
         /* the host refusing an option the console has (a buffer size out of its range, SO_DEBUG without
            privileges) isn't the game's fault: it gets what the console would answer */
         if (r == -SNX_ENOPROTOOPT || r == -SNX_EPERM || r == -SNX_EACCES) {

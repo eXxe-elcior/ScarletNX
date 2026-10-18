@@ -36,6 +36,9 @@ if(APPLE)
 endif()
 snx_component(kernel hle/kernel/kernel.c hle/kernel/thread.c hle/kernel/sync.c hle/svc/svc.c hle/svc/svc_mem.c hle/kernel/debug.c
               memory/mem.c hle/kernel/ipc.c)
+# the SVC dispatch, generated from hle/svc/hos.svc
+include("${PROJECT_SOURCE_DIR}/cmake/svcgen.cmake")
+snx_svcgen(snx_kernel)
 snx_component(hle hle/services/services.c hle/services/audren.c hle/services/audren_dsp.c hle/services/pl.c hle/services/sm.c hle/services/am.c hle/services/set.c hle/services/time.c hle/services/acc.c hle/services/audio.c
               hle/services/misc.c hle/services/ldr.c hle/services/network/bsd.c hle/services/network/dns.c
               hle/services/network/nifm.c hle/services/network/ssl.c hle/filesystem/fs.c hle/services/hid.c hle/services/hid_motion.c hle/services/hid_touch.c hle/services/vi.c hle/services/nvdrv.c)
@@ -53,8 +56,9 @@ snx_swipc(snx_hle ROOT "${CMAKE_CURRENT_SOURCE_DIR}" FILES
           hle/filesystem/fs.swipc)
 snx_component(video gpu/video/host1x.c gpu/video/nvdec.c gpu/video/vp9_rebuild.cpp gpu/video/vic.c)
 target_link_libraries(snx_video PRIVATE FFmpeg::avcodec)
-# hwopus (hle/services/audio.c) decodes Opus with FFmpeg too
-target_link_libraries(snx_hle PRIVATE FFmpeg::avcodec OpenSSL::SSL)
+# hwopus (hle/services/audio.c) decodes Opus with FFmpeg too; acc's user picture is a splash drawing (cmake/splash.cmake)
+include("${PROJECT_SOURCE_DIR}/cmake/splash.cmake")
+target_link_libraries(snx_hle PRIVATE FFmpeg::avcodec OpenSSL::SSL snx_splash)
 snx_component(gpu gpu/gpu.c gpu/maxwell/engines.c gpu/maxwell/mme.c gpu/maxwell/compute.c gpu/maxwell/fermi2d.c gpu/maxwell/dma.c gpu/maxwell/write_pages.c gpu/maxwell/maxwell3d.c gpu/renderer.c)
 
 include("${PROJECT_SOURCE_DIR}/cmake/controls_atlas.cmake")
@@ -72,10 +76,16 @@ snx_component(platform ${platform})
 
 snx_component(shader gpu/shader/shader.c gpu/shader/decode.c gpu/shader/corpus.c
                      gpu/shader/spirv_translate.c gpu/shader/spirv_compute.c gpu/shader/spirv_emit.c)
+# the opcode enum and decoder, generated from gpu/shader/maxwell_opcodes.def
+include("${PROJECT_SOURCE_DIR}/cmake/shaderdec.cmake")
+snx_shaderdec(snx_shader)
 snx_component(vk gpu/vk/renderer.c gpu/vk/device.c gpu/vk/cmd.c gpu/vk/format.c gpu/vk/surface.c gpu/vk/texture.c
                  gpu/vk/buffer.c gpu/vk/writeback.c gpu/vk/pipeline.c gpu/vk/render.c gpu/vk/release.c gpu/vk/query.c gpu/vk/compute.c
-                 gpu/vk/pending_pages.c gpu/vk/astc.c gpu/vk/ui.c gpu/texture/etc2.c gpu/texture/depth.c gpu/vk/vic.c gpu/vk/vma.cpp
+                 gpu/vk/pending_pages.c gpu/vk/memory.c gpu/vk/astc.c gpu/vk/ui.c gpu/texture/etc2.c gpu/texture/depth.c gpu/vk/vic.c gpu/vk/vma.cpp
                  "${volk_SOURCE_DIR}/volk.c")
+# the ASTC decoder's SPIR-V, compiled from its GLSL at build time (cmake/glsl.cmake)
+include("${PROJECT_SOURCE_DIR}/cmake/glsl.cmake")
+snx_glsl_spirv(snx_vk SOURCE gpu/texture/astc.comp NAME astc_spv HEADER nx/gpu/texture/astc_spv.h)
 set(components core kernel hle video gpu platform shader vk)
 # third-party code (vma.cpp is VMA's implementation)
 set_source_files_properties("${volk_SOURCE_DIR}/volk.c" gpu/vk/vma.cpp PROPERTIES COMPILE_OPTIONS -w)
@@ -192,6 +202,19 @@ if(BUILD_TESTING AND SNX_TEST_VULKAN)
     add_test(NAME vulkan_headless COMMAND snx-test-vulkan -H)
     set_tests_properties(vulkan_headless PROPERTIES TIMEOUT 60
         FAIL_REGULAR_EXPRESSION "vulkan validation:;failed: VK_ERROR")
+    # the ASTC upload against the CPU decoder, with the backend's own frames, staging and allocations and the SPIR-V
+    # the build makes (the file snx_glsl_spirv generated for snx_vk above). Again under a 4 MiB allocation cap, so
+    # images in pieces are tested too. `snx-test-astc-vulkan --large` decodes two 512 MiB textures (minutes on lavapipe)
+    add_executable(snx-test-astc-vulkan "${PROJECT_SOURCE_DIR}/tests/astc_vulkan.c" gpu/texture/astc.c gpu/vk/astc.c
+        gpu/vk/cmd.c gpu/vk/memory.c gpu/vk/vma.cpp "${volk_SOURCE_DIR}/volk.c"
+        "${CMAKE_BINARY_DIR}/generated/spirv/astc_spv.c")
+    target_link_libraries(snx-test-astc-vulkan PRIVATE snx_nx_flags Threads::Threads ${CMAKE_DL_LIBS})
+    set_target_properties(snx-test-astc-vulkan PROPERTIES LINKER_LANGUAGE CXX)
+    add_test(NAME astc_vulkan COMMAND snx-test-astc-vulkan)
+    add_test(NAME astc_vulkan_pieces COMMAND snx-test-astc-vulkan)
+    set_tests_properties(astc_vulkan_pieces PROPERTIES ENVIRONMENT SNX_VK_MAX_ALLOCATION_MB=4
+        PASS_REGULAR_EXPRESSION "memory in pieces")
+    set_tests_properties(astc_vulkan astc_vulkan_pieces PROPERTIES TIMEOUT 300)
 endif()
 if(BUILD_TESTING)
     snx_test_sanitize(snx_shader) # tests/CMakeLists.txt: made after it looked

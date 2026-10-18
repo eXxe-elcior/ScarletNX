@@ -1,15 +1,17 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later
    Copyright 2026 the ScarletNX contributors */
-/* mm:u (misc.c) and hid's IHidServer (hid.c) through their generated dispatchers, with the kernel objects they hand
-   out made here and the shared memory a host buffer */
+/* mm:u and the smaller services (misc.c), hid's IHidServer (hid.c) and acc (acc.c) through their generated
+   dispatchers, with the kernel objects they hand out made here and the shared memory a host buffer */
 #include "nx/hle/services/services_int.h"
 #include <math.h>
 #include <stdarg.h>
 
+#include "nx/hle/services/acc.c"
 #include "nx/hle/services/hid.c"
 #include "nx/hle/services/misc.c"
 
 u8* g_mem;
+u64 g_user_id[2] = {0x0123456789ABCDEFull, 0xFEDCBA9876543210ull};
 int g_verbose;
 int g_opt_docked, g_opt_lang = 1;
 u64 g_title_id = 0x0100BF00112C0000ull;
@@ -34,6 +36,19 @@ static void test_fail(const char* expression, int line) {
 void pm_init(PMutex* m) { (void)m; }
 void pm_lock(PMutex* m) { (void)m; }
 void pm_unlock(PMutex* m) { (void)m; }
+/* the data folder: only the add-on images in test_aoc_installed, ids of system/archives/<id>.romfs */
+static u64 test_aoc_installed[4];
+FILE* fs_open_read(const char* path, u64* size) {
+    char want[64];
+    for (size_t i = 0; i < 4 && test_aoc_installed[i]; i++) {
+        snprintf(want, sizeof want, "system/archives/%016llx.romfs", (unsigned long long)test_aoc_installed[i]);
+        if (!strcmp(path, want)) {
+            if (size) *size = 0;
+            return tmpfile(); /* any open file, which /dev/null is not on Windows: the scan only closes it */
+        }
+    }
+    return NULL;
+}
 void logf_(int level, const char* format, ...) {
     (void)level;
     (void)format;
@@ -162,7 +177,7 @@ KEvent* owned_event(const char* name) {
 
 typedef struct {
     IpcCtx c;
-    u8 raw[32];
+    u8 raw[0x60];
 } Request;
 static IpcCtx* request(Request* r, u32 cmd) {
     memset(r, 0, sizeof *r);
@@ -426,6 +441,7 @@ static void test_npad_players(SvcObj* h) {
     static const u32 no2_only[] = {1};
     u8* e1 = kshmem_ptr(hid.shm) + HO_HidSharedMemory_npad + HS_HidNpadSharedMemoryEntry;
     u32 assignment, selected_id;
+    u64 props;
     i32 sticks[4];
     KEvent* no2 = style_event(h, 1);
     KEvent* no3 = style_event(h, 2);
@@ -471,11 +487,19 @@ static void test_npad_players(SvcObj* h) {
     hid_update();
     CHECK(fabsf(npad_latest_direction(1, HO_HidNpadInternalState_joy_left_six_axis_sensor_lifo, 28)) < 0.0005f);
     g_pad_extra[0].motion[0].valid = 0;
+    /* upright, a single Joy-Con's header says so (footer JoyLeftVertical, ABXY oriented); held sideways, the other */
+    CHECK(e1[HO_HidNpadInternalState_applet_footer_ui_type] == 9);
+    memcpy(&props, e1 + HO_HidNpadInternalState_system_properties, 8);
+    CHECK((props & (3u << 11)) == 1u << 11 && (props & (1u << 14)));
     joy_hold(h, 1);
     hid_update();
     npad_latest_sticks(1, HO_HidNpadInternalState_joy_left_lifo, sticks);
     CHECK(sticks[0] == 1000 && sticks[1] == 0);
+    CHECK(e1[HO_HidNpadInternalState_applet_footer_ui_type] == 8);
+    memcpy(&props, e1 + HO_HidNpadInternalState_system_properties, 8);
+    CHECK((props & (3u << 11)) == 1u << 12);
     joy_hold(h, 0);
+    CHECK(e1[HO_HidNpadInternalState_applet_footer_ui_type] == 9);
     memcpy(&assignment, e1 + HO_HidNpadInternalState_joy_assignment_mode, 4);
     CHECK(assignment == 1);
     set_ids(h, fewer_ids, 4);
@@ -569,6 +593,12 @@ static void test_hid(void) {
     g_opt_docked = 0;
     hid_update();
     CHECK(npad_style_at(8) == 1u << 1);
+    /* the handheld Npad's full-key LIFO carries No1's state too */
+    g_pad.buttons = 1ull << 3;
+    hid_update();
+    CHECK(npad_latest_buttons(8, HO_HidNpadInternalState_handheld_lifo) == 1ull << 3);
+    CHECK(npad_latest_buttons(8, HO_HidNpadInternalState_full_key_lifo) == 1ull << 3);
+    g_pad.buttons = 0;
     CHECK(get_styles(h) == 0x7F); /* every style until the game says which it takes */
     CHECK(no1_style() == 1);      /* No1 is a Pro Controller */
     KEvent* no1 = style_event(h, 0);
@@ -605,6 +635,128 @@ static void test_hid(void) {
     for (int i = 0; i < 10; i++) kobj_unref(&hid.style_ev[i]->o);
 }
 
+/* ngc:u's Check (1) and Mask (2) {languages, options} of a text, and ngct:u's Match (0) and Filter (1): nothing found
+   or masked, the text back as sent and no byte past the room for it; GetContentVersion (0) 1 */
+typedef struct {
+    IpcCtx c;
+    u8 raw[0x40];
+} NgcRequest;
+static IpcCtx* ngc_request(NgcRequest* r, u32 cmd) {
+    memset(r, 0, sizeof *r);
+    r->c.cmd = cmd;
+    r->c.raw = r->raw;
+    r->c.raw_size = sizeof r->raw;
+    return &r->c;
+}
+static void test_ngc(void) {
+    static const char text[] = "edenprobe player";
+    SvcObj* ngc = new_ngc();
+    SvcObj* ngct = new_ngct();
+    NgcRequest r;
+    u32 cmd, v;
+    memcpy(g_mem + 0x100, text, sizeof text);
+    ngc_request(&r, 0);
+    CHECK(ngc->dispatch(ngc, &r.c) == 0 && r.c.out_size == 4);
+    memcpy(&v, r.c.out, 4);
+    CHECK(v == 1);
+    for (cmd = 1; cmd <= 5; cmd++) {
+        if (cmd == 3) continue;
+        ngc_request(&r, cmd);
+        v = 2; /* American English */
+        memcpy(r.raw, &v, 4);
+        r.c.na = 1;
+        r.c.a[0].addr = 0x100;
+        r.c.a[0].size = sizeof text;
+        if (cmd == 2 || cmd == 5) {
+            memset(g_mem + 0x200, 0xEE, 0x40);
+            r.c.nb = 1;
+            r.c.b[0].addr = 0x200;
+            r.c.b[0].size = sizeof text - 4; /* room for less than the text */
+        }
+        CHECK(ngc->dispatch(ngc, &r.c) == 0 && r.c.out_size == 4);
+        memcpy(&v, r.c.out, 4);
+        CHECK(v == 0);
+        if (cmd == 2 || cmd == 5)
+            CHECK(!memcmp(g_mem + 0x200, text, sizeof text - 4) && g_mem[0x200 + sizeof text - 4] == 0xEE);
+    }
+    ngc_request(&r, 0);
+    r.c.nx = 1;
+    r.c.x[0].addr = 0x100;
+    r.c.x[0].size = sizeof text;
+    CHECK(ngct->dispatch(ngct, &r.c) == 0 && r.c.out_size == 4 && r.c.out[0] == 0);
+    ngc_request(&r, 1);
+    memset(g_mem + 0x200, 0xEE, 0x40);
+    r.c.nx = 1;
+    r.c.x[0].addr = 0x100;
+    r.c.x[0].size = sizeof text;
+    r.c.nc = 1;
+    r.c.c[0].addr = 0x200;
+    r.c.c[0].size = 0x40;
+    CHECK(ngct->dispatch(ngct, &r.c) == 0 && !memcmp(g_mem + 0x200, text, sizeof text) &&
+          g_mem[0x200 + sizeof text] == 0xEE);
+    svcobj_unref(ngct);
+    svcobj_unref(ngc);
+}
+
+/* apm: Get (1) and Set (0) {mode, configuration} on a session, one configuration per mode, Config7 for both at
+   first; one that is not a configuration, or a mode past Boost, kept out; SetCpuBoostMode's modes for Boost */
+static u32 apm_get(SvcObj* s, u32 mode) {
+    Request r;
+    request(&r, 1);
+    argument32(&r, 0, mode);
+    call(s, &r);
+    CHECK(r.c.out_size == 4);
+    return reply32(&r, 0);
+}
+static void apm_set(SvcObj* s, u32 mode, u32 config) {
+    Request r;
+    request(&r, 0);
+    argument32(&r, 0, mode);
+    argument32(&r, 4, config);
+    call(s, &r);
+    CHECK(r.c.out_size == 0);
+}
+static void test_apm(void) {
+    SvcObj* apm = new_apm();
+    Request r;
+    request(&r, 0);
+    call(apm, &r);
+    CHECK(r.c.nout_objs == 1);
+    SvcObj* s = r.c.out_objs[0];
+    CHECK(apm_get(s, 0) == 0x00020003u && apm_get(s, 1) == 0x00020003u);
+    apm_set(s, 0, 0x00010000u);
+    CHECK(apm_get(s, 0) == 0x00010000u && apm_get(s, 1) == 0x00020003u);
+    apm_set(s, 0, 0x12345678u);
+    apm_set(s, 2, 0x00010001u);
+    CHECK(apm_get(s, 0) == 0x00010000u && apm_get(s, 1) == 0x00020003u);
+    apm_cpu_boost(1);
+    CHECK(apm_get(s, 1) == 0x92220009u && apm_get(s, 0) == 0x00010000u);
+    apm_cpu_boost(2);
+    CHECK(apm_get(s, 1) == 0x9222000Bu);
+    apm_cpu_boost(3);
+    CHECK(apm_get(s, 1) == 0x9222000Bu);
+    apm_cpu_boost(0);
+    apm_set(s, 0, 0x00020003u);
+    CHECK(apm_get(s, 1) == 0x00020003u && apm_get(s, 0) == 0x00020003u);
+    svcobj_unref(s);
+    svcobj_unref(apm);
+}
+
+/* StoreSaveDataThumbnail (110) {uid}: a thumbnail of 0x24000 bytes for the user is taken; one of another size is
+   InvalidArrayLength, one for a user id of nought InvalidUserId */
+static void test_acc_thumbnail(void) {
+    static const u8 nobody[16];
+    nn_account_Uid uid;
+    IpcBuf image = {0x1000, 0x24000, 0};
+    memcpy(uid.v, g_user_id, 16);
+    CHECK(nn_account_IAccountServiceForApplication_StoreSaveDataThumbnail(NULL, &uid, image) == 0);
+    image.size = 0x1000;
+    CHECK(nn_account_IAccountServiceForApplication_StoreSaveDataThumbnail(NULL, &uid, image) == RC(124, 32));
+    image.size = 0x24000;
+    memcpy(uid.v, nobody, 16);
+    CHECK(nn_account_IAccountServiceForApplication_StoreSaveDataThumbnail(NULL, &uid, image) == RC(124, 20));
+}
+
 static void test_mii_default(void) {
     SvcObj* service = new_mii();
     Request r;
@@ -631,6 +783,345 @@ static void test_mii_default(void) {
     request(&r, 7);
     argument32(&r, 0, 6);
     CHECK(db->dispatch(db, &r.c) == RC(126, 1));
+    /* the six defaults counted and given by Get, each BuildDefault's build past its random create id */
+    request(&r, 2);
+    argument32(&r, 0, 2);
+    call(db, &r);
+    CHECK(reply32(&r, 0) == 6);
+    request(&r, 2);
+    argument32(&r, 0, 1);
+    call(db, &r);
+    CHECK(reply32(&r, 0) == 0);
+    memset(g_mem + 0x4000, 0xee, 8 * 0x5c);
+    request(&r, 3);
+    argument32(&r, 0, 3);
+    r.c.nb = 1;
+    r.c.b[0].addr = 0x4000;
+    r.c.b[0].size = 8 * 0x5c;
+    call(db, &r);
+    CHECK(reply32(&r, 0) == 6);
+    for (u32 i = 0; i < 6; i++) {
+        u8 built[0x58];
+        u32 source;
+        request(&r, 7);
+        argument32(&r, 0, i);
+        call(db, &r);
+        memcpy(built, r.c.out, sizeof built);
+        CHECK(memcmp(g_mem + 0x4000 + i * 0x5c + 0x10, built + 0x10, 0x48) == 0);
+        memcpy(&source, g_mem + 0x4000 + i * 0x5c + 0x58, 4);
+        CHECK(source == 1);
+    }
+    CHECK(g_mem[0x4000 + 6 * 0x5c] == 0xee);
+    request(&r, 4);
+    argument32(&r, 0, 2);
+    r.c.nb = 1;
+    r.c.b[0].addr = 0x5000;
+    r.c.b[0].size = 6 * 0x58;
+    call(db, &r);
+    CHECK(reply32(&r, 0) == 6 && memcmp(g_mem + 0x5000 + 0x58 + 0x10, g_mem + 0x4000 + 0x5c + 0x10, 0x48) == 0);
+    request(&r, 3);
+    argument32(&r, 0, 2);
+    r.c.nb = 1;
+    r.c.b[0].addr = 0x4000;
+    r.c.b[0].size = 5 * 0x5c;
+    CHECK(db->dispatch(db, &r.c) == RC(126, 2));
+    request(&r, 1);
+    call(db, &r);
+    CHECK(reply32(&r, 0) == 0);
+    /* the bytes BuildDefault does not set are nought, whatever the CharInfo held */
+    nn_mii_CharInfo poisoned;
+    memset(&poisoned, 0xee, sizeof poisoned);
+    CHECK(nn_mii_detail_IDatabaseService_BuildDefault(NULL, 0, &poisoned) == 0);
+    CHECK(poisoned.v[0x11] == 0 && poisoned.v[0x1e] == 0 && poisoned.v[0x25] == 0);
+    svcobj_unref(db);
+    svcobj_unref(service);
+}
+
+/* mm:u past its 32 requests: the id is still the client's, and reads back no clock */
+static void test_mm_full(void) {
+    SvcObj* mm = new_mm();
+    u32 ids[33], i;
+    for (i = 0; i < 33; i++) ids[i] = mm_init(mm, 5);
+    CHECK(ids[32] && ids[32] != ids[31]);
+    mm_set_and_wait(mm, 6, ids[32], 1, 2);
+    CHECK(mm_get_setting(mm, 7, ids[32]) == 0);
+    mm_set_and_wait(mm, 6, ids[31], 3, 4);
+    CHECK(mm_get_setting(mm, 7, ids[31]) == 3);
+    svcobj_unref(mm);
+}
+
+/* nfp and nfc with no NFC device: the state follows Initialize and Finalize, the availability event is one per
+   IUser, and the device commands fail */
+static void test_nfp(void) {
+    SvcObj *manager = new_nfp(), *user = NULL, *nfc_manager = new_nfc(), *nfc = NULL;
+    IpcBuf none = {0, 0, 0};
+    nn_nfc_DeviceHandle device;
+    u32 state = 9, a, b;
+    i32 count;
+    memset(&device, 0, sizeof device);
+    CHECK(nn_nfp_detail_IUserManager_CreateUserInterface(manager, &user) == 0 && user);
+    CHECK(nn_nfp_detail_IUser_GetState(user, &state) == 0 && state == 0);
+    CHECK(nn_nfp_detail_IUser_ListDevices(user, none, &count) == RC(115, 80));
+    CHECK(nn_nfp_detail_IUser_Initialize(user, 0, 0, none) == 0);
+    CHECK(nn_nfp_detail_IUser_GetState(user, &state) == 0 && state == 1);
+    CHECK(nn_nfp_detail_IUser_ListDevices(user, none, &count) == RC(115, 64));
+    CHECK(nn_nfp_detail_IUser_StartDetection(user, &device) == RC(115, 64));
+    CHECK(nn_nfp_detail_IUser_GetDeviceState(user, &device, &state) == 0 && state == 6);
+    CHECK(nn_nfp_detail_IUser_AttachAvailabilityChangeEvent(user, &a) == 0);
+    CHECK(nn_nfp_detail_IUser_AttachAvailabilityChangeEvent(user, &b) == 0);
+    CHECK(handle_object(a) == handle_object(b) && !((KEvent*)handle_object(a))->signaled);
+    CHECK(nn_nfp_detail_IUser_Finalize(user) == 0);
+    CHECK(nn_nfp_detail_IUser_GetState(user, &state) == 0 && state == 0);
+    CHECK(nn_nfc_detail_IUserManager_CreateUserInterface(nfc_manager, &nfc) == 0 && nfc);
+    CHECK(nn_nfc_detail_IUser_ListDevices(nfc, none, &count) == RC(127, 77));
+    CHECK(nn_nfc_detail_IUser_InitializeOld(nfc, 0, 0, none) == 0);
+    CHECK(nn_nfc_detail_IUser_GetState(nfc, &state) == 0 && state == 1);
+    CHECK(nn_nfc_detail_IUser_ListDevices(nfc, none, &count) == RC(127, 64));
+    CHECK(nn_nfc_detail_IUser_AttachAvailabilityChangeEvent(nfc, &a) == 0);
+    CHECK(nn_nfc_detail_IUser_AttachAvailabilityChangeEvent(nfc, &b) == 0 && handle_object(a) == handle_object(b));
+    close_handles();
+    svcobj_unref(nfc);
+    svcobj_unref(nfc_manager);
+    svcobj_unref(user);
+    svcobj_unref(manager);
+}
+
+/* acc's TrySelectUserWithoutInteraction: 51, and 52, which a game built for 19.0.0 sends instead, both pick the one
+   user {is_network_service_account_required} */
+static void test_acc_select(void) {
+    SvcObj* acc = new_acc();
+    Request r;
+    for (u32 cmd = 51; cmd <= 52; cmd++) {
+        request(&r, cmd);
+        call(acc, &r);
+        CHECK(r.c.out_size == 16 && !memcmp(r.c.out, g_user_id, 16));
+    }
+    svcobj_unref(acc);
+}
+
+/* ldn:u's CreateClientProcessMonitor (1, 18.0.0+) gives the monitor libnx's ldnInitialize registers its process
+   with: RegisterClient (0), the pid and its word in the raw data, nothing else */
+static void test_ldn_monitor(void) {
+    SvcObj* ldn = new_ldn();
+    Request r;
+    request(&r, 1);
+    call(ldn, &r);
+    CHECK(r.c.nout_objs == 1 && r.c.out_objs[0] != NULL);
+    SvcObj* monitor = r.c.out_objs[0];
+    request(&r, 0);
+    r.c.raw_size = 8;
+    r.c.pid = 0x51;
+    r.c.has_pid = 1;
+    call(monitor, &r);
+    CHECK(r.c.out_size == 0);
+    svcobj_unref(monitor);
+    svcobj_unref(ldn);
+}
+
+/* nfp's StartDetectionWithFilter (25, 23.0.0+) answers what StartDetection (3) does for the same device, before and
+   after Initialize {aruid, pid, buffer}; the filter word after the device is not read */
+static void test_nfp_filter(void) {
+    SvcObj* manager = new_nfp();
+    Request r;
+    request(&r, 0);
+    call(manager, &r);
+    CHECK(r.c.nout_objs == 1);
+    SvcObj* user = r.c.out_objs[0];
+    for (int initialized = 0; initialized < 2; initialized++) {
+        if (initialized) {
+            request(&r, 0);
+            r.c.has_pid = 1;
+            r.c.na = 1;
+            call(user, &r);
+        }
+        int answers[2];
+        for (int i = 0; i < 2; i++) {
+            request(&r, i ? 25 : 3);
+            argument32(&r, 0, 0x20);
+            argument32(&r, 8, 0xFFFFFFFFu);
+            answers[i] = user->dispatch(user, &r.c);
+        }
+        CHECK(answers[0] == answers[1] && answers[0] == (initialized ? NFP_DEVICE_NOT_FOUND : NFP_NFC_DISABLED));
+    }
+    svcobj_unref(user);
+    svcobj_unref(manager);
+}
+
+/* aoc:u's ListAddOnContent (3) {offset, count, pid} with no add-on content: from the end (0) nothing, from past it
+   (1, or a negative offset, which the console reads unsigned) am's ApplicationRecordNotFound */
+static void test_aoc_list(void) {
+    static const u32 offsets[] = {0, 1, 0xFFFFFFFFu};
+    SvcObj* aoc = new_aoc();
+    Request r;
+    for (u32 i = 0; i < 3; i++) {
+        request(&r, 3);
+        argument32(&r, 0, offsets[i]);
+        argument32(&r, 4, 16);
+        r.c.has_pid = 1;
+        r.c.nb = 1;
+        if (i) {
+            CHECK(aoc->dispatch(aoc, &r.c) == RC(128, 37));
+            continue;
+        }
+        call(aoc, &r);
+        CHECK(r.c.out_size == 4 && reply32(&r, 0) == 0);
+    }
+    svcobj_unref(aoc);
+}
+
+/* aoc:u with the add-on images 1 and 3 in the data folder: CountAddOnContent (2) and the game's own
+   CountAddOnContentByApplicationId (0) say 2, another application's 0; ListAddOnContent (3) and
+   ListAddOnContentByApplicationId (1) {offset, count, ...} give the indices from offset, as many as count and the
+   buffer hold, nothing from the end and ApplicationRecordNotFound past it; PrepareAddOnContent (7) succeeds */
+static void test_aoc_content(void) {
+    static const struct {
+        u32 cmd, offset, count, room, rc, n, first;
+    } lists[] = {
+        {3, 0, 16, 16, 0, 2, 1}, {3, 1, 16, 16, 0, 1, 3},           {3, 0, 1, 16, 0, 1, 1},
+        {3, 0, 16, 1, 0, 1, 1},  {3, 2, 16, 16, 0, 0, 0},           {3, 3, 16, 16, RC(128, 37), 0, 0},
+        {1, 0, 16, 16, 0, 2, 1}, {1, 3, 16, 16, RC(128, 37), 0, 0},
+    };
+    const u64 base = aoc_base_id(g_title_id), other = 0x0100000000020000ull;
+    SvcObj* aoc = new_aoc();
+    Request r;
+    u32 v;
+    test_aoc_installed[0] = base + 1;
+    test_aoc_installed[1] = base + 3;
+    aoc_scanned = aoc_count = 0; /* test_aoc_list scanned an empty folder */
+    request(&r, 2);
+    r.c.has_pid = 1;
+    call(aoc, &r);
+    CHECK(reply32(&r, 0) == 2);
+    for (u32 i = 0; i < 2; i++) {
+        request(&r, 0);
+        argument64(&r, 0, i ? other : g_title_id);
+        call(aoc, &r);
+        CHECK(reply32(&r, 0) == (i ? 0u : 2u));
+    }
+    for (u32 i = 0; i < sizeof lists / sizeof lists[0]; i++) {
+        request(&r, lists[i].cmd);
+        argument32(&r, 0, lists[i].offset);
+        argument32(&r, 4, lists[i].count);
+        if (lists[i].cmd == 1) argument64(&r, 8, g_title_id);
+        r.c.has_pid = lists[i].cmd == 3;
+        r.c.nb = 1;
+        r.c.b[0].addr = 0x4000;
+        r.c.b[0].size = lists[i].room * 4;
+        memset(g_mem + 0x4000, 0xAA, 64);
+        CHECK((u32)aoc->dispatch(aoc, &r.c) == lists[i].rc);
+        if (lists[i].rc) continue;
+        CHECK(reply32(&r, 0) == lists[i].n);
+        memcpy(&v, g_mem + 0x4000, 4);
+        CHECK(!lists[i].n || v == lists[i].first);
+    }
+    request(&r, 7);
+    argument32(&r, 0, 1);
+    r.c.has_pid = 1;
+    call(aoc, &r);
+    svcobj_unref(aoc);
+    memset(test_aoc_installed, 0, sizeof test_aoc_installed);
+    aoc_scanned = aoc_count = 0;
+}
+
+/* nn::mii::detail::CharInfoRaw::Verify as the SDK checks a CharInfo (Mario Kart 8 Deluxe's sdk, 9c068c8): a create id
+   not all zeros with the RFC 4122 variant, a nickname of 1 to 10 characters ending in zeros, and each field in its
+   range. A game builds no Mii from a CharInfo that fails it */
+static int mii_valid(const u8* c) {
+    static const u8 max[49] = {3, 11, 1,  0x7f, 0x7f, 1,  3,  11, 9,  11, 11, 131, 99, 1,  59, 99, 7,
+                               6, 7,  12, 18,   23,   99, 8,  6,  11, 12, 15, 17,  8,  18, 35, 99, 8,
+                               6, 18, 99, 5,    5,    8,  16, 19, 99, 7,  20, 1,   8,  16, 31};
+    int i, zero = 1, end = 0;
+    for (i = 0; i < 16; i++)
+        if (c[i]) zero = 0;
+    if (zero || (c[8] & 0xc0) != 0x80) return 0;
+    if (!c[0x10] && !c[0x11]) return 0;
+    for (i = 0; i < 11; i++) {
+        int ch = c[0x10 + 2 * i] | c[0x11 + 2 * i] << 8;
+        if (!ch)
+            end = 1;
+        else if (end || i == 10)
+            return 0;
+    }
+    for (i = 0; i < 49; i++)
+        if (c[0x26 + i] > max[i]) return 0;
+    return 1;
+}
+
+/* BuildRandom (6): a valid Mii every time, of the age, gender and race asked (or any for All, 3, 2, 3), laid out as
+   Eden's CoreData::BuildRandom and CharInfo::SetFromStoreData make it. Mario Kart 8 Deluxe asks for 13 at its title,
+   and builds its Mii racers from them */
+static void test_mii_random(void) {
+    SvcObj* service = new_mii();
+    Request r;
+    u8 last[16] = {0};
+    int differ = 0, female = 0, male = 0;
+    request(&r, 0);
+    call(service, &r);
+    SvcObj* db = r.c.out_objs[0];
+    for (u32 age = 0; age <= 3; age++)
+        for (u32 gender = 0; gender <= 2; gender++)
+            for (u32 race = 0; race <= 3; race++)
+                for (int n = 0; n < 40; n++) {
+                    request(&r, 6);
+                    argument32(&r, 0, age);
+                    argument32(&r, 4, gender);
+                    argument32(&r, 8, race);
+                    call(db, &r);
+                    const u8* c = r.c.out;
+                    CHECK(r.c.out_size == 0x58 && mii_valid(c));
+                    if (gender < 2) CHECK(c[0x28] == gender);
+                    female += c[0x28] == 1, male += c[0x28] == 0;
+                    u32 axis = c[0x3a] - 12u; /* the eyes' height is the face's offset plus 12 */
+                    CHECK(axis <= 3 && (axis == 0 || (c[0x28] == 1 && age != 1 && age != 2)));
+                    if (race < 3) CHECK(c[0x41] == axis + (race == 2 ? 6 : 7) + 3); /* eyebrows: CoreData's + 3 */
+                    CHECK(c[0x43] == (c[0x28] ? 3 : 4) && c[0x44] == axis + 9);     /* the nose */
+                    CHECK(c[0x3c] == c[0x32] && c[0x4a] == c[0x32]); /* eyebrows and beard the hair's color */
+                    CHECK(c[0x50] == 8 && c[0x56] == 20 && c[0x29] == 64 && c[0x2a] == 64);
+                    if (c[0x28] == 1) CHECK(c[0x4b] == 0 && c[0x4c] == 0); /* no beard nor mustache */
+                    if (memcmp(last, c, 16)) differ++;
+                    memcpy(last, c, 16);
+                }
+    CHECK(differ == 4 * 3 * 4 * 40 && female > 300 && male > 300);
+    /* an age, gender or race past All is InvalidArgument */
+    request(&r, 6);
+    argument32(&r, 0, 4);
+    CHECK(db->dispatch(db, &r.c) == RC(126, 1));
+    argument32(&r, 0, 0);
+    argument32(&r, 4, 3);
+    CHECK(db->dispatch(db, &r.c) == RC(126, 1));
+    argument32(&r, 4, 0);
+    argument32(&r, 8, 4);
+    CHECK(db->dispatch(db, &r.c) == RC(126, 1));
+    svcobj_unref(db);
+    svcobj_unref(service);
+}
+
+/* UpdateLatest (5) and GetIndex (21) of a Mii: NotFound, whatever the source, as the empty database holds none. Mario
+   Kart 8 Deluxe asks UpdateLatest for the Mii its save holds at boot; a success there gave it an empty CharInfo, which
+   it built no Mii from, and crashed */
+static void test_mii_latest(void) {
+    SvcObj* service = new_mii();
+    Request r;
+    u8 mii[0x58];
+    request(&r, 0);
+    call(service, &r);
+    SvcObj* db = r.c.out_objs[0];
+    request(&r, 7);
+    argument32(&r, 0, 0);
+    call(db, &r);
+    memcpy(mii, r.c.out, sizeof mii);
+    CHECK(mii_valid(mii));
+    for (u32 source = 0; source <= 3; source++) {
+        request(&r, 5);
+        memcpy(r.raw, mii, sizeof mii);
+        argument32(&r, 0x58, source);
+        CHECK(db->dispatch(db, &r.c) == RC(126, 4));
+        CHECK(r.c.out_size == 0);
+    }
+    request(&r, 21);
+    memcpy(r.raw, mii, sizeof mii);
+    CHECK(db->dispatch(db, &r.c) == RC(126, 4));
+    CHECK(r.c.out_size == 0);
     svcobj_unref(db);
     svcobj_unref(service);
 }
@@ -641,6 +1132,18 @@ int main(void) {
     test_mm();
     test_hid();
     test_mii_default();
+    test_acc_thumbnail();
+    test_apm();
+    test_ngc();
+    test_mm_full();
+    test_nfp();
+    test_acc_select();
+    test_ldn_monitor();
+    test_nfp_filter();
+    test_aoc_list();
+    test_aoc_content();
+    test_mii_random();
+    test_mii_latest();
     CHECK(test_objects == 0 && test_kobjs == 0);
     free(g_mem);
     printf("misc_service: %u checks passed\n", test_checks);

@@ -49,26 +49,35 @@ interface nn::am::service::ICommonStateGetter {
     [30] GetHomeButtonReaderLockAccessor() -> object<nn::am::service::ILockAccessor> accessor;
     [31] GetReaderLockAccessorEx(u32 button_type) -> object<nn::am::service::ILockAccessor> accessor;
     [32] GetWriterLockAccessorEx(u32 button_type) -> object<nn::am::service::ILockAccessor> accessor;
-    @stub [50] IsVrModeEnabled() -> b8 enabled;
-    @stub [51] SetVrModeEnabled(b8 enabled);
+    [50] IsVrModeEnabled() -> b8 enabled;
+    [51] SetVrModeEnabled(b8 enabled);
     @stub [52] SetLcdBacklighOffEnabled(b8 enabled);
-    @stub [53] BeginVrModeEx();
-    @stub [54] EndVrModeEx();
+    # 7.0.0+, what libnx turns VR mode with from then
+    [53] BeginVrModeEx();
+    [54] EndVrModeEx();
     @stub [55] IsInControllerFirmwareUpdateSection() -> b8 in_section;
     @stub [59] SetVrPositionForDebug(i32 x, i32 y, i32 width, i32 height);
     [60] GetDefaultDisplayResolution() -> (i32 width, i32 height);
     [61] GetDefaultDisplayResolutionChangeEvent() -> handle<copy, event> event;
     @stub [62] GetHdcpAuthenticationState() -> i32 state;
     [63] GetHdcpAuthenticationStateChangeEvent() -> handle<copy, event> event;
-    @stub [66] SetCpuBoostMode(u32 mode);
+    [66] SetCpuBoostMode(u32 mode);
     @stub [67] CancelCpuBoostMode();
     @stub [68] GetBuiltInDisplayType() -> i32 type;
     [91] GetCurrentPerformanceConfiguration() -> u32 configuration;
+    # 21.0.0+
+    [130] EnableStartupLogoDisappearedMessage();
+    # 9.0.0+, a nn::settings::system::PlatformRegion
+    [300] GetSettingsPlatformRegion() -> u32 region;
     @stub [900] SetRequestExitToLibraryAppletAtExecuteNextProgramEnabled();
+    # 19.0.0+
+    [1000] BeginVrMode3d();
+    [1001] EndVrMode3d();
+    [1002] IsVrModeEnabled3d() -> b8 enabled;
 }
 
 # a lock on a system button (the home button's): no home menu here waits for it, so a lock is always granted, and
-# the event is signaled when it is released
+# the event is signaled from the start and when it is released
 interface nn::am::service::ILockAccessor {
     [1] TryLock(b8 return_handle) -> (b8 is_locked, handle<copy, event> event);
     [2] Unlock();
@@ -92,9 +101,11 @@ interface nn::am::service::ISelfController {
     [40] CreateManagedDisplayLayer() -> u64 layer_id;
     @stub [41] IsSystemBufferSharingEnabled();
     [44] CreateManagedDisplaySeparableLayer() -> (u64 layer_id, u64 recording_layer_id);
-    @stub [62] SetIdleTimeDetectionExtension(u32 extension);
-    @stub [63] GetIdleTimeDetectionExtension() -> u32 extension;
-    @stub [69] IsAutoSleepDisabled() -> b8 disabled;
+    [62] SetIdleTimeDetectionExtension(u32 extension);
+    [63] GetIdleTimeDetectionExtension() -> u32 extension;
+    # 5.0.0+
+    [68] SetAutoSleepDisabled(b8 disabled);
+    [69] IsAutoSleepDisabled() -> b8 disabled;
     @stub [90] GetAccumulatedSuspendedTickValue() -> u64 tick;
     [91] GetAccumulatedSuspendedTickChangedEvent() -> handle<copy, event> event;
     @stub [100] SetAlbumImageTakenNotificationEnabled(b8 enabled);
@@ -110,8 +121,11 @@ interface nn::am::service::IWindowController {
 }
 
 interface nn::am::service::IAudioController {
+    [0] SetExpectedMasterVolume(f32 main_volume, f32 library_volume);
     [1] GetMainAppletExpectedMasterVolume() -> f32 volume;
     [2] GetLibraryAppletExpectedMasterVolume() -> f32 volume;
+    [3] ChangeMainAppletMasterVolume(f32 volume, i64 fade_time_ns);
+    @stub [4] SetTransparentVolumeRate(f32 rate);
 }
 
 interface nn::am::service::IDisplayController {
@@ -128,7 +142,7 @@ interface nn::am::service::IApplicationFunctions {
     [21] GetDesiredLanguage() -> nn::settings::LanguageCode code;
     @stub [22] SetTerminateResult(u32 result);
     [23] GetDisplayVersion() -> nn::oe::DisplayVersion version;
-    @stub [25] ExtendSaveData(u8 type, nn::account::Uid uid, i64 normal_size, i64 journal_size) -> i64 required_size;
+    [25] ExtendSaveData(u8 type, nn::account::Uid uid, i64 normal_size, i64 journal_size) -> i64 required_size;
     [26] GetSaveDataSize(u8 type, nn::account::Uid uid) -> (i64 normal_size, i64 journal_size);
     @stub [27] CreateCacheStorage(u16 index, i64 normal_size, i64 journal_size)
         -> (u32 target_media, i64 required_size);
@@ -154,6 +168,11 @@ interface nn::am::service::IApplicationFunctions {
     @stub [110] QueryApplicationPlayStatistics(array<nn::pdm::ApplicationPlayStatistics, 6> statistics,
                                                array<nn::ApplicationId, 5> application_ids) -> i32 count;
     @stub [120] ExecuteProgram(u32 kind, u64 value);
+    # 6.0.0+: what a program hands the next one it launches, popped as LaunchParameterKind UserChannel
+    [121] ClearUserChannel();
+    [122] UnpopToUserChannel(object<nn::am::service::IStorage> storage);
+    # 5.0.0+
+    [123] GetPreviousProgramIndex() -> i32 index;
     @stub [124] EnableApplicationAllThreadDumpOnCrash(b8 enabled);
     [130] GetGpuErrorDetectedSystemEvent() -> handle<copy, event> event;
     [140] GetFriendInvitationStorageChannelEvent() -> handle<copy, event> event;

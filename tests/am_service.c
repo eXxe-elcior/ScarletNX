@@ -171,16 +171,18 @@ void set_language_code(int lang, u8 code[8]) {
     (void)lang;
     memcpy(code, "en-US", 6);
 }
+static int test_players = 1;
 int hid_connected_players(u32* selected_id) {
     *selected_id = 0;
-    return 1;
+    return test_players;
 }
 static const char* dialog_text = "Aé😀";
-static int dialog_cancel;
+static const char* dialog_then; /* what the dialog answers from its second time on, when set */
+static int dialog_cancel, dialog_calls;
 static int modern_packet;
 int plat_text_input(char* out, size_t cap, const char* initial) {
     (void)initial;
-    snprintf(out, cap, "%s", dialog_text);
+    snprintf(out, cap, "%s", dialog_calls++ && dialog_then ? dialog_then : dialog_text);
     return dialog_cancel;
 }
 static void put32(u8* dst, u32 v) { memcpy(dst, &v, 4); }
@@ -209,6 +211,93 @@ static SvcObj* reply(SvcObj* a, u32 state, u32 type, u32 size) {
     CHECK(get32(data->d) == state);
     CHECK(get32(data->d + 4) == type);
     return storage;
+}
+/* IAudioController: the expected master volumes read back as the game set them, from 0 to 1, on the controller it set
+   them on */
+static void test_audio_controller(void) {
+    SvcObj *c, *other;
+    float main_volume = -1.0f, library_volume = -1.0f;
+    CHECK(nn_am_service_IApplicationProxy_GetAudioController(NULL, &c) == 0);
+    CHECK(nn_am_service_IAudioController_GetMainAppletExpectedMasterVolume(c, &main_volume) == 0 &&
+          main_volume == 1.0f);
+    CHECK(nn_am_service_IAudioController_SetExpectedMasterVolume(c, 0.5f, 0.25f) == 0);
+    CHECK(nn_am_service_IAudioController_GetMainAppletExpectedMasterVolume(c, &main_volume) == 0 &&
+          main_volume == 0.5f);
+    CHECK(nn_am_service_IAudioController_GetLibraryAppletExpectedMasterVolume(c, &library_volume) == 0 &&
+          library_volume == 0.25f);
+    CHECK(nn_am_service_IAudioController_ChangeMainAppletMasterVolume(c, 0.75f, 0) == 0);
+    CHECK(nn_am_service_IAudioController_GetMainAppletExpectedMasterVolume(c, &main_volume) == 0 &&
+          main_volume == 0.75f);
+    CHECK(nn_am_service_IAudioController_SetExpectedMasterVolume(c, 1.5f, -1.0f) == 0);
+    CHECK(nn_am_service_IAudioController_GetMainAppletExpectedMasterVolume(c, &main_volume) == 0 &&
+          main_volume == 1.0f);
+    CHECK(nn_am_service_IAudioController_GetLibraryAppletExpectedMasterVolume(c, &library_volume) == 0 &&
+          library_volume == 0.0f);
+    CHECK(nn_am_service_IApplicationProxy_GetAudioController(NULL, &other) == 0);
+    CHECK(nn_am_service_IAudioController_GetLibraryAppletExpectedMasterVolume(other, &library_volume) == 0 &&
+          library_volume == 1.0f);
+    svcobj_unref(other);
+    svcobj_unref(c);
+    CHECK(test_objects == 0);
+}
+/* the user channel: a copy of each storage unpopped, the last one popped first, and ClearUserChannel empties it */
+static void test_user_channel(void) {
+    SvcObj *a = am_storage_new(4, "abc"), *b = am_storage_new(4, "xyz"), *s = NULL;
+    int i;
+    CHECK(nn_am_service_IApplicationFunctions_PopLaunchParameter(NULL, 1, &s) == AM_NO_DATA);
+    CHECK(nn_am_service_IApplicationFunctions_UnpopToUserChannel(NULL, a) == 0);
+    CHECK(nn_am_service_IApplicationFunctions_UnpopToUserChannel(NULL, b) == 0);
+    memcpy(am_storage_bytes(a), "zzz", 4);
+    CHECK(nn_am_service_IApplicationFunctions_PopLaunchParameter(NULL, 1, &s) == 0);
+    CHECK(((StorageData*)s->data)->size == 4 && memcmp(am_storage_bytes(s), "xyz", 4) == 0);
+    svcobj_unref(s);
+    CHECK(nn_am_service_IApplicationFunctions_PopLaunchParameter(NULL, 1, &s) == 0);
+    CHECK(memcmp(am_storage_bytes(s), "abc", 4) == 0);
+    svcobj_unref(s);
+    CHECK(nn_am_service_IApplicationFunctions_PopLaunchParameter(NULL, 1, &s) == AM_NO_DATA);
+    for (i = 0; i < AM_USER_CHANNEL; i++) CHECK(nn_am_service_IApplicationFunctions_UnpopToUserChannel(NULL, a) == 0);
+    CHECK(nn_am_service_IApplicationFunctions_UnpopToUserChannel(NULL, a) == AM_OUT_OF_MEMORY);
+    CHECK(nn_am_service_IApplicationFunctions_ClearUserChannel(NULL) == 0);
+    CHECK(nn_am_service_IApplicationFunctions_PopLaunchParameter(NULL, 1, &s) == AM_NO_DATA);
+    svcobj_unref(a);
+    svcobj_unref(b);
+    CHECK(test_objects == 0);
+}
+static void test_previous_program(void) {
+    i32 index = 0;
+    CHECK(nn_am_service_IApplicationFunctions_GetPreviousProgramIndex(NULL, &index) == 0 && index == -1);
+}
+/* IStorageAccessor's Read: the whole buffer within the storage, or InvalidOffset */
+static void test_storage_read(void) {
+    static u8 guest[32];
+    SvcObj *s = am_storage_new(8, "abcdefg"), *acc = NULL;
+    IpcBuf buf = {0, 8, 0};
+    g_mem = guest;
+    CHECK(nn_am_service_IStorage_Open(s, &acc) == 0);
+    CHECK(nn_am_service_IStorageAccessor_Read(acc, 0, buf) == 0 && memcmp(guest, "abcdefg", 8) == 0);
+    buf.size = 16;
+    CHECK(nn_am_service_IStorageAccessor_Read(acc, 0, buf) == AM_INVALID_OFFSET);
+    buf.size = 4;
+    CHECK(nn_am_service_IStorageAccessor_Read(acc, 6, buf) == AM_INVALID_OFFSET);
+    CHECK(nn_am_service_IStorageAccessor_Read(acc, 4, buf) == 0 && memcmp(guest, "efg", 4) == 0);
+    CHECK(nn_am_service_IStorageAccessor_Read(acc, -1, buf) == AM_INVALID_OFFSET);
+    g_mem = NULL;
+    svcobj_unref(acc);
+    svcobj_unref(s);
+    CHECK(test_objects == 0);
+}
+/* VR mode: on and off as the game turns it, by SetVrModeEnabled or by BeginVrModeEx and EndVrModeEx */
+static void test_vr_mode(void) {
+    u8 on = 0xee;
+    CHECK(nn_am_service_ICommonStateGetter_IsVrModeEnabled(NULL, &on) == 0 && on == 0);
+    CHECK(nn_am_service_ICommonStateGetter_BeginVrModeEx(NULL) == 0);
+    CHECK(nn_am_service_ICommonStateGetter_IsVrModeEnabled(NULL, &on) == 0 && on == 1);
+    CHECK(nn_am_service_ICommonStateGetter_EndVrModeEx(NULL) == 0);
+    CHECK(nn_am_service_ICommonStateGetter_IsVrModeEnabled(NULL, &on) == 0 && on == 0);
+    CHECK(nn_am_service_ICommonStateGetter_SetVrModeEnabled(NULL, 2) == 0);
+    CHECK(nn_am_service_ICommonStateGetter_IsVrModeEnabled(NULL, &on) == 0 && on == 1);
+    CHECK(nn_am_service_ICommonStateGetter_SetVrModeEnabled(NULL, 0) == 0);
+    CHECK(nn_am_service_ICommonStateGetter_IsVrModeEnabled(NULL, &on) == 0 && on == 0);
 }
 static void test_inline(void) {
     SvcObj* a;
@@ -258,10 +347,250 @@ static void test_inline(void) {
     close_handles();
     CHECK(test_objects == 0 && test_kobjs == 0);
 }
+/* a library applet run to its end: its pushed storages, then what PopOutData gives */
+static SvcObj* run_applet(u32 id, SvcObj* const* in, int nin) {
+    SvcObj *a, *out = NULL;
+    int i;
+    CHECK(nn_am_service_ILibraryAppletCreator_CreateLibraryApplet(NULL, id, 0, &a) == 0);
+    for (i = 0; i < nin; i++) CHECK(nn_am_service_ILibraryAppletAccessor_PushInData(a, in[i]) == 0);
+    CHECK(nn_am_service_ILibraryAppletAccessor_PopOutData(a, &out) == 0 && out);
+    CHECK(nn_am_service_ILibraryAppletAccessor_PopOutData(a, &out) == RC(128, 2)); /* given once */
+    svcobj_unref(a);
+    return out;
+}
+/* the standard keyboard: SwkbdConfigCommon's limits (max at 0x3ac, min at 0x3b0) and UTF-8 flag (0x3bd), the dialog
+   asked again until the text is long enough, and the reply's SwkbdResult and text */
+static SvcObj* swkbd(u32 max, u32 min, int utf8) {
+    u8 config[0x3e0] = {0};
+    SvcObj *in[2], *out;
+    memcpy(config + 0x3ac, &max, 4);
+    memcpy(config + 0x3b0, &min, 4);
+    config[0x3bd] = (u8)utf8;
+    in[0] = am_storage_new(0x20, NULL);
+    in[1] = am_storage_new(sizeof config, config);
+    dialog_calls = 0;
+    out = run_applet(0x11, in, 2);
+    svcobj_unref(in[0]);
+    svcobj_unref(in[1]);
+    CHECK(((StorageData*)out->data)->size == 0x7d8);
+    return out;
+}
+/* SetCpuBoostMode hands its mode to apm, and GetCurrentPerformanceConfiguration is apm's for the console's mode */
+extern u32 g_test_apm_boost;
+static void test_cpu_boost(void) {
+    u32 config = 0;
+    CHECK(nn_am_service_ICommonStateGetter_SetCpuBoostMode(NULL, 1) == 0 && g_test_apm_boost == 1);
+    CHECK(nn_am_service_ICommonStateGetter_GetCurrentPerformanceConfiguration(NULL, &config) == 0 &&
+          config == 0x00020003u);
+    g_opt_docked = 1;
+    CHECK(nn_am_service_ICommonStateGetter_GetCurrentPerformanceConfiguration(NULL, &config) == 0 &&
+          config == 0x92220009u);
+    g_opt_docked = 0;
+}
+
+/* a lock accessor from GetHomeButtonReaderLockAccessor (30) and GetReaderLockAccessorEx (31): its event signaled
+   while the lock is free, before anyone took it, and taken by TryLock (1) */
+static void test_lock_event(void) {
+    SvcObj* accessors[2];
+    u8 locked = 0;
+    u32 event = 0, i;
+    CHECK(nn_am_service_ICommonStateGetter_GetHomeButtonReaderLockAccessor(NULL, &accessors[0]) == 0);
+    CHECK(nn_am_service_ICommonStateGetter_GetReaderLockAccessorEx(NULL, 0, &accessors[1]) == 0);
+    for (i = 0; i < 2; i++) {
+        CHECK(((AmLock*)accessors[i]->data)->event->signaled);
+        CHECK(nn_am_service_ILockAccessor_TryLock(accessors[i], 0, &locked, &event) == 0 && locked == 1);
+        CHECK(nn_am_service_ILockAccessor_Unlock(accessors[i]) == 0);
+        svcobj_unref(accessors[i]);
+    }
+}
+
+static void test_swkbd(void) {
+    SvcObj* out;
+    u8* d;
+    u16 units[4];
+    dialog_cancel = 0;
+    dialog_then = NULL;
+    /* "Aé😀" is four UTF-16 units: three at most keeps the pair whole, cut before it */
+    out = swkbd(3, 0, 0);
+    d = ((StorageData*)out->data)->d;
+    CHECK(get32(d) == 0 && d[4] == 'A' && d[6] == 0xE9 && d[7] == 0 && d[8] == 0 && d[9] == 0);
+    svcobj_unref(out);
+    out = swkbd(0, 0, 1);
+    CHECK(!strcmp((char*)((StorageData*)out->data)->d + 4, "Aé😀"));
+    svcobj_unref(out);
+    /* too short for the minimum: asked again, and the second answer is taken */
+    dialog_then = "hello";
+    out = swkbd(0, 5, 1);
+    CHECK(dialog_calls == 2 && get32(((StorageData*)out->data)->d) == 0);
+    CHECK(!strcmp((char*)((StorageData*)out->data)->d + 4, "hello"));
+    svcobj_unref(out);
+    dialog_then = NULL;
+    /* a minimum above the maximum is the maximum */
+    out = swkbd(2, 9, 0);
+    d = ((StorageData*)out->data)->d;
+    CHECK(dialog_calls == 1 && get32(d) == 0 && d[4] == 'A' && d[6] == 0xE9 && d[8] == 0);
+    svcobj_unref(out);
+    /* cancelled */
+    dialog_cancel = 1;
+    out = swkbd(0, 0, 0);
+    CHECK(get32(((StorageData*)out->data)->d) == 1 && ((StorageData*)out->data)->d[4] == 0);
+    svcobj_unref(out);
+    dialog_cancel = 0;
+    /* malformed UTF-8 from the host: an overlong form, a surrogate and a cut sequence, each part U+FFFD */
+    CHECK(am_utf8_to_16("\xC0\xAF", units, 4) == 2 && units[0] == 0xFFFD && units[1] == 0xFFFD);
+    CHECK(am_utf8_to_16("\xED\xA0\x80", units, 4) == 3 && units[2] == 0xFFFD);
+    CHECK(am_utf8_to_16("a\xE2\x82", units, 4) == 2 && units[0] == 'a' && units[1] == 0xFFFD);
+    CHECK(am_utf8_to_16("\xF4\x90\x80\x80", units, 4) == 4); /* past U+10FFFF */
+    CHECK(am_utf8_to_16("\xF0\x9F\x98\x80", units, 4) == 2 && units[0] == 0xD83D && units[1] == 0xDE00);
+#ifndef _WIN32
+    /* a scripted run's text, cancelled when it is shorter than the minimum */
+    setenv("SNX_SWKBD_TEXT", "hi", 1);
+    out = swkbd(0, 0, 1);
+    CHECK(dialog_calls == 0 && get32(((StorageData*)out->data)->d) == 0);
+    CHECK(!strcmp((char*)((StorageData*)out->data)->d + 4, "hi"));
+    svcobj_unref(out);
+    out = swkbd(0, 3, 1);
+    CHECK(get32(((StorageData*)out->data)->d) == 1);
+    svcobj_unref(out);
+    unsetenv("SNX_SWKBD_TEXT");
+#endif
+}
+/* the other applets' outputs: the controller applet's players against the game's minimum, a web applet's return
+   value, and zeros from the rest */
+static void test_applets(void) {
+    u8 arg[0x40] = {2};
+    SvcObj *in[2], *out;
+    in[0] = am_storage_new(0x20, NULL);
+    in[1] = am_storage_new(sizeof arg, arg);
+    test_players = 1;
+    out = run_applet(0x0c, in, 2);
+    CHECK(((StorageData*)out->data)->size == 0xc && ((StorageData*)out->data)->d[0] == 1);
+    CHECK(get32(((StorageData*)out->data)->d + 8) == 2); /* fewer than two: cancelled */
+    svcobj_unref(out);
+    test_players = 2;
+    out = run_applet(0x0c, in, 2);
+    CHECK(((StorageData*)out->data)->d[0] == 2 && get32(((StorageData*)out->data)->d + 8) == 0);
+    svcobj_unref(out);
+    test_players = 1;
+    out = run_applet(0x14, in, 0); /* Shop */
+    CHECK(((StorageData*)out->data)->size == 0x1010);
+    svcobj_unref(out);
+    out = run_applet(0x0e, in, 0); /* the error applet */
+    CHECK(((StorageData*)out->data)->size == 0x10 && get32(((StorageData*)out->data)->d) == 0);
+    svcobj_unref(out);
+    svcobj_unref(in[0]);
+    svcobj_unref(in[1]);
+    close_handles();
+}
+/* am_init: the focus message, then the performance mode's, and the launchable event signaled */
+static void test_messages(void) {
+    nn_am_AppletMessage m = 0;
+    u32 h;
+    am_init();
+    CHECK(nn_am_service_ICommonStateGetter_ReceiveMessage(NULL, &m) == 0 && m == 15);
+    CHECK(am.msg_event->signaled);
+    CHECK(nn_am_service_ICommonStateGetter_ReceiveMessage(NULL, &m) == 0 && m == 31);
+    CHECK(!am.msg_event->signaled);
+    CHECK(nn_am_service_ICommonStateGetter_ReceiveMessage(NULL, &m) == RC(128, 3));
+    CHECK(nn_am_service_ISelfController_GetLibraryAppletLaunchableEvent(NULL, &h) == 0);
+    CHECK(test_handles[h - 0x100] == &am.launchable_event->o && am.launchable_event->signaled);
+    close_handles();
+}
+/* the Mii editor (0x12), which Mario Kart 8 Deluxe opens with nn::mii::AppendMii: with no editor here, appending is
+   cancelled as when the player backs out, an edit hands the Mii back, and each answer is the size the SDK reads */
+static SvcObj* mii_edit(u32 mode, const u8* charinfo, u32 out_size) {
+    u8 input[0x100] = {0};
+    SvcObj* a;
+    SvcObj* storage;
+    put32(input, 4); /* version 4 */
+    put32(input + 4, mode);
+    if (charinfo) memcpy(input + 0xc, charinfo, 0x58);
+    CHECK(nn_am_service_ILibraryAppletCreator_CreateLibraryApplet(NULL, 0x12, 0, &a) == 0);
+    storage = am_storage_new(sizeof input, input);
+    CHECK(nn_am_service_ILibraryAppletAccessor_PushInData(a, storage) == 0);
+    svcobj_unref(storage);
+    storage = NULL;
+    CHECK(nn_am_service_ILibraryAppletAccessor_PopOutData(a, &storage) == 0 && storage);
+    CHECK(((StorageData*)storage->data)->size == out_size);
+    svcobj_unref(a);
+    return storage;
+}
+static void test_mii_edit(void) {
+    u8 charinfo[0x58];
+    SvcObj* out;
+    StorageData* d;
+    int i;
+    for (i = 0; i < 0x58; i++) charinfo[i] = (u8)(i + 1);
+    out = mii_edit(1, NULL, 0x20); /* AppendMii: cancelled */
+    d = out->data;
+    CHECK(get32(d->d) == 1 && get32(d->d + 4) == 0);
+    svcobj_unref(out);
+    out = mii_edit(0, NULL, 0x20); /* ShowMiiEdit: shown */
+    CHECK(get32(((StorageData*)out->data)->d) == 0);
+    svcobj_unref(out);
+    out = mii_edit(5, charinfo, 0x80); /* EditMii: the same Mii back */
+    d = out->data;
+    CHECK(get32(d->d) == 0 && !memcmp(d->d + 4, charinfo, 0x58));
+    svcobj_unref(out);
+    out = mii_edit(4, NULL, 0x80); /* CreateMii: cancelled */
+    CHECK(get32(((StorageData*)out->data)->d) == 1);
+    svcobj_unref(out);
+    close_handles();
+    CHECK(test_objects == 0 && test_kobjs == 0);
+}
+/* ICommonStateGetter: 130 queues the start-up logo's message, 95, behind the focus and performance ones at startup;
+   1000 to 1002 keep 3D VR mode; 300 says the platform region is Global */
+static void test_state_getter(void) {
+    u32 message = 0, region = 0;
+    u8 vr = 0xee;
+    int logo = 0, received = 0;
+    am_init();
+    CHECK(nn_am_service_ICommonStateGetter_EnableStartupLogoDisappearedMessage(NULL) == 0 && am.msg_event->signaled);
+    while (received < AM_MESSAGES && nn_am_service_ICommonStateGetter_ReceiveMessage(NULL, &message) == 0) {
+        logo += message == AM_MSG_STARTUP_LOGO_GONE;
+        received++;
+    }
+    CHECK(received == 3 && logo == 1 && !am.msg_event->signaled);
+    CHECK(nn_am_service_ICommonStateGetter_IsVrModeEnabled3d(NULL, &vr) == 0 && vr == 0);
+    CHECK(nn_am_service_ICommonStateGetter_BeginVrMode3d(NULL) == 0);
+    CHECK(nn_am_service_ICommonStateGetter_IsVrModeEnabled3d(NULL, &vr) == 0 && vr == 1);
+    CHECK(nn_am_service_ICommonStateGetter_EndVrMode3d(NULL) == 0);
+    CHECK(nn_am_service_ICommonStateGetter_IsVrModeEnabled3d(NULL, &vr) == 0 && vr == 0);
+    CHECK(nn_am_service_ICommonStateGetter_GetSettingsPlatformRegion(NULL, &region) == 0 && region == 1);
+}
+/* ISelfController: the idle time detection extension and auto sleep read back as the game set them */
+static void test_self_settings(void) {
+    u32 extension = 0xee;
+    u8 disabled = 0xee;
+    CHECK(nn_am_service_ISelfController_GetIdleTimeDetectionExtension(NULL, &extension) == 0 && extension == 0);
+    CHECK(nn_am_service_ISelfController_SetIdleTimeDetectionExtension(NULL, 1) == 0);
+    CHECK(nn_am_service_ISelfController_GetIdleTimeDetectionExtension(NULL, &extension) == 0 && extension == 1);
+    CHECK(nn_am_service_ISelfController_SetIdleTimeDetectionExtension(NULL, 0) == 0);
+    CHECK(nn_am_service_ISelfController_GetIdleTimeDetectionExtension(NULL, &extension) == 0 && extension == 0);
+    CHECK(nn_am_service_ISelfController_IsAutoSleepDisabled(NULL, &disabled) == 0 && disabled == 0);
+    CHECK(nn_am_service_ISelfController_SetAutoSleepDisabled(NULL, 1) == 0);
+    CHECK(nn_am_service_ISelfController_IsAutoSleepDisabled(NULL, &disabled) == 0 && disabled == 1);
+    CHECK(nn_am_service_ISelfController_SetAutoSleepDisabled(NULL, 0) == 0);
+    CHECK(nn_am_service_ISelfController_IsAutoSleepDisabled(NULL, &disabled) == 0 && disabled == 0);
+}
 int main(void) {
+    test_mii_edit();
+    test_audio_controller();
+    test_user_channel();
+    test_previous_program();
+    test_storage_read();
+    test_vr_mode();
     test_inline();
     modern_packet = 1;
     test_inline();
+    test_swkbd();
+    test_lock_event();
+    test_cpu_boost();
+    test_applets();
+    CHECK(test_objects == 0 && test_kobjs == 0);
+    test_messages();
+    test_state_getter();
+    test_self_settings();
     printf("am_service: %u checks passed\n", test_checks);
     return 0;
 }

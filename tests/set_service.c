@@ -98,6 +98,70 @@ int main(void) {
     CHECK(nn_settings_ISettingsServer_MakeLanguageCode(NULL, 18, &code) != 0);
     CHECK(nn_settings_ISettingsServer_GetLanguageCode(NULL, &code) == 0 && !memcmp(code.v, "en-US\0\0", 8));
 
+    /* the nickname: zeroed, then "ScarletNX" cut to leave its NUL; nothing at all for an empty buffer */
+    memset(memory, 0xAA, sizeof memory);
+    buf.addr = 0x600;
+    buf.size = 6;
+    CHECK(nn_settings_ISettingsServer_GetDeviceNickName(NULL, buf) == 0);
+    CHECK(!memcmp(memory + 0x600, "Scarl\0", 6) && memory[0x606] == 0xAA);
+    buf.size = 0x80;
+    CHECK(nn_settings_ISettingsServer_GetDeviceNickName(NULL, buf) == 0);
+    CHECK(!strcmp((char*)memory + 0x600, "ScarletNX"));
+    for (i = 10; i < 0x80; i++) CHECK(memory[0x600 + i] == 0);
+    memset(memory, 0xAA, sizeof memory);
+    buf.size = 0;
+    CHECK(nn_settings_ISettingsServer_GetDeviceNickName(NULL, buf) == 0 && memory[0x600] == 0xAA);
+
+    /* set:sys's settings read back as set, from a factory console's: white, full vibration, the battery's
+       percentage shown, the language's keyboard layout (English (US) for en-US); set's quest flag is set:sys's */
+    {
+        i32 color = -1;
+        float volume = -1.0f;
+        u8 flag = 0xEE;
+        u32 layout = 0xEE;
+        CHECK(nn_settings_ISystemSettingsServer_GetColorSetId(NULL, &color) == 0 && color == 0);
+        CHECK(nn_settings_ISystemSettingsServer_SetColorSetId(NULL, 1) == 0);
+        CHECK(nn_settings_ISystemSettingsServer_GetColorSetId(NULL, &color) == 0 && color == 1);
+        CHECK(nn_settings_ISystemSettingsServer_GetVibrationMasterVolume(NULL, &volume) == 0 && volume == 1.0f);
+        CHECK(nn_settings_ISystemSettingsServer_SetVibrationMasterVolume(NULL, 0.25f) == 0);
+        CHECK(nn_settings_ISystemSettingsServer_GetVibrationMasterVolume(NULL, &volume) == 0 && volume == 0.25f);
+        CHECK(nn_settings_ISystemSettingsServer_GetKeyboardLayout(NULL, &layout) == 0 && layout == 1);
+        g_opt_lang = 2; /* French: its layout until one is set */
+        CHECK(nn_settings_ISystemSettingsServer_GetKeyboardLayout(NULL, &layout) == 0 && layout == 4);
+        CHECK(nn_settings_ISystemSettingsServer_SetKeyboardLayout(NULL, 3) == 0);
+        CHECK(nn_settings_ISystemSettingsServer_GetKeyboardLayout(NULL, &layout) == 0 && layout == 3);
+        g_opt_lang = 1;
+        CHECK(nn_settings_ISystemSettingsServer_GetKeyboardLayout(NULL, &layout) == 0 && layout == 3);
+        CHECK(nn_settings_ISystemSettingsServer_GetBatteryPercentageFlag(NULL, &flag) == 0 && flag == 1);
+        CHECK(nn_settings_ISystemSettingsServer_SetBatteryPercentageFlag(NULL, 0) == 0);
+        CHECK(nn_settings_ISystemSettingsServer_GetBatteryPercentageFlag(NULL, &flag) == 0 && flag == 0);
+        CHECK(nn_settings_ISystemSettingsServer_GetLockScreenFlag(NULL, &flag) == 0 && flag == 0);
+        CHECK(nn_settings_ISystemSettingsServer_SetLockScreenFlag(NULL, 1) == 0);
+        CHECK(nn_settings_ISystemSettingsServer_GetLockScreenFlag(NULL, &flag) == 0 && flag == 1);
+        CHECK(nn_settings_ISystemSettingsServer_GetSpeakerAutoMuteFlag(NULL, &flag) == 0 && flag == 0);
+        CHECK(nn_settings_ISystemSettingsServer_SetSpeakerAutoMuteFlag(NULL, 2) == 0);
+        CHECK(nn_settings_ISystemSettingsServer_GetSpeakerAutoMuteFlag(NULL, &flag) == 0 && flag == 1);
+        CHECK(nn_settings_ISystemSettingsServer_GetQuestFlag(NULL, &flag) == 0 && flag == 0);
+        CHECK(nn_settings_ISystemSettingsServer_SetQuestFlag(NULL, 1) == 0);
+        CHECK(nn_settings_ISystemSettingsServer_GetQuestFlag(NULL, &flag) == 0 && flag == 1);
+        CHECK(nn_settings_ISettingsServer_GetQuestFlag(NULL, &flag) == 0 && flag == 1);
+    }
+
+    /* a setting there is none of: size 0, its value buffer zeroed */
+    {
+        IpcBuf name, key, value;
+        u64 size = 1;
+        memset(memory, 0xAA, sizeof memory);
+        strcpy((char*)memory + 0x100, "time");
+        strcpy((char*)memory + 0x200, "standard_user_clock_initial_year");
+        name.addr = 0x100, name.size = 0x48;
+        key.addr = 0x200, key.size = 0x48;
+        value.addr = 0x300, value.size = 8;
+        CHECK(nn_settings_ISystemSettingsServer_GetSettingsItemValue(NULL, name, key, value, &size) == 0 && !size);
+        for (i = 0; i < 8; i++) CHECK(memory[0x300 + i] == 0);
+        CHECK(memory[0x308] == 0xAA);
+    }
+
     printf("PASS set_service (%u checks)\n", test_checks);
     return 0;
 }
