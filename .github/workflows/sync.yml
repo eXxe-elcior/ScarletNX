@@ -3,21 +3,21 @@ name: Sync Upstream
 on:
   schedule:
     - cron: '0 * * * *'
-  workflow_dispatch: 
+  workflow_dispatch:
 
 jobs:
   sync:
-    runs-on: ubuntu-latest
-    
-    
+    runs-on: ubuntu-24.04
+
     permissions:
       contents: write
 
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
         with:
           fetch-depth: 0
+          token: ${{ secrets.SYNC_PAT }}
 
       - name: Configure Git Identity
         run: |
@@ -26,13 +26,8 @@ jobs:
 
       - name: Merge Upstream Changes
         run: |
-          # Add the official upstream repository
           git remote add upstream https://github.com/scarletnx/ScarletNX.git
           git fetch upstream
-          
-          # Checkout your main branch
           git checkout main
-          
-          # Merge upstream changes and push them to your fork
           git merge upstream/main --no-edit
           git push origin main
