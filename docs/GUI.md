@@ -8,13 +8,15 @@
 * [Output and resource use](#output-and-resource-use)
 * [Themes](#themes)
   * [Theme formats](#theme-formats)
+* [Languages](#languages)
 * [Building and testing](#building-and-testing)
 
 `scarletnx` started with no arguments (or a model's name, or the AppImage), with no game of its
 name beside it, opens its launcher: a small SDL3 menu for the command-line drivers. A copy named
 after a game, without its code, says so and never opens it. It uses an
-embedded public-domain 8x16 VGA BIOS font, nearest-neighbor integer scaling, and
-English text only. No font files or localization packages are needed.
+embedded public-domain 8x16 VGA BIOS font, with GNU Unifont's 8x16 glyphs fitted to it for the Latin letters its CP437
+lacks, and nearest-neighbor integer scaling; its words are English or a language compiled into it
+([Languages](#languages)). No font files or localization packages are needed.
 
 ```sh
 ./build/scarletnx
@@ -95,7 +97,7 @@ built in, drawn at the window's size ([lunasvg](https://github.com/sammycage/lun
   dead zone, background input, Joy-Cons). A player's *Controller* is *Any*, the next to connect, until Enter on it
   and a press on a controller give it that one (ESC leaves it as it was, Del makes it *Any* again); its *Button
   map* is the page above on its own keys, its A and B as its *Swap A/B* says.
-  **App** holds **Theme** and **Text size**, which Left/Right or Enter go round either way, **Theme editor**, which comes back to App, and **Library**: first `games/`,
+  **App** holds **Theme**, **Text size** and **Language**, which Left/Right or Enter go round either way, **Theme editor**, which comes back to App, and **Library**: first `games/`,
   where recompiled games go: Enter there picks another, as **Folders > Games** does; at its default it stays on the
   list (the foot's Del greyed), and a folder picked goes back to the default with Del pressed twice, only the setting
   changing. Then the player's own folders, whose games the `games/` browser lists after
@@ -119,7 +121,8 @@ built in, drawn at the window's size ([lunasvg](https://github.com/sammycage/lun
   gives a game's `.ini` for the keys it no longer uses (in the config folder's `games/`, in `games/`
   and in the player's folders), the keys of `settings.ini` that no setting of the runtime's takes
   (only while the runtime lists its settings) and those of `app.ini` the menu does not know. A box
-  over the screen then lists each file and what was done to it, or why not, until a key closes it;
+  over the screen then lists each file and what was done to it, or why not, Up/Down and the wheel going over those
+  that do not fit, until another key closes it;
   Share log lists them too. A group of settings shows
   a row each, its help above, Left/Right going round its values, Enter typing one. A setting not picked shows the runtime's default and `[default]` (*Off [default]*):
   the run takes the game's `.ini`'s, which starts as that; one picked goes to every
@@ -140,8 +143,9 @@ built in, drawn at the window's size ([lunasvg](https://github.com/sammycage/lun
 - Settings > App's **Theme** switches to the next theme, or the one before: the built-in Default
   and YoRHa, then each folder of `themes/` (see [Themes](#themes)). The menu opens in YoRHa until one is picked.
   It is kept for the next start,
-  as is Text size, in `app.ini` beside `settings.ini`: `[app]` with `theme` (a theme's folder
-  name) and `text_size` (`auto` or 1 to 4), and once one is picked `[folders]` with Folders' `data`, `games` and
+  as are Text size and Language, in `app.ini` beside `settings.ini`: `[app]` with `theme` (a theme's folder
+  name), `text_size` (`auto` or 1 to 4) and `language` (`auto`, `en` or a language's code, as `pt_BR`), and once one
+  is picked `[folders]` with Folders' `data`, `games` and
   `work` (a full path, nothing for the default). A value the
   menu does not know, or a theme no longer there, is named in the menu's message as it opens and
   left out; a file that cannot be written is named in App's note.
@@ -158,6 +162,11 @@ built in, drawn at the window's size ([lunasvg](https://github.com/sammycage/lun
 - Settings > App's **Text size** steps the menu's letters through Auto (fit the screen) and four
   sizes. Bigger letters scroll the menu. The foot's letters (its keys, and the tips when they are
   there) are a size under the rest's, 1x at the least.
+- Settings > App's **Language** goes round Auto, English and each language compiled in, by its own name. Auto,
+  the default, takes the first of the system's languages (SDL's preferred locales) the menu has: that language for
+  that country, else the language with no country of its own, else the language for another country (Portuguese of
+  Portugal reads `pt_BR` when it is the only Portuguese), else English; the row says which it took. The words change
+  at once; a phrase the language has not translated stays English.
 - **Share log** saves the last run's output and game log to `scarletnx.log`. On the
   desktop it goes in the working folder with its path copied. On Android it goes to the
   data folder's `state/` and is shared.
@@ -170,8 +179,9 @@ built in, drawn at the window's size ([lunasvg](https://github.com/sammycage/lun
   under it the space it takes, counted as the box shows (*counting* until then). They are the menu's `gui/`, `work/`, each game laid out
   beside the others in `games/` or a Library folder (`games/<id>/` now), a portable copy's `games/`
   beside the program, and a build tree's `games/`, `work/` and keys in its checkout
-  ([USAGE](USAGE.md#folders)). Any key, click or tap closes it; nothing is moved, and it shows again at the next
-  start for as long as they are there.
+  ([USAGE](USAGE.md#folders)). Up/Down, PgUp/PgDn and the wheel go over those that do not fit (an arrow at the
+  right of the first says some are above it, *and N more* the ones under), any other key, click or tap closes it;
+  nothing is moved, and it shows again at the next start for as long as they are there.
   **Share log** lists them all, each with where it goes now. On Android the menu's own files an older version kept
   in the app's own files, out of the Files app's reach, are listed a file at a time, and under them the box says how
   they go while the app is in testing: Android's Settings > Apps > ScarletNX > Storage > Clear storage, which takes
@@ -272,7 +282,7 @@ of its own, the focused one framed in the focus colour or inverted, with the the
 beside it a box with what the focus is about (a recent game's path, Games' folders, the keys in use, the last
 run's output) and under that one the Status box. The tips have a row of their own under the head (`[tips] place =
 top`, both built-ins'), or go to the foot under the list's column with `bottom`, where they take one row, a long one
-sliding, or wrap over its rows with `[tips] wrap`. At the foot the screen's keys, the whole width, or under the side
+sliding, or wrap over its rows with `[tips] wrap`, the last sliding what does not fit. At the foot the screen's keys, the whole width, or under the side
 box's column beside the tips, in letters a size under the rest's; the tips and the keys each in a box with a bar down
 its left (`[tips] box`, `[footer] box`) or on the page. Games lists Add a folder, the recent games and a
 page of the games, as many as the list's box holds, the focused one's path and kind beside them; the keys'
@@ -282,7 +292,7 @@ rows: Enter, or a click on a row, opens the group, its rows taking the focus und
 takes as ESC, the group shown as the focused one; a click on another group opens that one. The theme editor lists its keys, the preview beside them. The list's column is two fifths of
 every screen (`[body] sizing = fixed`), and a window too narrow for both shows the list alone; with `adaptive` the
 column is as wide as its entries and the side box goes under the list. A text too long for its box wraps over
-its rows, or takes one that slides with `[body] text = slide`. A run of the console layout shows the driver's output in a box sized to it,
+its rows, its last sliding what is left, or takes one that slides with `[body] text = slide`. A run of the console layout shows the driver's output in a box sized to it,
 beside it what runs and how it ended over the status, the file in the tips and the ESC line where the keys
 go, which a tap aborts. The button map draws the pad in the box between the head and the foot. A question, or
 the files an older version left, comes in a box over the screen darkened.
@@ -460,6 +470,39 @@ ErET needs `[theme] layout`, so the built-in files carry one: `debug` and `menu`
   files never lean on a built-in's values, which may change. It reads an older file as that
   format reads, and writes it in the current one.
 
+## Languages
+
+The menu's phrases are English in its code, each through `snx_tr` (`src/gui/i18n.h`). `po/scarletnx.pot` lists
+them, made from the code by `scripts/build-languages.py --pot`; the `gui_languages_pot` test fails when it is not what
+the code says. A language is a `po/<code>.po` (`pt_BR.po`, `de.po`), gettext's format: the build makes each one a
+catalog of gettext's `.mo` format compiled into the menu, which reads it with musl's `__mo_lookup`
+(`src/gui/i18n.c`). A new one starts as a copy of the `.pot` whose header names it, in UTF-8:
+
+```po
+"Language: de\n"
+"Content-Type: text/plain; charset=UTF-8\n"
+"X-Language-Name: Deutsch\n"
+```
+
+`X-Language-Name` is what Settings > App > Language shows. `msgmerge -U po/de.po po/scarletnx.pot` (gettext's tools)
+brings a translation up to the code; a phrase it leaves empty, or marks `fuzzy`, stays English. The build refuses a
+`.po` that:
+
+- changes a phrase's printf conversions (`%s`, `%d`, `%zu`, `%.*s`) in number, order or type, uses numbered ones
+  (`%1$s`) or `%n`, or has a `%` its English does not: C's printf takes the arguments in the order the code gives;
+- changes the keys of a foot's sentences (`#, snx-keys`, "Key: what it does."): each key stays as it is, or as the
+  same file translates it (`#, snx-key`, as `Back`), since a click on the foot finds a key by its word, and a sentence
+  greyed (`~`, one its screen cannot do now) stays greyed;
+- has a letter the menu's font does not draw, which would show as `?`: the font is CP437 and the Latin letters of
+  U+00A0 to U+024F past it, GNU Unifont's (`src/gui/unifont-latin.hex`, which `scripts/build-glyphs.py --from` keeps
+  from a Unifont `.hex`, and the build draws with the VGA font's stems and baseline; the `gui_glyphs_kept` test checks
+  it holds each of them once);
+- has contexts (`msgctxt`), plurals (`msgid_plural`), a phrase twice, or is not UTF-8.
+
+The runtime's settings stay as the runtime names them (their groups, names, help and words come from
+`scarletnx --settings`), as do the Controllers' button map page, drawn as the game's menu draws it, the theme
+editor's rows (the file's own keys) and the lines Share log adds for us.
+
 ## Building and testing
 
 The NX build enables `SNX_BUILD_GUI` by default. Disable it with
@@ -489,6 +532,10 @@ accounting and process-tree cleanup. Browser tests cover filtering, missing/empt
 directories, pagination, resizing, Back/ESC, launching selected files and R's recompile.
 Key setup tests cover installation, replacement, invalid drops, failed writes,
 self-copy safety, cancellation, and the bright-red overwrite warning.
+Language tests cover a catalog's search in either byte order, catalogs cut or pointing out of themselves, the language
+Auto picks from the system's locales, English where a language has none, the Language row and `app.ini`'s key, and
+the script's refusals; they use a language of their own, `tests/po/xx.po`. Glyph tests cover the Latin letters'
+lookup, each way the menu draws a line with them, and the script that keeps them.
 Settings tests cover the runtime's list read into rows, picks, the options each combination
 passes, and the screens of its groups and App; menu tests cover mouse hover versus explicit
 activation, the menu without the games and Games with Add a folder and the recent games' show-more row,
