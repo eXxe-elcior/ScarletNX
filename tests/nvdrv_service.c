@@ -337,14 +337,14 @@ static void test_ctrl_syncpoints(u32 ctrl) {
     CHECK(nv_ioctl1(ctrl, EVENT_REG, 4) == 0);
     put(0, 40);
     put(4, 2);
-    put(8, 0);
+    put(8, 100);
     put(12, 9);
-    CHECK(nv_ioctl1(ctrl, EVENT_WAIT_AS, 16) == 5 && nv.nvev[9].armed);
+    CHECK(nv_ioctl1(ctrl, EVENT_WAIT_AS, 16) == 5 && nv.ctrl_ev[ctrl][9].armed);
     CHECK((gr32(OUT0 + 12) & 0xF000FFFFu) == 0x10000009u && ((gr32(OUT0 + 12) >> 16) & 0xFFF) == 40);
     put(0, 9);
-    CHECK(nv_ioctl1(ctrl, EVENT_UNREG, 4) == 0 && !nv.nvev[9].armed);
+    CHECK(nv_ioctl1(ctrl, EVENT_UNREG, 4) == 0 && !nv.ctrl_ev[ctrl][9].armed);
     put(0, 40);
-    CHECK(nv_ioctl1(ctrl, SYNCPT_INCR, 4) == 0 && !nv.nvev[9].ev->signaled);
+    CHECK(nv_ioctl1(ctrl, SYNCPT_INCR, 4) == 0 && !nv.ctrl_ev[ctrl][9].ev->signaled);
     /* Canceling a timed-out wait must not report an unfinished fence as complete. Reusing the event
        must still wait for the new threshold, and cancellation also clears a previously signaled event. */
     put(0, 10);
@@ -353,21 +353,55 @@ static void test_ctrl_syncpoints(u32 ctrl) {
     put(4, 4);
     put(8, 100);
     put(12, 10);
-    CHECK(nv_ioctl1(ctrl, EVENT_WAIT_AS, 16) == 5 && nv.nvev[10].armed);
+    CHECK(nv_ioctl1(ctrl, EVENT_WAIT_AS, 16) == 5 && nv.ctrl_ev[ctrl][10].armed);
     put(0, 10);
     CHECK(nv_ioctl1(ctrl, 0xC004001Cu, 4) == 0);
-    CHECK(!nv.nvev[10].armed && !nv.nvev[10].ev->signaled && syncpt_read(40) == 2);
+    CHECK(!nv.ctrl_ev[ctrl][10].armed && !nv.ctrl_ev[ctrl][10].ev->signaled && syncpt_read(40) == 2);
     put(0, 40);
-    CHECK(nv_ioctl1(ctrl, SYNCPT_INCR, 4) == 0 && !nv.nvev[10].ev->signaled);
+    CHECK(nv_ioctl1(ctrl, SYNCPT_INCR, 4) == 0 && !nv.ctrl_ev[ctrl][10].ev->signaled);
     put(0, 40);
     put(4, 4);
     put(8, 100);
     put(12, 10);
-    CHECK(nv_ioctl1(ctrl, EVENT_WAIT_AS, 16) == 5 && !nv.nvev[10].ev->signaled);
+    CHECK(nv_ioctl1(ctrl, EVENT_WAIT_AS, 16) == 5 && !nv.ctrl_ev[ctrl][10].ev->signaled);
     put(0, 40);
-    CHECK(nv_ioctl1(ctrl, SYNCPT_INCR, 4) == 0 && nv.nvev[10].ev->signaled);
+    CHECK(nv_ioctl1(ctrl, SYNCPT_INCR, 4) == 0 && nv.ctrl_ev[ctrl][10].ev->signaled);
     put(0, 10);
-    CHECK(nv_ioctl1(ctrl, 0xC004001Cu, 4) == 0 && !nv.nvev[10].ev->signaled);
+    CHECK(nv_ioctl1(ctrl, 0xC004001Cu, 4) == 0 && !nv.ctrl_ev[ctrl][10].ev->signaled);
+}
+
+/* an async wait on ctrl fd fd's slot for syncpoint id to reach th, with a timeout in ms */
+static u32 event_wait(u32 fd, u32 id, u32 th, u32 to, u32 slot) {
+    put(0, id);
+    put(4, th);
+    put(8, to);
+    put(12, slot);
+    return nv_ioctl1(fd, EVENT_WAIT_AS, 16);
+}
+/* each ctrl fd has slots of its own, as on the console: the game's GPU fence waits and its movie player use slot 0 of
+   two fds, and the player resetting its event must not take the other's wake. A wait with no time only asks */
+static void test_ctrl_event_fds(u32 ctrl) {
+    u32 error;
+    u32 other = nv_open("/dev/nvhost-ctrl", &error);
+    CHECK(!error && other != ctrl);
+    put(0, 0);
+    CHECK(nv_ioctl1(ctrl, EVENT_REG, 4) == 0);
+    put(0, 0);
+    CHECK(nv_ioctl1(other, EVENT_REG, 4) == 0);
+    NvEvent* a = &nv.ctrl_ev[ctrl][0];
+    NvEvent* b = &nv.ctrl_ev[other][0];
+    CHECK(a->ev && b->ev && a->ev != b->ev);
+    u32 base = syncpt_read(41);
+    CHECK(event_wait(ctrl, 41, base + 1, 100, 0) == 5 && a->armed && !b->armed);
+    CHECK(event_wait(other, 41, base + 2, 100, 0) == 5 && a->armed && b->armed && a->thresh == base + 1);
+    put(0, 41);
+    CHECK(nv_ioctl1(ctrl, SYNCPT_INCR, 4) == 0 && a->ev->signaled && !a->armed && !b->ev->signaled && b->armed);
+    /* polling the other fd's fence leaves its armed wait, and this fd's signal, as they were */
+    CHECK(event_wait(other, 41, base + 2, 0, 0) == 5 && b->armed && a->ev->signaled);
+    CHECK(event_wait(ctrl, 41, base + 2, 0, 0) == 5 && a->ev->signaled && !a->armed);
+    put(0, 41);
+    CHECK(nv_ioctl1(ctrl, SYNCPT_INCR, 4) == 0 && b->ev->signaled && !b->armed);
+    CHECK(nv_close(other) == 0 && !nv.ctrl_ev[other]); /* its slots go with it */
 }
 
 /* Ioctl3 (12): ctrl-gpu's GET_CHARACTERISTICS writes the characteristics to the inline output, B1 or C1 */
@@ -399,6 +433,14 @@ static void test_ioctl3(u32 ctrlgpu) {
     ctx.a[1] = buf(IN1, 0xA0);
     ctx.b[0] = buf(OUT0, 0xB0);
     CHECK(nvdrv->dispatch(nvdrv, &ctx) == 0 && reply(0) == 0 && GP(IN1)[0] == 0xCC);
+    /* VSMS_MAPPING writes {gpc, tpc} of each SM into its own buffer, never to an address taken from it */
+    u8 d[8], mapping[4];
+    const u8 sms[4] = {0, 0, 0, 1};
+    memset(d, 0xCC, sizeof d);
+    memset(mapping, 0xCC, sizeof mapping);
+    CHECK(ioctl_ctrlgpu(0xC0044714u, d, 4, mapping, 4) == 0 && !memcmp(d, sms, 4) && !memcmp(mapping, sms, 4));
+    CHECK(d[4] == 0xCC);
+    CHECK(ioctl_ctrlgpu(0xC0084714u & ~0x40000000u, d, 8, NULL, 0) == 0 && d[0] == 7 && d[4] == 1); /* slot mask */
 }
 
 /* QueryEvent (4) {fd, event id}: the NvError, then the event as a copy handle */
@@ -441,6 +483,141 @@ static void test_close_during_ioctl(void) {
     CHECK(!error && again == race_fd); /* free now: the lowest fd again */
     CHECK(nv_close(again) == 0 && nv_close(race_other_fd) == 0);
     CHECK(test_channels[1].closed && test_channels[2].closed);
+}
+
+/* nvmap's handle lifetime and parameters, and the address space's allocator, pieces, REMAP and regions, through the
+   device handlers */
+static u32 nvmap_call(u32 cmd, u8* d) { return ioctl_nvmap(cmd, d, 32); }
+static u32 nvmap_new(u32 size, u64 addr) {
+    u8 d[32] = {0};
+    u32 h;
+    memcpy(d, &size, 4);
+    CHECK(nvmap_call(0x01, d) == 0);
+    memcpy(&h, d + 4, 4);
+    memset(d, 0, sizeof d);
+    memcpy(d, &h, 4);
+    memcpy(d + 24, &addr, 8);
+    CHECK(nvmap_call(0x04, d) == 0);
+    return h;
+}
+static u32 nvmap_param(u32 h, u32 param, u32* value) {
+    u8 d[32] = {0};
+    u32 r;
+    memcpy(d, &h, 4);
+    memcpy(d + 4, &param, 4);
+    r = nvmap_call(0x09, d);
+    memcpy(value, d + 8, 4);
+    return r;
+}
+static u32 as_call(u32 cmd, u8* d, u32 n) { return ioctl_as(cmd, d, n, NULL, 0); }
+static u64 as_map(u32 flags, u32 h, u64 size, u64 gva) {
+    u8 d[40] = {0};
+    memcpy(d, &flags, 4);
+    memcpy(d + 8, &h, 4);
+    memcpy(d + 24, &size, 8);
+    memcpy(d + 32, &gva, 8);
+    CHECK(as_call(0x06, d, sizeof d) == 0);
+    memcpy(&gva, d + 32, 8);
+    return gva;
+}
+static void test_nvmap_as(void) {
+    u8 d[64] = {0};
+    u32 h, again, v, one = 1;
+    u64 gva, fixed, addr, size;
+    /* CREATE and FROM_ID take a reference each, FREE gives one back; the number is handed out again after the last */
+    h = nvmap_new(0x2000, 0x8000);
+    memcpy(d, &h, 4);
+    CHECK(nvmap_call(0x03, d) == 0 && !memcmp(d + 4, &h, 4)); /* FROM_ID: the id is the handle's number */
+    memset(d, 0, sizeof d);
+    memcpy(d, &h, 4);
+    CHECK(nvmap_call(0x05, d) == 0); /* FREE reports the address, size and flags */
+    memcpy(&addr, d + 8, 8);
+    memcpy(&v, d + 16, 4);
+    CHECK(addr == 0x8000 && v == 0x2000 && nv.nvh[h].alive);
+    CHECK(nvmap_param(h, 4, &v) == 0 && v == 0x40000000u); /* Eden's heap for an allocated handle */
+    CHECK(nvmap_param(h, 3, &v) == 0 && v == 0x8000);       /* Base: the address's low bits */
+    CHECK(nvmap_param(h, 2, &v) == 0 && v == 0x1000);       /* no alignment given */
+    CHECK(nvmap_param(h, 1, &v) == 0 && v == 0x2000);
+    memset(d, 0, sizeof d);
+    memcpy(d + 4, &h, 4);
+    CHECK(nvmap_call(0x0E, d) == 0 && !memcmp(d, &h, 4)); /* GET_ID */
+    memset(d, 0, sizeof d);
+    memcpy(d, &h, 4);
+    CHECK(nvmap_call(0x05, d) == 0 && !nv.nvh[h].alive);
+    CHECK(nvmap_call(0x05, d) == 1 && nvmap_param(h, 1, &v) == 1);
+    memset(d, 0, sizeof d);
+    memcpy(d + 4, &h, 4);
+    CHECK(nvmap_call(0x0E, d) == 1);
+    memcpy(d, &h, 4);
+    CHECK(nvmap_call(0x03, d) == 1); /* no live handle with that id */
+    again = nvmap_new(0x3000, 0x9000);
+    CHECK(again == h);
+
+    /* ALLOC_SPACE: allocator VA at a multiple of the alignment, from VA_BASE up */
+    memset(d, 0, sizeof d);
+    v = 4;
+    memcpy(d, &v, 4);
+    v = 0x10000;
+    memcpy(d + 4, &v, 4);
+    CHECK(as_call(0x02, d, 24) == 0);
+    memcpy(&gva, d + 16, 8);
+    CHECK(gva >= VA_BASE && !(gva & 0xFFFF));
+    v = 3; /* a page size that isn't a power of two */
+    memcpy(d + 4, &v, 4);
+    memset(d + 16, 0, 8);
+    CHECK(as_call(0x02, d, 24) == 4);
+
+    /* a mapping from the allocator, a fixed one over its second page, then UNMAP_BUFFER of the first: only the pages
+       still its own are cleared, and its VA goes back */
+    gva = as_map(0, again, 0x2000, 0);
+    CHECK(gva >= VA_BASE && gmmu_translate(gva) == 0x9000 && gmmu_translate(gva + 0x1FFF) == 0xAFFF);
+    h = nvmap_new(0x1000, 0xC000);
+    fixed = as_map(1, h, 0x1000, gva + 0x1000);
+    CHECK(fixed == gva + 0x1000 && gmmu_translate(fixed) == 0xC000);
+    memset(d, 0, sizeof d);
+    memcpy(d, &gva, 8);
+    CHECK(as_call(0x05, d, 8) == 0);
+    CHECK(!gmmu_translate(gva) && gmmu_translate(fixed) == 0xC000);
+    CHECK(as_map(0, again, 0x1000, 0) == gva); /* first fit takes the freed VA again */
+    /* FREE_SPACE clears every page of its range */
+    memset(d, 0, sizeof d);
+    memcpy(d, &gva, 8);
+    v = 2;
+    memcpy(d + 8, &v, 4);
+    v = 0x1000;
+    memcpy(d + 12, &v, 4);
+    CHECK(as_call(0x03, d, 16) == 0 && !gmmu_translate(gva) && !gmmu_translate(fixed));
+    addr = VA_END - 0x1000;
+    memcpy(d, &addr, 8);
+    CHECK(as_call(0x03, d, 16) == 4); /* past the 40-bit space */
+
+    /* REMAP in big pages: map, a bad handle skipped, then handle 0 unmaps */
+    memset(d, 0, sizeof d);
+    v = (u32)((VA_BASE + 0x1000000) >> 16);
+    memcpy(d + 4, &h, 4);
+    memcpy(d + 12, &v, 4);
+    memcpy(d + 16, &one, 4);
+    v = 0x1FFF; /* no such handle */
+    memcpy(d + 24, &v, 4);
+    CHECK(as_call(0x14, d, 40) == 0 && gmmu_translate(VA_BASE + 0x1000000) == 0xC000);
+    memset(d + 4, 0, 4);
+    CHECK(as_call(0x14, d, 20) == 0 && !gmmu_translate(VA_BASE + 0x1000000));
+
+    /* GET_VA_REGIONS: the big-page region starts where the allocator does */
+    memset(d, 0, sizeof d);
+    CHECK(as_call(0x08, d, 64) == 0);
+    memcpy(&v, d + 8, 4);
+    memcpy(&addr, d + 40, 8);
+    memcpy(&size, d + 16, 8);
+    CHECK(v == 48 && addr == VA_BASE && size == 0x10000ull << 10);
+    memcpy(&v, d + 48, 4);
+    CHECK(v == 0x10000);
+    /* ALLOC_AS_EX: 0 is 128K big pages */
+    memset(d, 0, sizeof d);
+    CHECK(as_call(0x09, d, 24) == 0 && nv.big_page_bits == 17);
+    v = 0x10000;
+    memcpy(d + 8, &v, 4);
+    CHECK(as_call(0x09, d, 24) == 0 && nv.big_page_bits == 16);
 }
 
 int main(void) {
@@ -507,6 +684,7 @@ int main(void) {
         CHECK(ioctl_as(0x06, request, sizeof request, NULL, 0) == 0);
         CHECK(gmmu_translate(gva) == addr && gmmu_translate(gva + 0xFFF) == AS_SIZE - 1);
     }
+    test_nvmap_as();
     nvdrv = new_nvdrv();
     u32 error;
 
@@ -528,12 +706,13 @@ int main(void) {
     test_ioctl2(gpu);
     test_ioctl3(ctrlgpu);
     test_ctrl_syncpoints(ctrl);
+    test_ctrl_event_fds(ctrl);
 
     /* a channel's own events (1 to 3), made on first query and kept by the fd; the ctrl fd's ids name event slots */
     KEvent* sm = query_event(gpu, 1);
     CHECK(query_event(gpu, 1) == sm && query_event(gpu, 3) != sm);
     KEvent* slot = query_event(ctrl, 0x10000005u);
-    CHECK(slot == nv.nvev[5].ev && query_event(ctrl, 5) == slot);
+    CHECK(slot == nv.ctrl_ev[ctrl][5].ev && query_event(ctrl, 5) == slot);
 
     /* closing the GPU channel retires its syncpoint once the GPU thread has run what was queued on it: a call after
        the channel's jobs */
@@ -544,16 +723,14 @@ int main(void) {
     CHECK(nv_ioctl1(gpu, SUBMIT_GPFIFO_EX, 0x18) == 8);
     CHECK(nv_close(gpu) == 8 && nv_close(0) == 8 && nv_close(0xFFFF) == 8); /* not open: as an ioctl to it */
     /* QueryEvent on an fd that isn't open: the bad-fd NvError, no handle, and no event slot of the ctrl device */
-    CHECK(!nv.nvev[6].ev);
+    CHECK(!nv.ctrl_ev[ctrl][6].ev);
     request(4, gpu, 6);
     CHECK(nvdrv->dispatch(nvdrv, &ctx) == 0 && reply(0) == 8 && ctx.nout_copy == 1 && ctx.out_copy[0] == 0);
-    CHECK(!nv.nvev[6].ev);
+    CHECK(!nv.ctrl_ev[ctrl][6].ev);
     test_close_during_ioctl();
 
     CHECK(nv_close(ctrlgpu) == 0 && nv_close(ctrl) == 0);
     for (u32 h = 0x100; h < test_next_handle; h++) kobj_unref(test_handles[h - 0x100]);
-    for (int i = 0; i < 64; i++)
-        if (nv.nvev[i].ev) kobj_unref(&nv.nvev[i].ev->o);
     CHECK(test_kobjs == 0 && test_locks == 0);
     svcobj_unref(nvdrv);
     for (u32 i = 0; i < GL1; i++) free(nv.gmmu[i]);

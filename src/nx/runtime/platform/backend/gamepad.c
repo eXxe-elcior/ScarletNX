@@ -1,7 +1,5 @@
-/* SwitchRecomp - Copyright 2026 MZ Labs
-   Licensed under the Apache License 2.0. See LICENSE.apache and NOTICE;
-   any copy or derived work must keep the credit to SwitchRecomp by MZ Labs.
-   This fork's changes are under GPL-3.0-or-later, the license of the fork as a whole (LICENSE). */
+/* SPDX-License-Identifier: GPL-3.0-or-later
+   Copyright 2026 the ScarletNX contributors */
 #include "nx/runtime/platform/gamepad.h"
 #include "nx/runtime/options.h"
 #include "nx/runtime/main.h"
@@ -260,10 +258,15 @@ static void load_mappings(void) {
         LOG("input: SDL mappings from %s\n", override);
         return;
     }
-    /* the launcher's, beside its settings.ini: one mapping database for every game it opens. On Android its own
-       storage, SDL's */
+    /* the launcher's, beside its settings.ini: one mapping database for every game it opens. On Android that of its
+       data folder in the app's own files (src/gui/android.c), wherever the game is */
 #ifdef SDL_PLATFORM_ANDROID
-    folder = SDL_GetPrefPath("scarletnx", "gui");
+    {
+        const char* files = SDL_GetAndroidInternalStoragePath();
+        char* data = files ? snx_path_join(files, SNX_PORTABLE_DIR) : NULL;
+        folder = data ? snx_menu_dir(data, SNX_USER_CONFIG) : NULL;
+        free(data);
+    }
 #else
     folder = snx_menu_dir(g_exedir[0] ? g_exedir : ".", SNX_USER_CONFIG);
 #endif
@@ -280,11 +283,7 @@ static void load_mappings(void) {
         LOG("input: loaded %d SDL mappings from %s\n", count, path);
     free(path);
 done:
-#ifdef SDL_PLATFORM_ANDROID
-    SDL_free(folder);
-#else
     free(folder);
-#endif
 }
 void gamepad_detect(u32 id) {
     const char* name = SDL_GetJoystickNameForID(id);
