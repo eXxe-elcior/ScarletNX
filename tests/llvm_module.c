@@ -126,8 +126,7 @@ static int run(const char* path, const unsigned char* image, int interp, Run* ou
 }
 
 static int same(const Run* a, const Run* b) {
-    return !memcmp(a->cpu.x, b->cpu.x, sizeof(a->cpu.x)) && a->cpu.pc == b->cpu.pc && a->cpu.n == b->cpu.n &&
-           a->cpu.z == b->cpu.z && a->cpu.cf == b->cpu.cf && a->cpu.vf == b->cpu.vf &&
+    return !memcmp(a->cpu.x, b->cpu.x, sizeof(a->cpu.x)) && a->cpu.pc == b->cpu.pc && a->cpu.nzcv == b->cpu.nzcv &&
            !memcmp(a->cpu.v, b->cpu.v, sizeof(a->cpu.v)) && a->cpu.fpsr == b->cpu.fpsr &&
            a->cpu.excl_on == b->cpu.excl_on && !memcmp(a->memory, b->memory, MEMORY) &&
            !memcmp(&a->calls, &b->calls, sizeof(a->calls));
@@ -145,12 +144,11 @@ static void differences(const Run* a, const Run* b, const char* what) {
             fprintf(stderr, "  %s v%lu=%llx:%llx, llvm %llx:%llx\n", what, (unsigned long)i,
                     (unsigned long long)b->cpu.v[i].d[1], (unsigned long long)b->cpu.v[i].d[0],
                     (unsigned long long)a->cpu.v[i].d[1], (unsigned long long)a->cpu.v[i].d[0]);
-    if (a->cpu.pc != b->cpu.pc || a->cpu.n != b->cpu.n || a->cpu.z != b->cpu.z || a->cpu.cf != b->cpu.cf ||
-        a->cpu.vf != b->cpu.vf || a->cpu.fpsr != b->cpu.fpsr || a->cpu.excl_on != b->cpu.excl_on)
-        fprintf(stderr, "  %s pc=%llx nzcv=%u%u%u%u fpsr=%x excl=%u, llvm pc=%llx nzcv=%u%u%u%u fpsr=%x excl=%u\n",
-                what, (unsigned long long)b->cpu.pc, b->cpu.n, b->cpu.z, b->cpu.cf, b->cpu.vf, (unsigned)b->cpu.fpsr,
-                b->cpu.excl_on, (unsigned long long)a->cpu.pc, a->cpu.n, a->cpu.z, a->cpu.cf, a->cpu.vf,
-                (unsigned)a->cpu.fpsr, a->cpu.excl_on);
+    if (a->cpu.pc != b->cpu.pc || a->cpu.nzcv != b->cpu.nzcv || a->cpu.fpsr != b->cpu.fpsr ||
+        a->cpu.excl_on != b->cpu.excl_on)
+        fprintf(stderr, "  %s pc=%llx nzcv=%08x fpsr=%x excl=%u, llvm pc=%llx nzcv=%08x fpsr=%x excl=%u\n",
+                what, (unsigned long long)b->cpu.pc, b->cpu.nzcv, (unsigned)b->cpu.fpsr, b->cpu.excl_on,
+                (unsigned long long)a->cpu.pc, a->cpu.nzcv, (unsigned)a->cpu.fpsr, a->cpu.excl_on);
     for (i = 0; i < MEMORY; ++i)
         if (a->memory[i] != b->memory[i]) {
             fprintf(stderr, "  %s memory differs from offset %lx\n", what, (unsigned long)i);

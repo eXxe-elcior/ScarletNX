@@ -250,10 +250,10 @@ static void emit_semantic_fixture(FILE* out) {
         out);
     fputs(" memset(&c,0,sizeof(c));memset(memory,0xAA,sizeof(memory));c.mem=memory;c.rt=&rt;traps=0;\n switch(i){\n",
           out);
-    fputs(" case 0:c.x[1]=0xFFFFFFFFULL;break; case 1:c.cf=1;break; case 2:c.cf=0;break;\n", out);
+    fputs(" case 0:c.x[1]=0xFFFFFFFFULL;break; case 1:c.nzcv|=1u<<29;break; case 2:c.nzcv&=~(1u<<29);break;\n", out);
     fputs(" case 3:c.x[1]=0x12345678;break;case 4:c.x[1]=0x80;break;case 5:c.x[1]=0x123456789ABCDEF0ULL;break;\n", out);
     fputs(" case 6:c.x[1]=16777217;break;case 7:c.v[1].d[0]=0x7FF8000000001234ULL;break;\n", out);
-    fputs(" case 8:c.z=1;c.v[1].d[0]=0x7FF8000000001234ULL;c.v[2].d[0]=0x3FF0000000000000ULL;break;\n", out);
+    fputs(" case 8:c.nzcv|=1u<<30;c.v[1].d[0]=0x7FF8000000001234ULL;c.v[2].d[0]=0x3FF0000000000000ULL;break;\n", out);
     fputs(" case 9:for(j=0;j<4;j++){c.v[1].s[j]=0xFFFFFFFFu;c.v[2].s[j]=j+1;}break;\n", out);
     fputs(" case 10:for(j=0;j<4;j++){c.v[0].f[j]=3;c.v[1].f[j]=4;c.v[2].f[j]=5;}break;\n", out);
     fputs(" case 11:c.x[1]=0x123456789ABCDEF0ULL;break;case 12:c.v[1].d[1]=0xFEDCBA9876543210ULL;break;\n", out);
@@ -273,7 +273,7 @@ static void emit_semantic_fixture(FILE* out) {
     fputs(" case 27:c.v[2].s[0]=0x7F800000;break;default:break;}\n", out);
     fputs(" pc=mode?snx_step(&c,words[i],0x1000):steps[i](&c);ok=pc==(i==16?0xFFC:i==17?0x1000:0x1004);\n switch(i){\n",
           out);
-    fputs(" case 0:ok&=c.x[0]==0&&c.z==1&&c.cf==1&&!c.n&&!c.vf;break;case 1:ok&=c.x[0]==1;break;\n", out);
+    fputs(" case 0:ok&=c.x[0]==0&&c.nzcv==0x60000000u;break;case 1:ok&=c.x[0]==1;break;\n", out);
     fputs(" case 2:ok&=c.x[0]==~0ULL;break;case 3:ok&=c.x[0]==0x3456;break;case 4:ok&=c.x[0]==~127ULL;break;\n", out);
     fputs(
         " case 5:ok&=c.x[0]==0xF0123456789ABCDEULL;break;case 6:ok&=c.v[0].s[0]==0x4B800000u&&!c.v[0].d[1]&&c.fpsr==0x10;break;\n",

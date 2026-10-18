@@ -292,7 +292,7 @@ void ir_cpu_store(SnxIr* ir, LLVMValueRef value, size_t offset) {
 size_t ir_off_x(unsigned n) { return offsetof(CPU, x) + 8 * (size_t)n; }
 size_t ir_off_v(unsigned n) { return offsetof(CPU, v) + 16 * (size_t)n; }
 size_t ir_off_pc(void) { return offsetof(CPU, pc); }
-size_t ir_off_cf(void) { return offsetof(CPU, cf); }
+size_t ir_off_nzcv(void) { return offsetof(CPU, nzcv); }
 size_t ir_off_excl_on(void) { return offsetof(CPU, excl_on); }
 size_t ir_off_fpcr(void) { return offsetof(CPU, fpcr); }
 size_t ir_off_mem(void) { return offsetof(CPU, mem); }
@@ -555,50 +555,65 @@ static void helper_end(SnxIr* ir, Saved* saved) {
 #define P(i) LLVMGetParam(function, i)
 #define B    ir->b
 
-static void store_flag(SnxIr* ir, LLVMValueRef value, size_t offset) { ir_cpu_store(ir, ir_u32(ir, value), offset); }
+/* NZCV lives in one u32 in PSTATE positions (n=31, z=30, c=29, v=28): one store per update, one load per
+   read, instead of four separate fields */
+static LLVMValueRef flag_bits(SnxIr* ir, LLVMValueRef v) {
+    unsigned bits = LLVMGetIntTypeWidth(LLVMTypeOf(v));
+    if (bits == 1) return LLVMBuildZExt(B, v, ir->t_i32, "");
+    if (bits > 32) return LLVMBuildTrunc(B, v, ir->t_i32, "");
+    return v;
+}
+static LLVMValueRef nzcv_bit(SnxIr* ir, LLVMValueRef f, unsigned bit) {
+    return LLVMBuildAnd(B, LLVMBuildLShr(B, f, ir_i32(ir, bit), ""), ir_i32(ir, 1), "");
+}
+static void store_nzcv(SnxIr* ir, LLVMValueRef n, LLVMValueRef z, LLVMValueRef cf, LLVMValueRef vf) {
+    LLVMValueRef w = LLVMBuildOr(
+        B,
+        LLVMBuildOr(B, LLVMBuildShl(B, flag_bits(ir, n), ir_i32(ir, 31), ""),
+                    LLVMBuildShl(B, flag_bits(ir, z), ir_i32(ir, 30), ""), ""),
+        LLVMBuildOr(B, LLVMBuildShl(B, flag_bits(ir, cf), ir_i32(ir, 29), ""),
+                    LLVMBuildShl(B, flag_bits(ir, vf), ir_i32(ir, 28), ""), ""), "");
+    ir_cpu_store(ir, w, offsetof(CPU, nzcv));
+}
 
 /* adds64/adds32(c,a,b,cin) */
 static void build_adds(SnxIr* ir, LLVMValueRef function, LLVMTypeRef t, unsigned bits) {
     LLVMValueRef a = P(1), b = P(2), cin = P(3), r, cf, vf;
     r = LLVMBuildAdd(B, LLVMBuildAdd(B, a, b, ""), ir_cast(ir, cin, t, 0), "");
-    store_flag(ir, LLVMBuildLShr(B, r, LLVMConstInt(t, bits - 1, 0), ""), offsetof(CPU, n));
-    store_flag(ir, LLVMBuildZExt(B, LLVMBuildICmp(B, LLVMIntEQ, r, LLVMConstInt(t, 0, 0), ""), t, ""),
-               offsetof(CPU, z));
     cf = LLVMBuildSelect(B, LLVMBuildICmp(B, LLVMIntNE, cin, ir_i32(ir, 0), ""), LLVMBuildICmp(B, LLVMIntULE, r, a, ""),
                          LLVMBuildICmp(B, LLVMIntULT, r, a, ""), "");
-    ir_cpu_store(ir, ir_bool32(ir, cf), offsetof(CPU, cf));
     vf = LLVMBuildAnd(B, LLVMBuildNot(B, LLVMBuildXor(B, a, b, ""), ""), LLVMBuildXor(B, a, r, ""), "");
-    store_flag(ir, LLVMBuildLShr(B, vf, LLVMConstInt(t, bits - 1, 0), ""), offsetof(CPU, vf));
+    store_nzcv(ir, LLVMBuildLShr(B, r, LLVMConstInt(t, bits - 1, 0), ""),
+               LLVMBuildICmp(B, LLVMIntEQ, r, LLVMConstInt(t, 0, 0), ""), cf,
+               LLVMBuildLShr(B, vf, LLVMConstInt(t, bits - 1, 0), ""));
     LLVMBuildRet(B, r);
 }
 /* subs64/subs32(c,a,b) */
 static void build_subs(SnxIr* ir, LLVMValueRef function, LLVMTypeRef t, unsigned bits) {
     LLVMValueRef a = P(1), b = P(2), r, vf;
     r = LLVMBuildSub(B, a, b, "");
-    store_flag(ir, LLVMBuildLShr(B, r, LLVMConstInt(t, bits - 1, 0), ""), offsetof(CPU, n));
-    ir_cpu_store(ir, ir_bool32(ir, LLVMBuildICmp(B, LLVMIntEQ, r, LLVMConstInt(t, 0, 0), "")), offsetof(CPU, z));
-    ir_cpu_store(ir, ir_bool32(ir, LLVMBuildICmp(B, LLVMIntUGE, a, b, "")), offsetof(CPU, cf));
     vf = LLVMBuildAnd(B, LLVMBuildXor(B, a, b, ""), LLVMBuildXor(B, a, r, ""), "");
-    store_flag(ir, LLVMBuildLShr(B, vf, LLVMConstInt(t, bits - 1, 0), ""), offsetof(CPU, vf));
+    store_nzcv(ir, LLVMBuildLShr(B, r, LLVMConstInt(t, bits - 1, 0), ""),
+               LLVMBuildICmp(B, LLVMIntEQ, r, LLVMConstInt(t, 0, 0), ""), LLVMBuildICmp(B, LLVMIntUGE, a, b, ""),
+               LLVMBuildLShr(B, vf, LLVMConstInt(t, bits - 1, 0), ""));
     LLVMBuildRet(B, r);
 }
 /* logic64/logic32(c,r) */
 static void build_logic(SnxIr* ir, LLVMValueRef function, LLVMTypeRef t, unsigned bits) {
     LLVMValueRef r = P(1);
-    store_flag(ir, LLVMBuildLShr(B, r, LLVMConstInt(t, bits - 1, 0), ""), offsetof(CPU, n));
-    ir_cpu_store(ir, ir_bool32(ir, LLVMBuildICmp(B, LLVMIntEQ, r, LLVMConstInt(t, 0, 0), "")), offsetof(CPU, z));
-    ir_cpu_store(ir, ir_i32(ir, 0), offsetof(CPU, cf));
-    ir_cpu_store(ir, ir_i32(ir, 0), offsetof(CPU, vf));
+    store_nzcv(ir, LLVMBuildLShr(B, r, LLVMConstInt(t, bits - 1, 0), ""),
+               LLVMBuildICmp(B, LLVMIntEQ, r, LLVMConstInt(t, 0, 0), ""), ir_i32(ir, 0), ir_i32(ir, 0));
     LLVMBuildRetVoid(B);
 }
 /* cond_ok(c,cond) */
 static void build_cond_ok(SnxIr* ir, LLVMValueRef function) {
-    LLVMValueRef cond = P(1), n, z, cf, vf, k, r, nv, zero = ir_i32(ir, 0), result;
+    LLVMValueRef cond = P(1), f, n, z, cf, vf, k, r, nv, zero = ir_i32(ir, 0), result;
     LLVMBasicBlockRef always = ir_block(ir, "always"), test = ir_block(ir, "test");
-    n = ir_cpu_load(ir, ir->t_i32, offsetof(CPU, n));
-    z = ir_cpu_load(ir, ir->t_i32, offsetof(CPU, z));
-    cf = ir_cpu_load(ir, ir->t_i32, offsetof(CPU, cf));
-    vf = ir_cpu_load(ir, ir->t_i32, offsetof(CPU, vf));
+    f = ir_cpu_load(ir, ir->t_i32, offsetof(CPU, nzcv));
+    n = nzcv_bit(ir, f, 31);
+    z = nzcv_bit(ir, f, 30);
+    cf = nzcv_bit(ir, f, 29);
+    vf = nzcv_bit(ir, f, 28);
     k = LLVMBuildLShr(B, cond, ir_i32(ir, 1), "");
     LLVMBuildCondBr(B, LLVMBuildICmp(B, LLVMIntEQ, k, ir_i32(ir, 7), ""), always, test);
     LLVMPositionBuilderAtEnd(B, always);
@@ -623,11 +638,8 @@ static void build_cond_ok(SnxIr* ir, LLVMValueRef function) {
 }
 /* set_nzcv(c,f) */
 static void build_set_nzcv(SnxIr* ir, LLVMValueRef function) {
-    LLVMValueRef f = P(1), one = ir_i32(ir, 1);
-    ir_cpu_store(ir, LLVMBuildAnd(B, LLVMBuildLShr(B, f, ir_i32(ir, 3), ""), one, ""), offsetof(CPU, n));
-    ir_cpu_store(ir, LLVMBuildAnd(B, LLVMBuildLShr(B, f, ir_i32(ir, 2), ""), one, ""), offsetof(CPU, z));
-    ir_cpu_store(ir, LLVMBuildAnd(B, LLVMBuildLShr(B, f, one, ""), one, ""), offsetof(CPU, cf));
-    ir_cpu_store(ir, LLVMBuildAnd(B, f, one, ""), offsetof(CPU, vf));
+    LLVMValueRef f = P(1);
+    ir_cpu_store(ir, LLVMBuildShl(B, LLVMBuildAnd(B, f, ir_i32(ir, 15), ""), ir_i32(ir, 28), ""), offsetof(CPU, nzcv));
     LLVMBuildRetVoid(B);
 }
 /* ror64/ror32(x,s): s&=w-1; s ? (x>>s)|(x<<(w-s)) : x */

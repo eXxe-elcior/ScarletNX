@@ -226,7 +226,7 @@ void ir_cpu_store(SnxIr* ir, LLVMValueRef value, size_t offset);
 size_t ir_off_x(unsigned n);
 size_t ir_off_v(unsigned n);
 size_t ir_off_pc(void);
-size_t ir_off_cf(void);
+size_t ir_off_nzcv(void);
 size_t ir_off_excl_on(void);
 size_t ir_off_fpcr(void);
 size_t ir_off_mem(void);

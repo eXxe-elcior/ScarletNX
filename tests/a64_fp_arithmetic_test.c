@@ -16,7 +16,7 @@ static CPU state(u32 control) {
     CPU c = {0};
     c.fpcr = control;
     c.fpsr = 0xA8000000u; /* NZCV and QC in FPSR must survive arithmetic. */
-    c.n = c.cf = 1;
+    c.nzcv = 0xA0000000u; /* N=1, C=1: arithmetic must leave PSTATE.NZCV alone */
     return c;
 }
 static void result(CPU* c, u64 got, u64 want, u32 flags, u32 control, const char* name) {

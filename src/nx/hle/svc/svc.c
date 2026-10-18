@@ -274,7 +274,7 @@ static u32 get_thread_context(KThread* cur, u64 out, u32 h) {
             memcpy(ctx + 0x110, c->v, sizeof c->v);
         }
         put64(ctx + 0x100, at_svc ? c->pc - 4 : c->pc);
-        w[0] = (c->n ? 1u << 31 : 0) | (c->z ? 1u << 30 : 0) | (c->cf ? 1u << 29 : 0) | (c->vf ? 1u << 28 : 0);
+        w[0] = c->nzcv;
         memcpy(ctx + 0x108, w, 4);
         w[0] = c->fpcr;
         w[1] = c->fpsr;

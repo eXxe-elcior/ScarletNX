@@ -250,10 +250,8 @@ static void random_state(CPU* c, unsigned char* memory, const Word* w) {
             c->v[rn].d[1] = narrow_edge((w->word >> 22) & 1);
         }
     }
-    c->n = next_random() & 1;
-    c->z = next_random() & 1;
-    c->cf = next_random() & 1;
-    c->vf = next_random() & 1;
+    c->nzcv = ((next_random() & 1) << 31) | ((next_random() & 1) << 30) | ((next_random() & 1) << 29) |
+              ((next_random() & 1) << 28);
     c->fpcr = fpcr[next_random() % 8] | (next_random() % 2 ? (u32)(next_random() & 0x07C00000u) : 0);
     if ((w->word & 0x8F3FFC00UL) == 0x0E216800UL && next_random() % 2) c->fpcr &= ~(3u << 22); /* FCVTN: RNE */
     c->fpsr = next_random() % 4 ? (next_random() % 2 ? 0x10 : 0) : (u32)(next_random() & 0xF800009Fu);
@@ -307,8 +305,8 @@ static void report(const Word* w, const CPU* start, const CPU* p, const CPU* l, 
                     (unsigned long long)start->v[i].d[1], (unsigned long long)start->v[i].d[0],
                     (unsigned long long)p->v[i].d[1], (unsigned long long)p->v[i].d[0],
                     (unsigned long long)l->v[i].d[1], (unsigned long long)l->v[i].d[0]);
-    if (p->n != l->n || p->z != l->z || p->cf != l->cf || p->vf != l->vf)
-        fprintf(stderr, "  nzcv portable %u%u%u%u llvm %u%u%u%u\n", p->n, p->z, p->cf, p->vf, l->n, l->z, l->cf, l->vf);
+    if (p->nzcv != l->nzcv)
+        fprintf(stderr, "  nzcv portable %08x llvm %08x\n", p->nzcv, l->nzcv);
     if (p->fpcr != l->fpcr || p->fpsr != l->fpsr)
         fprintf(stderr, "  fpcr/fpsr portable %08x/%08x llvm %08x/%08x (start %08x/%08x)\n", p->fpcr, p->fpsr, l->fpcr,
                 l->fpsr, start->fpcr, start->fpsr);
@@ -323,8 +321,8 @@ static void report(const Word* w, const CPU* start, const CPU* p, const CPU* l, 
 }
 
 static int same_cpu(const CPU* a, const CPU* b) {
-    return !memcmp(a->x, b->x, sizeof(a->x)) && a->pc == b->pc && a->n == b->n && a->z == b->z && a->cf == b->cf &&
-           a->vf == b->vf && !memcmp(a->v, b->v, sizeof(a->v)) && a->fpcr == b->fpcr && a->fpsr == b->fpsr &&
+    return !memcmp(a->x, b->x, sizeof(a->x)) && a->pc == b->pc && a->nzcv == b->nzcv &&
+           !memcmp(a->v, b->v, sizeof(a->v)) && a->fpcr == b->fpcr && a->fpsr == b->fpsr &&
            a->tpidr == b->tpidr && a->tpidrro == b->tpidrro && a->excl_addr == b->excl_addr &&
            a->excl_val == b->excl_val && a->excl_val2 == b->excl_val2 && a->excl_size == b->excl_size &&
            a->excl_on == b->excl_on;

@@ -28,6 +28,9 @@ static const Kernel kernels[] = {
                 " ubfx x8, x7, #5, #17\n madd x1, x8, x2, x1\n str x1, [x3, #8]\n ldr x9, [x3, #8]\n"
                 " add x2, x2, x9, lsr #7\n and w10, w2, #0x7ffffff0\n eor x2, x2, x10\n tbz x2, #5, 1f\n"
                 " sub x2, x2, #3\n1:\n subs x19, x19, #1\n b.ne loop\n ret\n"},
+    {"flags", "main:\n mov x1, #0\n mov x2, #0\nloop:\n cmp x1, #64\n b.eq reset\n add x1, x1, #1\n b.lt keep\n"
+              " csinc x2, x2, x1, ge\n b next\nreset:\n mov x1, #0\nkeep:\n add x2, x2, #1\n"
+              "next:\n subs x19, x19, #1\n b.ne loop\n ret\n"},
     {"fp", "main:\n fmov d0, #1.0\n fmov d1, #1.5\n fmov d2, #0.5\n fmov s3, #2.0\n fmov s4, #1.25\nloop:\n"
            " fadd d0, d0, d2\n fmul d5, d0, d1\n fdiv d6, d5, d1\n fsub d0, d6, d2\n fmadd d7, d0, d1, d2\n"
            " fsqrt d8, d7\n fmul d0, d0, d2\n fadd d0, d0, d8\n fadd s3, s3, s4\n fdiv s3, s3, s4\n"
@@ -237,8 +240,7 @@ int main(int argc, char** argv) {
                 } else if (have_reference &&
                            (memcmp(reference.x, result.x, sizeof(result.x)) ||
                             memcmp(reference.v, result.v, sizeof(result.v)) || reference.fpsr != result.fpsr ||
-                            reference.n != result.n || reference.z != result.z || reference.cf != result.cf ||
-                            reference.vf != result.vf)) {
+                            reference.nzcv != result.nzcv)) {
                     fprintf(stderr, "%s: %s state differs from %s\n", kernels[k].name, backends[b], backends[0]);
                     ++failures;
                 }

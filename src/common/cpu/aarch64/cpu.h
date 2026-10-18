@@ -34,7 +34,7 @@ typedef double f64;
    module descriptor). The recompiler stamps it into each module, the runtime refuses a module with another one */
 /* 7: CPU.poll and RtAPI.poll, checked on the backward branches of generated code.
    8: recompile game modules for the FP/SIMD emitters and discovery changes. */
-#define SNX_ABI 8
+#define SNX_ABI 9
 
 #if defined(_WIN32)
 #define SNX_EXPORT __declspec(dllexport)
@@ -61,7 +61,7 @@ typedef void (*GuestFn)(struct CPU* RESTRICT c, u64 entry);
 typedef struct CPU {
     u64 x[32]; /* x[31] is SP, XZR is handled at translation time */
     u64 pc;
-    u32 n, z, cf, vf; /* NZCV kept as separate fields */
+    u32 nzcv; /* NZCV in PSTATE positions: N=31, Z=30, C=29, V=28 */
     V128 v[32];
     u32 fpcr, fpsr;
     u64 tpidr, tpidrro;
@@ -114,74 +114,52 @@ SNX_INLINE GuestFn snx_lookup(CPU* c, u64 pc) {
 
 /* ---- conditions ---- */
 SNX_INLINE int cond_ok(const CPU* c, u32 cond) {
+    u32 f = c->nzcv, n = f >> 31, z = (f >> 30) & 1, cf = (f >> 29) & 1, vf = (f >> 28) & 1;
     int r;
     switch (cond >> 1) {
-        case 0: r = c->z; break;
-        case 1: r = c->cf; break;
-        case 2: r = c->n; break;
-        case 3: r = c->vf; break;
-        case 4: r = c->cf && !c->z; break;
-        case 5: r = c->n == c->vf; break;
-        case 6: r = !c->z && c->n == c->vf; break;
+        case 0: r = (int)z; break;
+        case 1: r = (int)cf; break;
+        case 2: r = (int)n; break;
+        case 3: r = (int)vf; break;
+        case 4: r = (int)(cf && !z); break;
+        case 5: r = n == vf; break;
+        case 6: r = !z && n == vf; break;
         default: return 1;
     }
     return (cond & 1) ? !r : r;
 }
-SNX_INLINE void set_nzcv(CPU* c, u32 f) {
-    c->n = (f >> 3) & 1;
-    c->z = (f >> 2) & 1;
-    c->cf = (f >> 1) & 1;
-    c->vf = f & 1;
-}
-SNX_INLINE u32 get_nzcv(const CPU* c) { return (c->n << 31) | (c->z << 30) | (c->cf << 29) | (c->vf << 28); }
+SNX_INLINE u32 get_nzcv(const CPU* c) { return c->nzcv; }
+SNX_INLINE u32 get_cf(const CPU* c) { return (c->nzcv >> 29) & 1; }
+SNX_INLINE void set_nzcv(CPU* c, u32 f) { c->nzcv = (f & 0xF) << 28; }
 
 /* ---- flag setting arith ---- */
+SNX_INLINE void set_flags(CPU* c, u32 n, u32 z, u32 cf, u32 vf) {
+    c->nzcv = (n << 31) | (z << 30) | (cf << 29) | (vf << 28);
+}
 SNX_INLINE u64 adds64(CPU* c, u64 a, u64 b, u32 cin) {
     u64 r = a + b + cin;
-    c->n = (u32)(r >> 63);
-    c->z = r == 0;
-    c->cf = cin ? r <= a : r < a;
-    c->vf = (u32)(((~(a ^ b)) & (a ^ r)) >> 63);
+    set_flags(c, (u32)(r >> 63), r == 0, cin ? r <= a : r < a, (u32)(((~(a ^ b)) & (a ^ r)) >> 63));
     return r;
 }
 SNX_INLINE u32 adds32(CPU* c, u32 a, u32 b, u32 cin) {
     u32 r = a + b + cin;
-    c->n = r >> 31;
-    c->z = r == 0;
-    c->cf = cin ? r <= a : r < a;
-    c->vf = ((~(a ^ b)) & (a ^ r)) >> 31;
+    set_flags(c, r >> 31, r == 0, cin ? r <= a : r < a, ((~(a ^ b)) & (a ^ r)) >> 31);
     return r;
 }
 SNX_INLINE u64 subs64(CPU* c, u64 a, u64 b) {
     u64 r = a - b;
-    c->n = (u32)(r >> 63);
-    c->z = r == 0;
-    c->cf = a >= b;
-    c->vf = (u32)(((a ^ b) & (a ^ r)) >> 63);
+    set_flags(c, (u32)(r >> 63), r == 0, a >= b, (u32)(((a ^ b) & (a ^ r)) >> 63));
     return r;
 }
 SNX_INLINE u32 subs32(CPU* c, u32 a, u32 b) {
     u32 r = a - b;
-    c->n = r >> 31;
-    c->z = r == 0;
-    c->cf = a >= b;
-    c->vf = ((a ^ b) & (a ^ r)) >> 31;
+    set_flags(c, r >> 31, r == 0, a >= b, ((a ^ b) & (a ^ r)) >> 31);
     return r;
 }
 SNX_INLINE u64 sbcs64(CPU* c, u64 a, u64 b, u32 cin) { return adds64(c, a, ~b, cin); }
 SNX_INLINE u32 sbcs32(CPU* c, u32 a, u32 b, u32 cin) { return adds32(c, a, ~b, cin); }
-SNX_INLINE void logic64(CPU* c, u64 r) {
-    c->n = (u32)(r >> 63);
-    c->z = r == 0;
-    c->cf = 0;
-    c->vf = 0;
-}
-SNX_INLINE void logic32(CPU* c, u32 r) {
-    c->n = r >> 31;
-    c->z = r == 0;
-    c->cf = 0;
-    c->vf = 0;
-}
+SNX_INLINE void logic64(CPU* c, u64 r) { set_flags(c, (u32)(r >> 63), r == 0, 0, 0); }
+SNX_INLINE void logic32(CPU* c, u32 r) { set_flags(c, r >> 31, r == 0, 0, 0); }
 
 /* ---- shifts ---- */
 SNX_INLINE u64 ror64(u64 x, u32 s) {

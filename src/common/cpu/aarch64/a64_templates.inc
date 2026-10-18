@@ -2098,42 +2098,42 @@ static const SnxA64Case cases_ADC[] = {
     /* sf=0, op=0, S=0 */
     { SNX_FLOW_PLAIN,
       "const u32 f_rd=(w>>0)&31; const u32 f_rm=(w>>16)&31; const u32 f_rn=(w>>5)&31; ",
-      "SETX(f_rd,(u64)((u32)((u32)(u32)RX(f_rn)+(u32)(u32)RX(f_rm)+c->cf)));",
+      "SETX(f_rd,(u64)((u32)((u32)(u32)RX(f_rn)+(u32)(u32)RX(f_rm)+get_cf(c))));",
       "" },
     /* sf=0, op=0, S=1 */
     { SNX_FLOW_PLAIN,
       "const u32 f_rd=(w>>0)&31; const u32 f_rm=(w>>16)&31; const u32 f_rn=(w>>5)&31; ",
-      "SETX(f_rd,(u64)((u32)(adds32(c,(u32)RX(f_rn),(u32)RX(f_rm),c->cf))));",
+      "SETX(f_rd,(u64)((u32)(adds32(c,(u32)RX(f_rn),(u32)RX(f_rm),get_cf(c)))));",
       "" },
     /* sf=0, op=1, S=0 */
     { SNX_FLOW_PLAIN,
       "const u32 f_rd=(w>>0)&31; const u32 f_rm=(w>>16)&31; const u32 f_rn=(w>>5)&31; ",
-      "SETX(f_rd,(u64)((u32)((u32)(u32)RX(f_rn)+~(u32)(u32)RX(f_rm)+c->cf)));",
+      "SETX(f_rd,(u64)((u32)((u32)(u32)RX(f_rn)+~(u32)(u32)RX(f_rm)+get_cf(c))));",
       "" },
     /* sf=0, op=1, S=1 */
     { SNX_FLOW_PLAIN,
       "const u32 f_rd=(w>>0)&31; const u32 f_rm=(w>>16)&31; const u32 f_rn=(w>>5)&31; ",
-      "SETX(f_rd,(u64)((u32)(sbcs32(c,(u32)RX(f_rn),(u32)RX(f_rm),c->cf))));",
+      "SETX(f_rd,(u64)((u32)(sbcs32(c,(u32)RX(f_rn),(u32)RX(f_rm),get_cf(c)))));",
       "" },
     /* sf=1, op=0, S=0 */
     { SNX_FLOW_PLAIN,
       "const u32 f_rd=(w>>0)&31; const u32 f_rm=(w>>16)&31; const u32 f_rn=(w>>5)&31; ",
-      "SETX(f_rd,(u64)((u64)RX(f_rn)+(u64)RX(f_rm)+c->cf));",
+      "SETX(f_rd,(u64)((u64)RX(f_rn)+(u64)RX(f_rm)+get_cf(c)));",
       "" },
     /* sf=1, op=0, S=1 */
     { SNX_FLOW_PLAIN,
       "const u32 f_rd=(w>>0)&31; const u32 f_rm=(w>>16)&31; const u32 f_rn=(w>>5)&31; ",
-      "SETX(f_rd,(u64)(adds64(c,RX(f_rn),RX(f_rm),c->cf)));",
+      "SETX(f_rd,(u64)(adds64(c,RX(f_rn),RX(f_rm),get_cf(c))));",
       "" },
     /* sf=1, op=1, S=0 */
     { SNX_FLOW_PLAIN,
       "const u32 f_rd=(w>>0)&31; const u32 f_rm=(w>>16)&31; const u32 f_rn=(w>>5)&31; ",
-      "SETX(f_rd,(u64)((u64)RX(f_rn)+~(u64)RX(f_rm)+c->cf));",
+      "SETX(f_rd,(u64)((u64)RX(f_rn)+~(u64)RX(f_rm)+get_cf(c)));",
       "" },
     /* sf=1, op=1, S=1 */
     { SNX_FLOW_PLAIN,
       "const u32 f_rd=(w>>0)&31; const u32 f_rm=(w>>16)&31; const u32 f_rn=(w>>5)&31; ",
-      "SETX(f_rd,(u64)(sbcs64(c,RX(f_rn),RX(f_rm),c->cf)));",
+      "SETX(f_rd,(u64)(sbcs64(c,RX(f_rn),RX(f_rm),get_cf(c))));",
       "" },
 };
 

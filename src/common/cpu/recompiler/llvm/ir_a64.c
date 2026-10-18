@@ -463,6 +463,12 @@ static void addsub_ext(SnxIr* ir, SnxU32 w, size_t index) {
     }
 }
 
+/* carry flag (PSTATE C, bit 29 of the packed NZCV word) as 0/1 */
+static V cf_bit(SnxIr* ir) {
+    V f = ir_cpu_load(ir, ir->t_i32, ir_off_nzcv());
+    return LLVMBuildAnd(B, LLVMBuildLShr(B, f, i32c(ir, 29), ""), i32c(ir, 1), "");
+}
+
 static void adc(SnxIr* ir, SnxU32 w, size_t index) {
     unsigned s = index & 1, op = (index >> 1) & 1, sf = (unsigned)(index >> 2);
     unsigned rd = F(0, 5), rn = F(5, 5), rm = F(16, 5);
@@ -470,7 +476,7 @@ static void adc(SnxIr* ir, SnxU32 w, size_t index) {
     if (!sf) {
         a = rx32(ir, rn);
         b = rx32(ir, rm);
-        cf = ir_cpu_load(ir, ir->t_i32, ir_off_cf());
+        cf = cf_bit(ir);
         if (!s) {
             if (op) b = LLVMBuildNot(B, b, "");
             ir_setx(ir, rd, ir_u64(ir, LLVMBuildAdd(B, LLVMBuildAdd(B, a, b, ""), cf, "")));
@@ -479,7 +485,7 @@ static void adc(SnxIr* ir, SnxU32 w, size_t index) {
     } else {
         a = ir_rx(ir, rn);
         b = ir_rx(ir, rm);
-        cf = ir_cpu_load(ir, ir->t_i32, ir_off_cf());
+        cf = cf_bit(ir);
         if (!s) {
             if (op) b = LLVMBuildNot(B, b, "");
             ir_setx(ir, rd, LLVMBuildAdd(B, LLVMBuildAdd(B, a, b, ""), ir_u64(ir, cf), ""));
