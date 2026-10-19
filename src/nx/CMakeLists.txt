@@ -29,7 +29,7 @@ endfunction()
 snx_component(core runtime/main.c runtime/arm.c runtime/loader.c runtime/rtapi.c runtime/clock.c runtime/crash.c runtime/options.c
               runtime/ini.c runtime/startup.c runtime/gdbstub.c runtime/present.c runtime/guest_jit.c
               runtime/cheats.c)
-target_link_libraries(snx_core PRIVATE snx_driver snx_lz4)
+target_link_libraries(snx_core PRIVATE snx_driver snx_lz4 snx_build_info)
 if(APPLE)
     # main.c's weak snx_module_static, which no build defines yet: ld64 refuses an undefined symbol, weak or not,
     # unless told it is resolved at run time
@@ -135,9 +135,10 @@ set_target_properties(scarletnx PROPERTIES LINKER_LANGUAGE CXX RUNTIME_OUTPUT_DI
     LIBRARY_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}")
 if(WIN32)
     # Prefer static toolchain/SDL libraries. LLVM may still use a DLL import library,
-    # resolved by cmake/llvm.cmake and bundled by CI. user32 provides message boxes;
-    # winmm is loaded at run time, and the static SDL3 brings the libraries it needs
-    target_link_libraries(scarletnx PRIVATE user32)
+    # resolved by cmake/llvm.cmake and bundled by CI. user32 provides message boxes and
+    # advapi32 the registry (the log's system line); winmm is loaded at run time, and the
+    # static SDL3 brings the libraries it needs
+    target_link_libraries(scarletnx PRIVATE user32 advapi32)
     # The application manifest (runtime/platform/runtime.manifest): UTF-8 as the process's code page, long paths
     enable_language(RC)
     target_sources(scarletnx PRIVATE runtime/platform/runtime.rc)
@@ -186,6 +187,10 @@ if(BUILD_TESTING)
     find_program(SNX_SPIRV_VAL spirv-val)
     find_program(SNX_SPIRV_DIS spirv-dis)
     find_package(Python3 QUIET COMPONENTS Interpreter)
+    if(Python3_Interpreter_FOUND) # scarletnx --mcp over stdio (runtime/driver/mcp.c)
+        add_test(NAME mcp COMMAND "${Python3_EXECUTABLE}" "${PROJECT_SOURCE_DIR}/tests/mcp_test.py"
+                 $<TARGET_FILE:scarletnx>)
+    endif()
     if(SNX_SPIRV_VAL AND SNX_SPIRV_DIS AND Python3_Interpreter_FOUND)
         add_test(NAME shader_direct COMMAND "${Python3_EXECUTABLE}" "${PROJECT_SOURCE_DIR}/tests/shader_direct_test.py"
             --generator $<TARGET_FILE:snx-test-shader-direct> --validator "${SNX_SPIRV_VAL}"

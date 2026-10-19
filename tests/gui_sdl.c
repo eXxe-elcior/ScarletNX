@@ -4650,15 +4650,39 @@ int main(int argc, char** argv) {
         text = (char*)snx_read_file(kept, &size);
         assert(text && strstr(text, "Message: before the log"));
         free(text);
-        /* any other build's (a checkout) in the working folder */
+        /* any other build's (a checkout) in the working folder, with the newest game log's summary at its top: how the
+           run ended, demangled, before the run's output and the log itself */
         free(app.data_dir);
         app.data_dir = snx_strdup(temporary);
-        snprintf(app.message, sizeof(app.message), "before the log");
-        key(&app, SDLK_RETURN);
-        assert(!strncmp(app.message, "Log saved to ", 13) && strstr(app.message, "scarletnx.log"));
-        text = (char*)snx_read_file(saved, &size);
-        assert(text && strstr(text, "Message: before the log") && strstr(text, "== the last run: "));
-        free(text);
+        {
+            char *game = snx_path_join(app.games_dir, "Some Game"), *log = snx_path_join(game, "Some Game.log");
+            /* with CRLF lines, as a game log is on Windows (plat.c writes it in text mode) */
+            static const char crashed[] =
+                "[   0.00] ScarletNX - Some Game\r\n"
+                "[   0.00] build: ScarletNX main 1234abc (clang 23.1.3, Windows x86_64)\r\n"
+                "[   2.25] \r\n*** The game called svcBreak (reason 0, info 1300100df8, 4 bytes) ***\r\n"
+                "[   2.25]    #0 163d18d8 <_ZN2nn4diag6detail10VAbortImplEv+d8>\r\n"
+                "[   2.25]    #1 1683a358 <_ZN2nn3hid18GetNpadJoyHoldTypeEv+38>\r\n"
+                "[   2.32] FATAL: The game stopped (svcBreak, reason 0). See the .log for details.\r\n";
+            assert(!snx_mkdirs(game) && !snx_write_file(log, crashed, sizeof crashed - 1));
+            snprintf(app.message, sizeof(app.message), "before the log");
+            key(&app, SDLK_RETURN);
+            assert(!strncmp(app.message, "Log saved to ", 13) && strstr(app.message, "scarletnx.log"));
+            text = (char*)snx_read_file(saved, &size);
+            assert(text && strstr(text, "Message: before the log") && strstr(text, "== the last run: "));
+            assert(strstr(text, "== summary ==\n### `Some Game`") &&
+                   strstr(text, "**Build:** `ScarletNX main 1234abc (clang 23.1.3, Windows x86_64)`") &&
+                   strstr(text, "**Signature:** `svcBreak in _ZN2nn3hid18GetNpadJoyHoldTypeEv`") &&
+                   strstr(text, "**In:** `nn::hid::GetNpadJoyHoldType()+38`"));
+            assert(strstr(text, "== summary ==") < strstr(text, "== the last run: ") &&
+                   !strstr(text, "The log's last lines"));
+            /* the log's copy, CR gone: no line ends in the '?' a CR would have become */
+            assert(strstr(text, "ScarletNX - Some Game\n") && !strstr(text, "?\n"));
+            free(text);
+            assert(!snx_remove_tree(game));
+            free(log);
+            free(game);
+        }
         free(app.data_dir);
         app.data_dir = installed_dir;
         assert(!snx_remove_tree(portable));
@@ -4817,15 +4841,15 @@ int main(int argc, char** argv) {
             app.recent_file = snx_path_join(expected, "recent.txt");
             loose = snx_path_join(app.games_dir, LONG);
             loose_data = snx_format("%s_data", loose);
-            named = snx_path_join(app.games_dir, "Tunic");
-            npdm = snx_path_join(app.games_dir, "Tunic_data/exefs/main.npdm");
+            named = snx_path_join(app.games_dir, "MyGame");
+            npdm = snx_path_join(app.games_dir, "MyGame_data/exefs/main.npdm");
             work = snx_path_join(app.data_dir, "work");
             memset(meta, 0, sizeof meta); /* an NPDM whose ACI0 at 0x80 gives the game its title ID */
             memcpy(meta, "META", 4);
             meta[0x70] = 0x80;
             meta[0x74] = 0x20;
             memcpy(meta + 0x80, "ACI0", 4);
-            for (i = 0; i < 8; ++i) meta[0x90 + i] = (unsigned char)(0x0100DA801624E000ull >> (8 * i));
+            for (i = 0; i < 8; ++i) meta[0x90 + i] = (unsigned char)(0x0100ABCD12345000ull >> (8 * i));
             line = snx_dirname(npdm);
             assert(!snx_mkdirs(work) && !snx_mkdirs(loose_data) && !snx_mkdirs(line) && !snx_write_file(loose, "", 0));
             {
@@ -4844,7 +4868,7 @@ int main(int argc, char** argv) {
             lines[2][0] = snx_strdup(loose);
             lines[2][1] = snx_format("%s/" LONG "/", app.games_dir);
             lines[3][0] = snx_strdup(named);
-            lines[3][1] = snx_format("%s/0100DA801624E000/", app.games_dir);
+            lines[3][1] = snx_format("%s/0100ABCD12345000/", app.games_dir);
             lines[4][0] = snx_path_join(app.drivers, "games"); /* a portable copy's games/ beside the program */
             lines[4][1] = snx_format("%s/.scarletnx/games", app.drivers);
             left_behind(&app);
