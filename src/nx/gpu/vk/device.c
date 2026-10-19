@@ -8,6 +8,7 @@
 #include "nx/runtime/platform/backend.h"
 #include "nx/runtime/platform/log.h"
 #include "nx/runtime/platform/plat.h"
+#include "nx/gpu/gpu.h"
 #include "nx/gpu/vk/vk.h"
 
 int g_vk_preserve_infnan;
@@ -20,7 +21,11 @@ VkState g_vk;
 static PMutex g_vklock;
 static _Thread_local int t_vkdepth;
 void vk_lock(void) {
-    if (!t_vkdepth++) pm_lock(&g_vklock);
+    if (!t_vkdepth++ && !pm_trylock(&g_vklock)) { /* held: the GPU thread says so for the stall report */
+        gpu_wait_note("vk_lock, which another thread holds", 0);
+        pm_lock(&g_vklock);
+        gpu_wait_note(NULL, 0);
+    }
 }
 void vk_unlock(void) {
     if (!--t_vkdepth) pm_unlock(&g_vklock);
