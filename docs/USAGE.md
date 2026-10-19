@@ -74,11 +74,8 @@ the game's `.ini` keeps `controls`. Any other `--key=value` of the game's
 `.ini` is forwarded as well, for that run (`scarletnx --settings` lists them all), and so are the timed-run ones
 (`--seconds=`, `--shot=`...); any other key stops the run with `unknown option`.
 The game's own executable also takes `-v`, the same as `--log=2`.
-`--backend=gcc` selects libgccjit instead of the default LLVM backend when preparing
-a dump. An explicit `--backend=llvm|gcc` forces recompilation rather than reusing a
-cached executable built by another compiler.
-It assembles and links with GNU binutils' `as` and `ld`: the AppImage and the Windows zip carry theirs, elsewhere
-they come from PATH, and without them it stops and says so.
+LLVM is the only backend. `--backend=llvm`, which older scripts give, is accepted and changes nothing, and any
+other `--backend` stops with an error.
 Use the separate commands for updates, custom keys or other compiler options.
 
 DXCI and DNSP with decrypted content need no keys. Containers are identified by their headers,
@@ -159,7 +156,7 @@ Remaining examples: POSIX.
   ([key filtering and cleanup](../src/nx/runtime/driver/extract.c)).
   Sparse and compressed NCAs, updates with large relocation tables and gamecard dumps that start with the card's key
   area all extract, through what [`storage.c`](../src/nx/runtime/driver/hactool/storage.c) ports from LibHac.
-- **Recompile:** AOT → module (LLVM, or `--backend=gcc` for libgccjit on DEC Alpha EV67 hosts) →
+- **Recompile:** AOT → module (LLVM) →
   final runtime deployment, for this machine's CPU. Shaders compile directly to SPIR-V at runtime.
   `-O 0..3,s,z` sets the optimization level.
   `--target auto|linux|win64` takes only this host's own system: modules are built for the machine that builds
@@ -168,7 +165,9 @@ Remaining examples: POSIX.
   `--keep-c` is the deprecated spelling of `--keep-ir`.
 - **Codegen:** `--no-build` stages data/INI only; `--interp-only` omits AOT functions.
   `--chunk N` sets instructions per code unit. Nothing is cached between runs.
-  `--keep-ir` saves the generated code (LLVM IR, libgccjit dumps) in `<outdir>/<NAME>/<NAME>_build/`.
+  `--keep-ir` saves the generated code (LLVM IR) in `<outdir>/<NAME>/<NAME>_build/`.
+  `--hook-direct-calls` sends calls and branches between guest functions through the dispatch table too, so
+  `SNX_NVN_TRACE` also counts calls made by direct branch. The game runs slower, so use it only for investigating.
 - **Data updates:** ExeFS refreshes; `<id>_data/romfs` is reused.
   Replace cached RomFS after asset changes; preserve `<id>_data/save/`.
 
@@ -181,6 +180,7 @@ With `--out work/Game` and `--outdir games` as above (without them, see [Folders
 | `games/<id>/<id>_data/`, `<id>.ini` | Data/saves (and `control.nacp`) + settings |
 | `games/<id>/<id>_build/` | Generated code, only with `--keep-ir` |
 | `games/<id>/shader_cache/vk_pipelines.bin` | Vulkan pipeline cache |
+| `games/<id>/shader_cache/<id>.vkshaders` | Translated shaders and the pipelines made, made again at the next start |
 
 ## GDB (UNIX only)
 
@@ -337,7 +337,7 @@ nickname and picture, and the launcher the one its Settings' `user` names, where
 
 `Game.ini`: help rewritten at startup, most settings hot-reload. `--key=value` overrides one run.
 Restart for `docked`, `fullscreen`, `language`, `resolution`, `anisotropy`, `memory_gb`, `heap_max_mb`, `airplane_mode`,
-`ldn`, `room`, `profile`.
+`ldn`, `room`, `profile`, `jit_threads`.
 `scarletnx --settings` prints each setting the launcher's Settings offer, one a line: its section, key, default,
 type, range and help, tab-separated.
 
@@ -353,6 +353,7 @@ type, range and help, tab-separated.
 | `fps_limit` | `game` | The pace the game asks for, as on the console: 60 FPS, or 30 for a game made for 30. `0` is unlimited, and `10` to `1000` is that many FPS |
 | `memory_gb` | `0` | Memory the game sees. Below `6` it is the console's 3.2 GB, `6` gives 4.8 GB and `8` gives 6.8 GB. Games that run out of memory on 3.2 GB, like Tears of the Kingdom, need `6` |
 | `heap_max_mb` | `0` | The most heap the game can allocate, in MB. `0` is as much as the memory allows |
+| `jit_threads` | `0` | Threads compiling the game code the recompiler missed, which a thread waits for when it reaches it. `0` uses every CPU the game may run on but two, at most 8. They run below the game's threads |
 | `network` | `0` | `0` reports offline and lets the game reach only loopback, which is not a network sandbox. `1` uses the computer's connection, and the resolver blocks known console service domains. Local wireless works either way (`ldn`) |
 | `airplane_mode` | `0` | `1` is the console in airplane mode: offline whatever `network` says, no local wireless, as the game hears it, and in no Eden room |
 | `ldn` | `lan` | Local wireless. `lan` is over the LAN with ldn_mitm's protocol, with another ScarletNX, a Ryujinx or a console running ldn_mitm: with `network=1` the console is the computer's address, with `0` it is `127.0.0.N`, one per ScarletNX on the machine, so two of them play together through loopback. `room` is through the Eden room `room` names, with the Edens and ScarletNXs in it. `off` is local wireless disabled, as the game hears it. Another word stops the game |
