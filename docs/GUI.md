@@ -55,7 +55,8 @@ built in, drawn at the window's size ([lunasvg](https://github.com/sammycage/lun
   keys': a click on its blinking **[ Pick or drop a file ]**, or Enter, opens the system's file
   picker (on Linux the desktop's, else zenity's). Dropping a file on the window and Ctrl+V with
   a path work too. ESC returns to the menu. On Android the picker opens at once. A dump not extracted yet takes
-  about its size for the extraction and, for a Switch game, as much again for the RomFS its folder gets; when its
+  about its size, a Switch dump's extracted straight into its game's folder (as much again only with an
+  **Extractions** folder picked, which keeps a copy, and in the temporary folder with *Extract to tmpfs*); when its
   disks have less free, the menu says how much it needs and *Run anyway* takes a second press.
 - **Load 3DS CIA** uses `scarletnx-3ds`. Its `games/` browser lists CIA inputs,
   not host executables. The driver extracts supported decrypted application CIAs.
@@ -79,7 +80,7 @@ built in, drawn at the window's size ([lunasvg](https://github.com/sammycage/lun
   did, *Installed* or *Not installed* and why, and goes back to the menu by itself after 3 seconds
   (10 after a failure, while another file can still be picked); ESC cancels without changing them.
 - **Settings** opens on its groups, Enter opening one and ESC coming back: **App**, then
-  **Launch** (the launcher's two), then a group per section of the game's `.ini` (Display,
+  **Launch** (the launcher's three), then a group per section of the game's `.ini` (Display,
   Graphics, Performance, On-screen controls, Controllers, Network, Debug), as `scarletnx --settings`
   prints them from the runtime's own tables. The game's menu's settings have its names and words
   (*Scale* 100%, *Touch screen* Fingers), and its **Buttons** page, whose **All** steps every row;
@@ -135,8 +136,14 @@ built in, drawn at the window's size ([lunasvg](https://github.com/sammycage/lun
   and `fullscreen` puts the launcher itself on the whole screen too).
   **libgccjit** passes `--backend=gcc` when preparing a dump (it stays off in a build without
   libgccjit; a game of `games/` another build made is recompiled with LLVM), **gdbstub** passes `-S` and `-s`, the
-  runtime's stub on port 1234 waiting for the debugger at startup (UNIX only). None of them
-  reaches the Linux or the 3DS driver.
+  runtime's stub on port 1234 waiting for the debugger at startup (UNIX only), and **Extract to tmpfs**
+  passes `--tmpfs`: a dump's extraction goes to `/tmp/scarletnx/work/<title ID>` (`$TMPDIR` when set, the
+  temporary folder on Windows) instead of the game's folder, and the game reads its RomFS from there, its ExeFS and
+  saves staying in its folder. Off, the default, it is extracted to disk. The room a run asks about is then the temporary
+  folder's, without the second copy. Either way the game's folder gets `<name>.source`, a link to the dump, which
+  the RomFS is extracted again from when tmpfs was emptied (a reboot), or moved by when the setting changes. A game
+  without one, made before, says *Can't be extracted to tmpfs due to missing symlink* and runs from what it has.
+  None of them reaches the Linux or the 3DS driver.
 - The Status box, after the RAM and the CPU, says what ScarletNX's folders take (games/,
   work/ and themes/ of the data folder, and on Linux its config, state and cache folders, else
   the menu's own) and what is left on that disk, counted as the menu opens and after each run.
@@ -309,11 +316,11 @@ dots and a turning ring; each step the driver and the runner report (unpack, ext
 recompile with its blocks, built, launch, GPU) typed down the page, with turning dots
 while it runs and `...OK` or `...FAILED` once it ends, the cursor blinking on the current
 one, and the other lines it printed indented under it (`[run] bar` adds a progress bar
-with the running step's percentage). A step that counts, the unpack and the extraction by
+with the running step's percentage). A step that counts, the extraction by
 what hactool has written, the recompile by its blocks, shows how far it is on its line as
 `[run] progress` says: `amount` (`1.2 / 4.0 GB`, `3 / 6`), `percent` (`30%`, YoRHa's) or
 `time`, what is left at its pace so far (`01:23 left`). With `layout = console` the
-driver's own row says it, `unpacked 1229 of 4096 MB (30%)`, written over itself each second. The menu fades out to black as a run starts and the run fades in from it; ESC
+driver's own row says it, `extracted 1229 of 4096 MB (30%)`, written over itself each second. The menu fades out to black as a run starts and the run fades in from it; ESC
 fades the run out and the menu back in.
 
 A theme is also a folder holding a `theme.ini`, the folder's name its id, in
@@ -526,7 +533,7 @@ ctest --test-dir build/gui -R '^gui_' --output-on-failure
 
 For just the GUI and Linux runtime, use `-DSNX_BUILD_NX=OFF -DSNX_BUILD_GUI=ON`: the launcher is
 then `scarletnx-gui`, a program of its own, which looks for `scarletnx` as it does for the other drivers.
-Tools-only and hactool-only builds cannot enable the GUI.
+Tools-only builds cannot enable the GUI.
 Supported host platforms are Linux, FreeBSD, Windows (llvm-mingw) and Android (`dist/android`).
 SDL3 handles window creation, keyboard/mouse input, rendering, clipboard and drag-and-drop
 on every host. The platform-specific code only handles child processes and resource
