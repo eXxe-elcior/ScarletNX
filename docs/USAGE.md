@@ -300,14 +300,15 @@ and an older game runs where it is, its run saying where its folder goes.
 The console's users are in `users/users.ini` of the data folder ([Folders](#folders)), every game's: up to 8, each a
 section in the console's order. Without the file there is one, `Player`. User 1 is always that first user, by the uid it
 has always had, so its saves stay its own; each other one needs a uid of 32 hex digits of its own (not zero) and a
-nickname of 1 to 32 bytes:
+nickname. A nickname is 4 to 20 letters, digits, spaces, `.`, `_` or `-`, the names Eden's rooms take; any other
+stops the game and says why:
 
 ```ini
 [user1]
-nickname=Ada
+nickname=Aogo
 [user2]
 uid=5f3c0d9e8a7b41c2963e0f1a2b3c4d5e
-nickname=Bee
+nickname=Xuji
 ```
 
 `uid` (user 1's, if written, is `0123456789abcdeffedcba9876543210`) and `nickname` are the keys; any
@@ -339,7 +340,7 @@ type, range and help, tab-separated.
 | `fps_limit` | `game` | The pace the game asks for, as on the console: 60 FPS, or 30 for a game made for 30. `0` is unlimited, and `10` to `1000` is that many FPS |
 | `memory_gb` | `0` | Memory the game sees. Below `6` it is the console's 3.2 GB, `6` gives 4.8 GB and `8` gives 6.8 GB. Games that run out of memory on 3.2 GB, like Tears of the Kingdom, need `6` |
 | `heap_max_mb` | `0` | The most heap the game can allocate, in MB. `0` is as much as the memory allows |
-| `network` | `0` | `0` reports offline and lets the game reach only loopback, which is not a network sandbox. `1` uses the computer's connection, and the resolver blocks known console service domains |
+| `network` | `0` | `0` reports offline and lets the game reach only loopback, which is not a network sandbox. `1` uses the computer's connection, and the resolver blocks known console service domains. Local wireless (ldn) works either way, over the LAN with ldn_mitm's protocol: with `1` the console is the computer's address, with `0` it is `127.0.0.N`, one per ScarletNX on the machine, so two of them play together through loopback |
 | `user` | `1` | The console's user the game plays as, `1` to `8`, as [Users](#users) lists them. A number with no user stops the game |
 | `touch` | `2` | The game's touch screen: `2` fingers and the mouse's left button, `1` fingers, `0` off |
 | `controls` | `1` on Android, else `0` | The [on-screen controls](#on-screen-controls) shown |
