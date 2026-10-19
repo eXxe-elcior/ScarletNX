@@ -27,6 +27,9 @@ if(NOT CMAKE_C_COMPILER_ID MATCHES "^(Apple)?Clang$" OR NOT CMAKE_CXX_COMPILER_I
                         "(${CMAKE_C_COMPILER}). Use a preset, or -DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++ "
                         "in a new build folder.")
 endif()
+# the CPU baseline (POWER8 on PowerPC64) and a Linux cross build's target and sysroot, for FFmpeg, OpenSSL and the
+# recompiler's runtime library
+include(cmake/cross.cmake)
 # the iOS and macOS apps' frontend (src/gui/apple.m and dist/apple's Swift, docs/APPLE.md), which the runtime links
 # with the menu: the languages are enabled where every target that links them is below
 if(APPLE AND (NOT DEFINED SNX_BUILD_GUI OR SNX_BUILD_GUI))
@@ -72,8 +75,11 @@ endif()
 if(NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
     set(CMAKE_BUILD_TYPE RelWithDebInfo CACHE STRING "Build type" FORCE)
 endif()
-set(CMAKE_C_FLAGS_RELWITHDEBINFO "-O2 -g")
-set(CMAKE_CXX_FLAGS_RELWITHDEBINFO "-O2 -g")
+# CI's cross builds, which no one debugs, set -O2 -g0: compiles, links and the compiler cache are smaller without
+# the symbols
+set(SNX_OPT_FLAGS "-O2 -g" CACHE STRING "Optimization and debug flags of a RelWithDebInfo build")
+set(CMAKE_C_FLAGS_RELWITHDEBINFO "${SNX_OPT_FLAGS}")
+set(CMAKE_CXX_FLAGS_RELWITHDEBINFO "${SNX_OPT_FLAGS}")
 
 set(THREADS_PREFER_PTHREAD_FLAG ON)
 find_package(Threads REQUIRED)
@@ -87,6 +93,8 @@ option(SNX_BUILD_GUI "Build the keyboard-driven SDL3 launcher" ${snx_gui_default
 if(SNX_BUILD_GUI AND (SNX_TOOLS_ONLY OR SNX_HACTOOL_ONLY))
     message(FATAL_ERROR "SNX_BUILD_GUI requires a runtime build, not a tools-only build")
 endif()
+# Before the dependencies: the tests' network fixtures link ENet and zstd, whatever the build
+include(CTest)
 # Before the sources: the C90 driver of a tools-only build links LZ4 too
 include(cmake/dependencies.cmake)
 if(SNX_HACTOOL_ONLY)
@@ -99,7 +107,6 @@ add_subdirectory(src/common)
 if(SNX_BUILD_NX)
     add_subdirectory(src/nx/runtime/driver host-tools)
 endif()
-include(CTest)
 include(cmake/build_info.cmake) # the window titles' line; the driver stamps games with its commit
 if(SNX_BUILD_3DS)
     add_subdirectory(src/3ds)
@@ -182,6 +189,10 @@ install(FILES "${OpenSSL_SOURCE_DIR}/LICENSE.txt" DESTINATION ${licenses}/OpenSS
 # lib/LICENSE is the library's BSD-2-Clause. The top-level LICENSE covers the rest of LZ4 (GPL-2.0-or-later), none
 # of which is built here
 install(FILES "${lz4_SOURCE_DIR}/lib/LICENSE" DESTINATION ${licenses}/lz4)
+if(TARGET snx_enet)
+    install(FILES "${enet_SOURCE_DIR}/LICENSE" DESTINATION ${licenses}/enet)
+    install(FILES "${zstd_SOURCE_DIR}/LICENSE" DESTINATION ${licenses}/zstd)
+endif()
 if(SNX_SDL3_FROM_SOURCE)
     install(FILES "${SDL3_SOURCE_DIR}/LICENSE.txt" DESTINATION ${licenses}/SDL3)
 endif()

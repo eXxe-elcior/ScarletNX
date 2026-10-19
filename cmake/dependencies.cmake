@@ -56,6 +56,39 @@ if(SNX_BUILD_NX OR SNX_HACTOOL_ONLY)
     snx_quiet(snx_lz4)
 endif()
 
+# ENet (MIT) and zstd (BSD-3-Clause) for ldn's rooms (src/common/network/net_room.c): an Eden room is ENet on UDP,
+# and a game's datagrams in it are zstd frames. ENet's own sources, with the POSIX calls every target but Windows
+# has; zstd's compressor and decompressor alone, in C (no assembly, so every target builds the same). The tests of
+# the network services link them in a build without the runtime too
+if(NOT SNX_HACTOOL_ONLY AND (SNX_BUILD_NX OR BUILD_TESTING))
+    CPMAddPackage(NAME enet VERSION 1.3.18
+                  URL https://github.com/lsalzman/enet/archive/refs/tags/v1.3.18.tar.gz
+                  URL_HASH SHA256=28603c895f9ed24a846478180ee72c7376b39b4bb1287b73877e5eae7d96b0dd
+                  DOWNLOAD_ONLY YES)
+    add_library(snx_enet STATIC "${enet_SOURCE_DIR}/callbacks.c" "${enet_SOURCE_DIR}/compress.c"
+                "${enet_SOURCE_DIR}/host.c" "${enet_SOURCE_DIR}/list.c" "${enet_SOURCE_DIR}/packet.c"
+                "${enet_SOURCE_DIR}/peer.c" "${enet_SOURCE_DIR}/protocol.c" "${enet_SOURCE_DIR}/unix.c"
+                "${enet_SOURCE_DIR}/win32.c")
+    target_include_directories(snx_enet PUBLIC "${enet_SOURCE_DIR}/include")
+    if(WIN32)
+        target_link_libraries(snx_enet PUBLIC ws2_32 winmm)
+    else()
+        target_compile_definitions(snx_enet PRIVATE HAS_FCNTL=1 HAS_POLL=1 HAS_GETADDRINFO=1 HAS_GETNAMEINFO=1
+                                   HAS_INET_PTON=1 HAS_INET_NTOP=1 HAS_MSGHDR_FLAGS=1 HAS_SOCKLEN_T=1)
+    endif()
+    snx_quiet(snx_enet)
+    CPMAddPackage(NAME zstd VERSION 1.5.7
+                  URL https://github.com/facebook/zstd/releases/download/v1.5.7/zstd-1.5.7.tar.gz
+                  URL_HASH SHA256=eb33e51f49a15e023950cd7825ca74a4a2b43db8354825ac24fc1b7ee09e6fa3
+                  DOWNLOAD_ONLY YES)
+    file(GLOB snx_zstd_sources "${zstd_SOURCE_DIR}/lib/common/*.c" "${zstd_SOURCE_DIR}/lib/compress/*.c"
+         "${zstd_SOURCE_DIR}/lib/decompress/*.c")
+    add_library(snx_zstd STATIC ${snx_zstd_sources})
+    target_include_directories(snx_zstd PUBLIC "${zstd_SOURCE_DIR}/lib")
+    target_compile_definitions(snx_zstd PRIVATE ZSTD_DISABLE_ASM=1 ZSTD_MULTITHREAD_SUPPORT_DEFAULT=0)
+    snx_quiet(snx_zstd)
+endif()
+
 # OpenSSL for the hashes and ciphers (the NX and 3DS loaders, ldr, csrng, hactool) and the ssl service's TLS. It builds
 # with its own Configure and make, which cmake/openssl.cmake runs
 # The archives' SHA-256 are also part of their cache keys (cmake/deps_cache.cmake)
@@ -113,13 +146,15 @@ endif()
 
 set(SNX_SDL3_FROM_SOURCE OFF)
 if((SNX_BUILD_NX AND NOT SNX_TOOLS_ONLY AND NOT SNX_HACTOOL_ONLY) OR SNX_BUILD_GUI OR SNX_BUILD_3DS)
-    # Prefer a compatible system package. CPM handles the pinned static fallback and user overrides.
+    # Prefer a compatible system package. CPM handles the pinned static fallback and user overrides. SDL_ALTIVEC only
+    # changes PowerPC builds: SDL's AltiVec blitters prefetch with dstt, which the ISA phased out and qemu's POWER10
+    # traps as illegal (the window icon's and the menu's software surfaces, which nothing here needs fast)
     CPMFindPackage(NAME SDL3 VERSION 3.4.18 FIND_PACKAGE_ARGUMENTS CONFIG
                    URL https://github.com/libsdl-org/SDL/archive/refs/tags/release-3.4.18.tar.gz
                    URL_HASH SHA256=c4b08b950bd29d83caae0ab8d884298d27046a9d30700fb42841c50992665c90
                    EXCLUDE_FROM_ALL YES SYSTEM YES
                    OPTIONS "SDL_SHARED OFF" "SDL_STATIC ON" "SDL_TEST_LIBRARY OFF" "SDL_TESTS OFF"
-                           "SDL_EXAMPLES OFF" "SDL_INSTALL OFF" "SDL_UNIX_CONSOLE_BUILD ON")
+                           "SDL_EXAMPLES OFF" "SDL_INSTALL OFF" "SDL_UNIX_CONSOLE_BUILD ON" "SDL_ALTIVEC OFF")
     if(SDL3_ADDED)
         set(SNX_SDL3_FROM_SOURCE ON)
         snx_quiet(SDL3-static)
