@@ -4,7 +4,9 @@
 #define SNX_GUI_NO_MAIN
 #include "gui/main.c"
 #include <assert.h>
-#ifndef _WIN32
+#ifdef _WIN32
+#include "win32_crash.h"
+#else
 #include <sys/statvfs.h> /* Folders on a disk mounted noexec */
 #endif
 /* the default theme's colours, as the checks below name them */
@@ -456,6 +458,7 @@ static void players_view(App* app) {
     int r;
     gui_settings_free(&app->settings);
     memset(&app->settings, 0, sizeof app->settings);
+    app->groups = 0; /* they point into the list just freed, as settings_of drops them */
     assert(!gui_settings_read(&app->settings, list));
     gui_settings_mark(&app->settings);
     app->player = 0;
@@ -585,6 +588,7 @@ static void button_map(App* app) {
     SDL_SetHint(SDL_HINT_GAMECONTROLLER_IGNORE_DEVICES_EXCEPT, "0x045e/0x02ea"); /* a real pad plugged in stays out */
     gui_settings_free(&app->settings);
     memset(&app->settings, 0, sizeof app->settings);
+    app->groups = 0; /* they point into the list just freed, as settings_of drops them */
     assert(!gui_settings_read(&app->settings, list));
     gui_settings_mark(&app->settings);
     for (int i = 0; i < app->settings.count; ++i)
@@ -851,6 +855,9 @@ static void keys_outcome(App* app, bool ok) {
     app->clock = 0;
 }
 int main(int argc, char** argv) {
+#ifdef _WIN32
+    snx_test_crash_said();
+#endif
     if (argc == 2 && !strcmp(argv[1], "--settings")) { /* as the runtime lists its settings */
         fputs("Display\tfullscreen\t0\tint\t0\t1\t1 = start in fullscreen\t\t0=0|1=1\n"
               "Graphics\tresolution\t1\tfloat\t0.25\t4\tInternal 3D resolution\t\t\n"
@@ -1341,7 +1348,8 @@ int main(int argc, char** argv) {
     assert(app.form == GUI_FORM_SETTINGS);
     key(&app, SDLK_RETURN);
     /* a group's settings on the right, a row each with its help in the tips; the group named over them */
-    assert(app.form == GUI_FORM_GROUP && app.group == 1 && app.editor.count == GUI_SETTINGS_OWN);
+    /* gdbstub, Extract to tmpfs, Extract game container, Optimization level, AOT threads and the LLVM Internals page */
+    assert(app.form == GUI_FORM_GROUP && app.group == 1 && app.editor.count == 6);
     render(&app);
     shows(&app, "Launch", normal);
     shows(&app, "Enables gdbstub", normal); /* in the tips */
@@ -1703,7 +1711,7 @@ int main(int argc, char** argv) {
         {
             GuiSettings listed = app.settings;
             app.settings = (GuiSettings){0};
-            assert(!gui_settings_read(&app.settings, "") && app.settings.count == GUI_SETTINGS_OWN);
+            assert(!gui_settings_read(&app.settings, "") && app.settings.count == app.settings.own);
             assert(!settings_unread(&app, unread, sizeof unread) && !unread[0]);
             gui_settings_free(&app.settings);
             app.settings = listed;
@@ -2149,8 +2157,12 @@ int main(int argc, char** argv) {
         assert(kept && strstr(kept, "[Display]\nfullscreen=1\n") && !strstr(kept, "controls=") &&
                !strstr(kept, "gdbstub"));
         free(kept);
+        assert(app.groups > 0);           /* the Settings' groups were made, each naming a section of the list */
         gui_settings_free(&app.settings); /* as a new start has none read */
         assert(setting_is(&app, "fullscreen", NULL) && settings_of(&app) && setting_is(&app, "fullscreen", "1"));
+        /* read anew, the list drops the groups that named the old one's sections: the screens drawn later (the theme
+           editor's width) read none of the freed names */
+        assert(app.groups == 0);
     }
     key(&app, SDLK_UP);
     key(&app, SDLK_LEFT);

@@ -108,11 +108,11 @@ static void dump_open(void) {
         return;
     }
     data[n - 5] = 0;
-    source = g_opt_source[0] ? snx_strdup(g_opt_source) : snx_format("%s.source", data);
+    source = g_settings.game_dump[0] ? snx_strdup(g_settings.game_dump) : snx_format("%s.source", data);
     folder = snx_dirname(data);
     free(data);
     if (!snx_is_file(source)) {
-        if (g_opt_source[0]) WARN("fs: the game's dump %s, source in its settings, is not there\n", source);
+        if (g_settings.game_dump[0]) WARN("fs: the game's dump %s, source in its settings, is not there\n", source);
         free(source);
         free(folder);
         return;
@@ -451,8 +451,14 @@ void romfs_init(void) {
     if (!fs_tree_lookup(&g_hle.fs.tree, NULL, "romfs.bin", &node) && !node->is_dir) {
         if (node->fd >= 0)
             g_hle.fs.rimage = node;
-        else if (!(g_hle.fs.rraw = node_open(node, "rb")))
-            fatal("Could not open indexed romfs.bin");
+        else if (!(g_hle.fs.rraw = node_open(node, "rb"))) {
+            char path[FS_TREE_PATH_MAX], why[256];
+            snx_os_error(why, sizeof why);
+            if (fs_tree_path(&g_hle.fs.tree, node, path, sizeof path)) snprintf(path, sizeof path, "romfs.bin");
+            /* the path in the log, not in the fatal: a game report's signature is the fatal's text */
+            LOG("RomFS: cannot open %s: %s\n", path, why);
+            fatal("Could not open the game's romfs.bin: %s", why);
+        }
         g_hle.fs.rtotal = node->size;
         LOG("RomFS: image (%.1f MB)\n", (double)g_hle.fs.rtotal / 1048576.0);
     } else if (!fs_tree_lookup(&g_hle.fs.tree, NULL, "romfs:/", &node) && node->is_dir) {

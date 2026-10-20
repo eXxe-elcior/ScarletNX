@@ -2462,6 +2462,7 @@ static GuiSettings* settings_of(App* app) {
     char* driver;
     char* list;
     if (app->settings.keys) return &app->settings;
+    app->groups = 0; /* made from a list read before, whose section names they point into */
     driver = find_driver(app, GUI_SWITCH);
 #ifdef SDL_PLATFORM_IOS /* no program to ask: the game's .ini keeps its settings */
     list = NULL;
@@ -3623,7 +3624,9 @@ static void device_open(App* app) {
     SDL_free(ids);
 }
 /* a player's Controller row: Enter waits for a press on a controller, which the player then takes, by its GUID ("/2"
-   after it for the second of two alike), as Eden's Input Device. ESC leaves it as it was */
+   after it for the second of two alike), as Eden's Input Device. ESC keeps the one it has */
+/* a Controller row's controller as the row shows it */
+static const char* device_shown(const GuiSetting* v) { return v->text[0] ? v->text : snx_tr("Any [default]"); }
 static void device_listen(App* app, int row) {
     if (!SDL_InitSubSystem(SDL_INIT_GAMEPAD)) {
         snprintf(app->editor.note, sizeof app->editor.note, snx_tr("Controllers cannot be read: %s"), SDL_GetError());
@@ -3633,8 +3636,8 @@ static void device_listen(App* app, int row) {
     app->device_listen = row + 1;
     device_open(app);
     snprintf(app->editor.note, sizeof app->editor.note,
-             snx_tr("Press a button on player %d's controller. ESC: as it was"),
-             player_key(app->settings.values[row].key, "device"));
+             snx_tr("Press a button on player %d's controller. ESC keeps %s"),
+             player_key(app->settings.values[row].key, "device"), device_shown(&app->settings.values[row]));
 }
 static void device_stop(App* app) {
     if (!app->device_listen) return;
@@ -3675,8 +3678,10 @@ static bool device_event(App* app, const SDL_Event* e) {
     else if (e->type == SDL_EVENT_GAMEPAD_ADDED) /* plugged in while it waits: its press counts too */
         device_open(app);
     else if (e->type == SDL_EVENT_KEY_DOWN && menu_key_of(&e->key, &key) && key == GUI_CANCEL) {
+        const GuiSetting* v = &app->settings.values[app->device_listen - 1];
         device_stop(app);
-        snprintf(app->editor.note, sizeof app->editor.note, "%s", snx_tr("As it was"));
+        snprintf(app->editor.note, sizeof app->editor.note, snx_tr("Player %d keeps %s"), player_key(v->key, "device"),
+                 device_shown(v));
     } else
         return e->type == SDL_EVENT_KEY_DOWN || e->type == SDL_EVENT_TEXT_INPUT ||
                e->type == SDL_EVENT_MOUSE_BUTTON_DOWN || e->type == SDL_EVENT_FINGER_DOWN;
@@ -3959,7 +3964,7 @@ static const char* form_note(const App* app) {
     if (app->form == GUI_FORM_PLACES)
         return app->editor.row < GUI_PLACES ? app->place_line[app->editor.row] : snx_tr("Data, games and extractions");
     if (app->form != GUI_FORM_SETTINGS && app->form != GUI_FORM_GROUP) return NULL;
-    return app->settings.count > GUI_SETTINGS_OWN ? snx_tr("For the next runs. [default]: as the game's .ini says")
+    return app->settings.count > app->settings.own ? snx_tr("For the next runs. [default]: as the game's .ini says")
                                                   : snx_tr("The runtime listed no settings");
 }
 static void form_boxes(App* app, GuiFormBoxes* f) {
@@ -4593,7 +4598,7 @@ static int settings_unread(App* app, char* out, size_t size) {
     if (size) out[0] = 0;
     if (!app->settings_file || !snx_is_file(app->settings_file)) return 0;
     s = settings_of(app);
-    return s->count > GUI_SETTINGS_OWN ? gui_settings_unread(s, app->settings_file, out, size) : 0;
+    return s->count > app->settings.own ? gui_settings_unread(s, app->settings_file, out, size) : 0;
 }
 /* the .ini files with a [Deprecated] section; with done, each written again without it */
 static int clean_inis(App* app, GuiCleaned* done) {
@@ -4805,7 +4810,7 @@ static void launch(App* app, char* absolute, bool prepared) {
     /* Switch options only, never guest argv for the CPU-only Linux driver or the 3DS one; R's recompile takes no
        option of a run. The drivers work in the menu's data folder, so they list the same games */
     if (app->recompile && app->menu.selected == GUI_SWITCH && gui_settings_tmpfs(s)) argv[n++] = gui_settings_tmpfs(s);
-    if (!direct && app->menu.selected == GUI_SWITCH && gui_settings_opt(s)) argv[n++] = gui_settings_opt(s);
+    if (!direct && app->menu.selected == GUI_SWITCH) n += gui_settings_recompile(s, argv + n);
     if (app->menu.selected == GUI_SWITCH && !app->recompile) n += gui_settings_options(s, 1, argv + n);
     /* Extract game container, which both drivers take, for a run and for R's recompile: off, nothing is extracted */
     if ((app->menu.selected == GUI_3DS || (app->menu.selected == GUI_SWITCH && app->recompile)) &&
@@ -4954,6 +4959,7 @@ static void keys_result(App* app, bool ok) {
     app->keys_done = now_ms(app) ? now_ms(app) : 1;
 }
 static void keys_write(App* app, const char* data, size_t size) {
+    char why[256];
     if (!app->keys_path) {
         snprintf(app->message, sizeof(app->message), "%s",
                  snx_tr("Cannot locate your home directory. Keys were not installed."));
@@ -4970,13 +4976,15 @@ static void keys_write(App* app, const char* data, size_t size) {
     if (ok) ok = chmod(staged, 0600) == 0;
 #endif
     if (ok) ok = !snx_replace(staged, app->keys_path);
+    if (!ok) snx_os_error(why, sizeof why); /* before the cleanup's calls set another */
     if (temporary) snx_remove_tree(temporary);
     free(staged);
     free(temporary);
     free(directory);
-    snprintf(app->message, sizeof(app->message), "%s",
-             ok ? snx_tr("prod.keys installed: games can be extracted now.")
-                : snx_tr("Cannot install prod.keys. Check file and folder permissions, then try again."));
+    if (ok)
+        snprintf(app->message, sizeof(app->message), "%s", snx_tr("prod.keys installed: games can be extracted now."));
+    else
+        snprintf(app->message, sizeof(app->message), snx_tr("Cannot install %s: %s"), app->keys_path, why);
     keys_result(app, ok);
 }
 static void install_keys(App* app, const char* source) {
@@ -5181,7 +5189,7 @@ static void games_scan(App* app, GuiGames* games, char* message, size_t size) {
     char error[sizeof app->message];
     gui_games_free(games);
     if (!gui_games_add(games, app->games_dir, kinds, error, sizeof error))
-        snprintf(message, size, "%s", snx_tr("Cannot open games/. Create it in the displayed working directory."));
+        snprintf(message, size, "%s", error);
     else
         message[0] = 0;
     for (i = 0; i < app->folder_count; ++i)

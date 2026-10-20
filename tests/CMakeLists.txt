@@ -83,6 +83,9 @@ function(snx_test_target target standard)
         target_compile_definitions(${target} PRIVATE _FILE_OFFSET_BITS=64)
     endif()
     target_link_libraries(${target} PRIVATE Threads::Threads)
+    if(TARGET snx_settings) # g_settings, its header, and the tables a test uses (cmake/settings.cmake)
+        target_link_libraries(${target} PRIVATE snx_settings_runtime snx_settings)
+    endif()
     if(SNX_TEST_SANITIZERS)
         target_compile_options(${target} PRIVATE -fsanitize=address,undefined -fno-omit-frame-pointer)
         target_link_options(${target} PRIVATE -fsanitize=address,undefined)
@@ -274,6 +277,11 @@ if(UNIX)
     add_test(NAME data_dir COMMAND snx-test-data-dir)
     add_test(NAME runtime_deploy COMMAND "${CMAKE_COMMAND}" -P "${CMAKE_CURRENT_SOURCE_DIR}/deploy.cmake")
 endif()
+# snx_os_error: the system's reason a message names, Windows' GetLastError where its calls leave errno
+add_executable(snx-test-os-error os_error.c)
+snx_test_target(snx-test-os-error 90)
+target_link_libraries(snx-test-os-error PRIVATE scarletnx-common)
+add_test(NAME os_error COMMAND snx-test-os-error)
 if(NOT SNX_BUILD_NX AND NOT SNX_BUILD_GNUABI)
     include(architecture.cmake)
     snx_sanitizer_path()
@@ -489,7 +497,7 @@ endif()
 
 # mm:u and the smaller services, hid's IHidServer and acc (misc.c, hid.c, acc.c, whose user picture snx_splash draws),
 # with the kernel objects stubbed
-if(TARGET OpenSSL::Crypto AND TARGET snx_splash)
+if(TARGET OpenSSL::Crypto AND NOT SNX_TOOLS_ONLY)
     add_executable(snx-test-misc-service misc_service.c "${PROJECT_SOURCE_DIR}/src/nx/hle/services/hid_touch.c"
         "${PROJECT_SOURCE_DIR}/src/nx/hle/services/hid_motion.c")
     snx_test_target(snx-test-misc-service 23)
@@ -922,7 +930,7 @@ if(NOT SNX_TOOLS_ONLY)
     # by their shaders' records, a cut or changed record ending the reading, another key starting over, a full file
     add_executable(snx-test-pipeline-file pipeline_file.c)
     snx_test_target(snx-test-pipeline-file 23)
-    target_link_libraries(snx-test-pipeline-file PRIVATE snx_nx_flags)
+    target_link_libraries(snx-test-pipeline-file PRIVATE snx_nx_flags scarletnx-common)
     add_test(NAME pipeline_file COMMAND snx-test-pipeline-file)
 endif()
 
@@ -1029,6 +1037,11 @@ if(UNIX AND NOT CMAKE_CROSSCOMPILING)
     endif()
 endif()
 
+# LLVM Internals: passes cut out of LLVM's pipelines (nx/runtime/driver/llvm_tuning.c), which LLVM still runs
+add_executable(snx-test-llvm-tuning llvm_tuning.c)
+snx_test_target(snx-test-llvm-tuning 11)
+target_link_libraries(snx-test-llvm-tuning PRIVATE snx_driver)
+add_test(NAME llvm_tuning COMMAND snx-test-llvm-tuning)
 add_executable(snx-test-llvm-module llvm_module.c)
 snx_test_target(snx-test-llvm-module 11)
 target_link_libraries(snx-test-llvm-module PRIVATE snx_driver snx_a64_reference ${CMAKE_DL_LIBS})
@@ -1039,10 +1052,45 @@ add_executable(snx-test-recompiler-library recompiler_library.c)
 snx_test_target(snx-test-recompiler-library 11)
 target_link_libraries(snx-test-recompiler-library PRIVATE scarletnx-recompiler)
 add_test(NAME recompiler_library COMMAND snx-test-recompiler-library)
+# The Mach-O linker on objects Clang compiles for arm64 macOS, which any host's Clang with AArch64 can: what macOS
+# would check of the dylib (link_macho.c), on hosts that can't load one
+if(TARGET OpenSSL::Crypto)
+    set(snx_macho_probe "${CMAKE_CURRENT_BINARY_DIR}/link_macho_probe.o")
+    execute_process(COMMAND "${CMAKE_C_COMPILER}" --target=arm64-apple-macos13 -ffreestanding -c
+        "${CMAKE_CURRENT_SOURCE_DIR}/link_macho_fixture.c" -DPART=2 -o "${snx_macho_probe}"
+        RESULT_VARIABLE snx_macho_result OUTPUT_QUIET ERROR_QUIET)
+    if(snx_macho_result EQUAL 0)
+        foreach(part 1 2 3 4)
+            # LLVM's modules have no common symbols, which the linker refuses: a tentative definition is not one
+            # whatever the compiler's default
+            add_custom_command(OUTPUT "${CMAKE_CURRENT_BINARY_DIR}/link_macho_${part}.o"
+                COMMAND "${CMAKE_C_COMPILER}" --target=arm64-apple-macos13 -ffreestanding -O2 -fPIC -fno-common
+                    -DPART=${part} -c "${CMAKE_CURRENT_SOURCE_DIR}/link_macho_fixture.c"
+                    -o "${CMAKE_CURRENT_BINARY_DIR}/link_macho_${part}.o"
+                DEPENDS link_macho_fixture.c VERBATIM)
+        endforeach()
+        set(snx_link_sources "${PROJECT_SOURCE_DIR}/src/common/cpu/recompiler/llvm")
+        add_executable(snx-test-link-macho link_macho.c "${snx_link_sources}/link.c" "${snx_link_sources}/link_elf.c"
+            "${snx_link_sources}/elf_object.c" "${snx_link_sources}/link_coff.c" "${snx_link_sources}/link_macho.c"
+            "${CMAKE_CURRENT_BINARY_DIR}/link_macho_1.o" "${CMAKE_CURRENT_BINARY_DIR}/link_macho_2.o"
+            "${CMAKE_CURRENT_BINARY_DIR}/link_macho_3.o" "${CMAKE_CURRENT_BINARY_DIR}/link_macho_4.o")
+        # the objects are the test's data, not part of its own link
+        set_source_files_properties("${CMAKE_CURRENT_BINARY_DIR}/link_macho_1.o"
+            "${CMAKE_CURRENT_BINARY_DIR}/link_macho_2.o" "${CMAKE_CURRENT_BINARY_DIR}/link_macho_3.o"
+            "${CMAKE_CURRENT_BINARY_DIR}/link_macho_4.o" PROPERTIES EXTERNAL_OBJECT FALSE HEADER_FILE_ONLY TRUE)
+        snx_test_target(snx-test-link-macho 11)
+        target_include_directories(snx-test-link-macho PRIVATE "${PROJECT_SOURCE_DIR}/src")
+        target_link_libraries(snx-test-link-macho PRIVATE OpenSSL::Crypto)
+        add_test(NAME link_macho COMMAND snx-test-link-macho "${CMAKE_CURRENT_BINARY_DIR}/link_macho_1.o"
+            "${CMAKE_CURRENT_BINARY_DIR}/link_macho_2.o" "${CMAKE_CURRENT_BINARY_DIR}/link_macho.dylib"
+            "${CMAKE_CURRENT_BINARY_DIR}/link_macho_3.o" "a call to the undefined weak symbol _missing"
+            "${CMAKE_CURRENT_BINARY_DIR}/link_macho_4.o" "aligned beyond a page")
+    endif()
+endif()
 if(APPLE)
-    # these build a game module and load it, which needs a Mach-O module the recompiler can't link yet
-    # (src/common/cpu/recompiler/llvm/link.c, docs/APPLE.md), and 4 KiB host pages to run it: not run there. The
-    # in-process loader's tests run: it loads ELF objects on macOS too (code_loader.c)
+    # these build a game module and load it, which no Mac has done yet: the Mach-O linker (link_macho.c) is checked
+    # on Linux only (the link_macho test and docs/APPLE.md), and these wait for a run on a Mac. The in-process
+    # loader's tests run: it loads ELF objects on macOS too (code_loader.c)
     set_tests_properties(native_recompiler llvm_module recompiler_library llvm_differential_0 llvm_differential_1
                          llvm_differential_2 PROPERTIES DISABLED TRUE)
 endif()
@@ -1157,6 +1205,7 @@ if(UNIX)
         "${PROJECT_SOURCE_DIR}/src/nx/gpu/maxwell/mme.c" "${PROJECT_SOURCE_DIR}/src/nx/gpu/maxwell/mme_hle.c"
         "${PROJECT_SOURCE_DIR}/src/nx/gpu/maxwell/dma.c")
     snx_test_target(snx-test-gpu-park 23)
+    target_link_libraries(snx-test-gpu-park PRIVATE scarletnx-common) # gpu.c says why a thread did not start
         add_test(NAME gpu_park COMMAND snx-test-gpu-park)
     set_tests_properties(gpu_park PROPERTIES TIMEOUT 30) # a deadlock in the queue would otherwise hang ctest
 endif()
@@ -1284,6 +1333,17 @@ if(SNX_BUILD_NX AND NOT SNX_TOOLS_ONLY)
                  "-DSPEC=${PROJECT_SOURCE_DIR}/src/nx/hle/svc/hos.svc"
                  "-DEXPECTED=${CMAKE_CURRENT_SOURCE_DIR}/svcgen_layout.txt"
                  -P "${CMAKE_CURRENT_SOURCE_DIR}/svcgen_layout.cmake")
+        # tools/settingsgen on headers of its own: LLVM's setters however their declarations are broken over lines,
+        # the passes of a pipeline, and an @ID this LLVM lacks
+        add_test(NAME settingsgen COMMAND "${CMAKE_COMMAND}" "-DSETTINGSGEN=$<TARGET_FILE:snx-settingsgen>"
+                 "-DWORK=${CMAKE_CURRENT_BINARY_DIR}/settingsgen-test"
+                 -P "${CMAKE_CURRENT_SOURCE_DIR}/settingsgen.cmake")
+        if(UNIX) # the opts the test runs are shell scripts
+            # cmake/llvm_opt.cmake: the pipelines of an opt of the LLVM's exact version, and what another opt gets
+            add_test(NAME llvm_opt COMMAND "${CMAKE_COMMAND}"
+                     "-DLLVM_OPT_CMAKE=${PROJECT_SOURCE_DIR}/cmake/llvm_opt.cmake"
+                     "-DWORK=${CMAKE_CURRENT_BINARY_DIR}/llvm-opt-test" -P "${CMAKE_CURRENT_SOURCE_DIR}/llvm_opt.cmake")
+        endif()
     endif()
     if(Python3_Interpreter_FOUND AND NOT CMAKE_CROSSCOMPILING)
         include("${PROJECT_SOURCE_DIR}/cmake/shaderdec.cmake")

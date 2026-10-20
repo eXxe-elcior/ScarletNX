@@ -90,10 +90,12 @@ int plat_thread(PThreadFn fn, void* arg, size_t stack) {
     s->guarantee = stack == 0 || stack >= GUARANTEE_MIN_THREAD;
     h = CreateThread(NULL, stack, thread_start, s, stack ? STACK_SIZE_PARAM_IS_A_RESERVATION : 0, NULL);
     if (!h) {
+        DWORD why = GetLastError(); /* the reason, for what the caller says */
         free(s);
+        SetLastError(why);
         return -1;
     }
-    if (g_opt_prof) plat_prof_add_thread(h); /* the profiler takes its own handle */
+    if (g_settings.profiler) plat_prof_add_thread(h); /* the profiler takes its own handle */
     CloseHandle(h);
     return 0;
 }

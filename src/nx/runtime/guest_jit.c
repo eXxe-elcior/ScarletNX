@@ -35,7 +35,10 @@ static PMutex g_jit_synthetic_lock = PMUTEX_INIT;
 
 /* on a compile thread */
 static void jit_log(const SnxJitReport* r) {
-    if (r->error)
+    if (r->dropped)
+        LOGV("jit: %llx and %lu more pcs queued again: guest memory changed while they compiled\n",
+             (unsigned long long)r->pc, (unsigned long)(r->pcs - 1));
+    else if (r->error)
         WARN_LIMIT(32, "jit: %llx and %lu more pcs could not be compiled: %s\n", (unsigned long long)r->pc,
                    (unsigned long)(r->pcs - 1), r->error);
     else
@@ -77,7 +80,7 @@ void jit_init(void) {
     /* with SNX_NVN_TRACE, wrappers sit in dispatch slots, which only calls through the table see */
     config.hook_direct_calls = nvn_trace_active();
     config.direct_svc = 1; /* g_rtapi's svcs, as the AOT module calls them */
-    config.threads = (unsigned)g_opt_jit_threads;
+    config.threads = (unsigned)g_settings.jit_threads;
     config.report = jit_log;
     snprintf(g_jit_cache, sizeof(g_jit_cache), "%s%s.jitcache", g_cachedir, g_exename);
     config.cache_path = g_jit_cache;
@@ -200,8 +203,8 @@ void jit_report(void) {
     SnxJitStats s;
     if (!g_jit) return;
     snx_jit_stats(g_jit, &s);
-    LOG("jit: %lu batches compiled %lu pcs (%lu failed, %lu still queued), %lu functions, %lu instructions, %lu KiB of "
-        "code, %.2f s compiling, %lu units loaded from %s\n",
-        s.batches, s.compiled, s.failures, s.queued, s.functions, s.instructions, (unsigned long)(s.bytes >> 10),
-        s.seconds, s.cached, g_jit_cache);
+    LOG("jit: %lu batches compiled %lu pcs (%lu failed, %lu still queued, %lu batches dropped by memory changes), %lu "
+        "functions, %lu instructions, %lu KiB of code, %.2f s compiling, %lu units loaded from %s\n",
+        s.batches, s.compiled, s.failures, s.queued, s.dropped, s.functions, s.instructions,
+        (unsigned long)(s.bytes >> 10), s.seconds, s.cached, g_jit_cache);
 }
