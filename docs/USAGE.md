@@ -65,7 +65,7 @@ given. `scarletnx -r --outdir games -- "Game.xci"` recompiles straight from a du
 place. `-rx` (`-r -x` on Windows) prepares it extracted, as `-r --extract-container` does. `-x` alone only extracts.
 
 A game made already plays the same way, named by its folder or its program: `./build/scarletnx games/<id>` (or
-`games/<id>/<id>`) runs it, recompiled first where it is when another build made it, from what its `<id>_data/`
+`games/<id>/<id>`) runs it, recompiled first where it is when a build of another ABI made it, from what its `<id>_data/`
 keeps (the ExeFS or the NRO: no dump, keys or extraction), or from the dump its `.ini` records when it was
 made without extracting it. `-r` recompiles it without playing. `--outdir` and `--out`
 name a dump's folders and are refused for it. `--game=games/<id>` runs it as it is, whichever build made it.
@@ -106,11 +106,12 @@ Run the same command again to retry after a failure or interruption:
 
 - `work/Game/` skips extraction. Automatic extraction publishes this directory only after success,
   using `work/Game.extracting/` while running. An incomplete staging directory is discarded on retry.
-- A complete `games/<id>/<id>` (`<id>.exe` on Windows), code module and `<id>.abi` stamp naming this build
-  skip recompilation. The stamp holds `SNX_ABI` and the build's commit (the window title's), so a game another
-  build made, of another version or branch, is recompiled automatically, as is one with a missing or invalid
-  stamp. Failed builds never publish a valid ABI checkpoint. Builds of a tree with uncommitted changes
-  (`-dirty`) or from outside git (`unknown`) cannot tell each other apart: there `-r` recompiles.
+- A complete `games/<id>/<id>` (`<id>.exe` on Windows), code module and `<id>.abi` stamp naming this build's
+  ABI skip recompilation. The stamp holds `SNX_ABI`: a game a build of another ABI made is recompiled
+  automatically, as is one with a missing or invalid stamp. One another build of the same ABI made keeps its code,
+  and its `games/<id>/<id>` is replaced by this build's runtime when the two differ, so a newer build's fixes reach
+  it. Failed builds never publish a valid ABI checkpoint. A change to the recompiler that keeps `SNX_ABI` isn't
+  seen: there `-r` recompiles.
 - Changing directory and running the game happen on every launch. A game failure never invalidates the build.
 
 Failures stop the workflow and print the failed stage and exit status or signal. On POSIX, stopping a
@@ -321,6 +322,9 @@ and `--out` (an extractions folder picked keeps a Switch dump's extraction there
 3DS driver as `--repo` and `--output`), and its own files stay where they are. On Android they
 are in its data folder's `config/` and `state/`, in the app's own storage, which needs no permission. `~/.local/share`, `~/.config`, `~/.local/state` and `~/.cache` are the
 defaults of `$XDG_DATA_HOME`, `$XDG_CONFIG_HOME`, `$XDG_STATE_HOME` and `$XDG_CACHE_HOME` (a relative one is ignored).
+Each time the driver makes or starts a game of the user's data folder, it names the folders of the game's settings, log
+and caches in `games/<id>/<id>.folders`, where the game reads them: started with other variables (its copy of an
+AppImage run with `--appimage-portable-config` or `--appimage-portable-home`, a shortcut), it finds them there.
 
 An older version kept a game's files side by side in `games/` (`games/Game`, `Game_code.so`, `Game_data/`,
 `Game.ini`), the menu's in the data folder's `gui/`, outside Linux the rest in the data folder itself, a portable
@@ -359,7 +363,7 @@ nickname and picture, and the launcher the one its Settings' `user` names, where
 
 `Game.ini`: help rewritten at startup, most settings hot-reload. `--key=value` overrides one run.
 Restart for `docked`, `fullscreen`, `language`, `resolution`, `anisotropy`, `memory_gb`, `heap_max_mb`, `airplane_mode`,
-`ldn`, `room`, `profile`, `jit_threads`.
+`ldn`, `room`, `profile`, `pipeline_threads`, `jit_threads`.
 `scarletnx --settings` prints each setting the launcher's Settings offer, one a line: its section, key, default,
 type, range and help, tab-separated. Every setting, the recompiler's too, is described once in
 `src/nx/runtime/settings.txt`, which the build generates the tables and `g_settings` from.
@@ -370,6 +374,8 @@ type, range and help, tab-separated. Every setting, the recompiler's too, is des
 | `docked` | `1` | `1` is TV mode, `0` handheld mode (1280x720) |
 | `fullscreen` | `0` | `1` starts fullscreen, except in timed test runs (`--seconds`, `--frames`). `-f` or `--fullscreen=0` sets it for one run. F11 or Alt+Enter switches without changing it |
 | `language` | `1` | The game's language, English (US). The `.ini` lists the others, `0` to `17`. One the runtime doesn't know is English (US) |
+| `showcase` | `0` | `1` draws player 1's buttons and sticks, as the game gets them, and the frames a second in a corner of the window, for a video. F6 turns it on and off |
+| `showcase_corner` | `br` | The corner `showcase` draws in: `tl` top left, `tr` top right, `bl` bottom left, `br` bottom right |
 | `resolution` | `1` | Internal 3D scale, `0.25` to `4`: `1` native, `2` double, `0.75` and `0.5` faster |
 | `shadows` | `1` | `0` skips shadow maps |
 | `vsync` | `1` | Images are shown only on the display's refresh, so nothing tears. `0` doesn't wait for it: the newest image is shown on the next refresh where the display can do that, else at once (which may tear). A display that can do neither waits for the refresh as `1` does |
@@ -377,6 +383,7 @@ type, range and help, tab-separated. Every setting, the recompiler's too, is des
 | `fps_limit` | `game` | The pace the game asks for, as on the console: 60 FPS, or 30 for a game made for 30. `0` is unlimited, and `10` to `1000` is that many FPS |
 | `memory_gb` | `0` | Memory the game sees. Below `6` it is the console's 3.2 GB, `6` gives 4.8 GB and `8` gives 6.8 GB. Games that run out of memory on 3.2 GB, like Tears of the Kingdom, need `6` |
 | `heap_max_mb` | `0` | The most heap the game can allocate, in MB. `0` is as much as the memory allows |
+| `pipeline_threads` | `0` | Threads that make the GPU's new pipelines while the game goes on. `0` uses a quarter of the computer's threads, two to six; `1` to `32` is that many. More make a first run's new pipelines sooner, with less CPU left for the game |
 | `jit_threads` | `0` | Threads compiling the game code the recompiler missed, which a thread waits for when it reaches it. `0` uses every CPU the game may run on but two, at most 8. They run below the game's threads |
 | `network` | `0` | `0` reports offline and lets the game reach only loopback, which is not a network sandbox. `1` uses the computer's connection, and the resolver blocks known console service domains. Local wireless works either way (`ldn`) |
 | `airplane_mode` | `0` | `1` is the console in airplane mode: offline whatever `network` says, no local wireless, as the game hears it, and in no Eden room |
@@ -446,9 +453,9 @@ after installation. Other HIDAPI controllers may need their vendor's own hidraw 
 | Q / E / 1 / 3 | L / R / ZL / ZR |
 | Enter / Backspace | Plus / Minus |
 
-F1 help; F2 the game's menu; F3 screenshot; F4 FPS limit off and on; F5 thread dump; F11/Alt+Enter fullscreen;
-Escape quit. A window shows at most one image per refresh and drops the rest unless images tear, and the game keeps
-the pace `fps_limit` sets.
+F1 help; F2 the game's menu; F3 screenshot; F4 FPS limit off and on; F5 thread dump; F6 showcase on and off;
+F11/Alt+Enter fullscreen; Escape quit. A window shows at most one image per refresh and drops the rest unless images
+tear, and the game keeps the pace `fps_limit` sets.
 
 In the game's menu the arrows, Enter and Escape move, select and go back; a gamepad's D-pad or left stick, A and
 B do the same, the on-screen controls' too, and a direction held goes on after a moment.
