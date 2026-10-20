@@ -8,6 +8,7 @@
    new channel's render enable override starts at USE_RENDER_ENABLE, as Eden's does.
    Each mark is a ClearBuffers value the stand-in renderer records; the platform's locks are pthreads */
 #include "nx/gpu/gpu.h"
+#include "nx/gpu/maxwell/engines_int.h"
 #include "nx/gpu/renderer.h"
 #include "nx/hle/services/nvdrv.h"
 #include "nx/memory/mem.h"
@@ -59,6 +60,11 @@ void compute_method(GpuChannel* ch, u32 m, u32 v, int last) {
 }
 void kepler_i2m_method(GpuChannel* ch, u32 m, u32 v) { (void)ch, (void)m, (void)v; }
 void fermi2d_method(GpuChannel* ch, u32 m, u32 v) { (void)ch, (void)m, (void)v; }
+/* the macros run natively or interpreted here: mme_jit.c's compiled forms are tested in mme_jit.c */
+int mme_jit_run(GpuChannel* ch, MmeRec* rec, u32 idx, u32 np) {
+    (void)ch, (void)rec, (void)idx, (void)np;
+    return 0;
+}
 
 static pthread_mutex_t seen_lk = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t seen_cv = PTHREAD_COND_INITIALIZER;
@@ -98,7 +104,12 @@ void syncpt_add(u32 id, u32 n) {
     gpu_kick();
 }
 void syncpt_incr(u32 id) { syncpt_add(id, 1); }
+static int dma_on_cpu(const GpuDmaOp* o) { /* the renderer's copy as its CPU reference does it */
+    dma_copy_ref(o);
+    return 1;
+}
 static const Renderer stand_in = {.name = "stand-in",
+                                  .dma_copy = dma_on_cpu,
                                   .mem_may_have_changed = new_epoch,
                                   .clear = record_clear,
                                   .draw = no_draw,

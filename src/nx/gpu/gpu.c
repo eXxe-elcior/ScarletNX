@@ -20,6 +20,7 @@
 #include <string.h>
 #include "common/utilities/common.h"
 #include "nx/gpu/gpu.h"
+#include "nx/memory/own.h"
 #include "nx/gpu/maxwell/engines_int.h"
 #include "nx/gpu/renderer.h"
 #include "nx/hle/services/nvdrv.h"
@@ -37,7 +38,8 @@ void (*g_gpu_mapping_end)(void);
 
 /* ------------------------------------------------------------ guest memory through the GPU's address space */
 /* the runs of guest memory behind [gva, gva + size), copied in or out: 1 when every page was mapped. An unmapped
-   page reads as zero and takes no write */
+   page, or one the guest freed after mapping it here (gmmu_run), reads as zero and takes no write. What the GPU holds of a run lands first (memory/own.c): the caller may hold
+   the renderer's lock, and a trap can't be answered then */
 static int copy_runs(u64 gva, u8* in, const u8* out, u64 size) {
     int all = 1;
     while (size) {
@@ -47,10 +49,14 @@ static int copy_runs(u64 gva, u8* in, const u8* out, u64 size) {
             if (n > size) n = size;
             if (in) memset(in, 0, (size_t)n);
             all = 0;
-        } else if (in)
+            goto next;
+        }
+        if (__atomic_load_n(&g_own_any, __ATOMIC_ACQUIRE)) own_acquire(cpu, n);
+        if (in)
             memcpy(in, GP(cpu), (size_t)n);
         else
             memcpy(GP(cpu), out, (size_t)n);
+    next:
         if (in)
             in += n;
         else
@@ -106,7 +112,16 @@ int gmem_write(u64 gva, const void* src, u64 size) {
     gpu_mem_written(gva, size);
     return all ? 0 : -1;
 }
+/* the host pointer of [gva, gva + size) when contiguous, what the GPU holds of it landed (memory/own.c): the caller
+   reads or writes it on the CPU, maybe with the renderer's lock held */
 u8* gmem_ptr_untracked(u64 gva, u64 size) {
+    u64 cpu = 0;
+    if (!size) size = 1;
+    if (gmmu_run(gva, size, &cpu) != size) return NULL;
+    if (__atomic_load_n(&g_own_any, __ATOMIC_ACQUIRE)) own_acquire(cpu, size);
+    return GP(cpu);
+}
+u8* gmem_host(u64 gva, u64 size) {
     u64 cpu = 0;
     if (!size) size = 1;
     return gmmu_run(gva, size, &cpu) == size ? GP(cpu) : NULL;
@@ -165,28 +180,6 @@ static u64 bl_yz(u32 y, u32 z, u32 wb, u32 h, u32 bh, u32 bd) {
 }
 u64 bl_offset(u32 x_bytes, u32 y, u32 z, u32 width_bytes, u32 height, u32 bh_log2, u32 bd_log2) {
     return bl_x(x_bytes, bh_log2, bd_log2) + bl_yz(y, z, width_bytes, height, bh_log2, bd_log2);
-}
-void deswizzle(u8* dst, u32 dst_pitch, const u8* src, u32 w_bytes, u32 h, u32 bh_log2) {
-    u32 x, y;
-    for (y = 0; y < h; y++) {
-        u64 row = bl_yz(y, 0, w_bytes, h, bh_log2, 0);
-        u8* d = dst + (u64)y * dst_pitch;
-        for (x = 0; x < w_bytes; x += 16) {
-            u32 n = w_bytes - x < 16 ? w_bytes - x : 16;
-            memcpy(d + x, src + row + bl_x(x, bh_log2, 0), n);
-        }
-    }
-}
-void swizzle(u8* dst, const u8* src, u32 src_pitch, u32 w_bytes, u32 h, u32 bh_log2) {
-    u32 x, y;
-    for (y = 0; y < h; y++) {
-        u64 row = bl_yz(y, 0, w_bytes, h, bh_log2, 0);
-        const u8* s = src + (u64)y * src_pitch;
-        for (x = 0; x < w_bytes; x += 16) {
-            u32 n = w_bytes - x < 16 ? w_bytes - x : 16;
-            memcpy(dst + row + bl_x(x, bh_log2, 0), s + x, n);
-        }
-    }
 }
 /* the guest bytes of a pixel of a color format, for render targets and 2D surfaces alike (nv50's surface formats) */
 u32 gpu_color_bpp(u32 format) {
@@ -582,6 +575,13 @@ static u32 g_qtotal;
 static u8 g_qparked[128];    /* the channel's oldest job waits (gpu_park) */
 static u8 g_scan_stale[128]; /* the channel closed: its submission scan starts again from reset */
 static u64 g_job_ids;
+/* for the stall report: whether this is the GPU thread, the channel whose job runs (its id + 1, 0 between jobs) and
+   since when, and the blocking wait it is in (gpu_wait_note) */
+static _Thread_local int t_gpu;
+static u32 g_run_chan;
+static u64 g_run_since;
+static const char* g_wait_what;
+static u64 g_wait_value, g_wait_since;
 
 /* a job's block after the item: its entries, each fetched entry's first word (in the words fetched at submission,
    or in late), then the words */
@@ -743,7 +743,10 @@ static int run_pass(i64* wake) {
             g_qparked[it->chan] = 0;
         }
         pm_unlock(&g_qlk);
+        __atomic_store_n(&g_run_since, plat_ns(), __ATOMIC_RELAXED);
+        __atomic_store_n(&g_run_chan, it->chan + 1, __ATOMIC_RELEASE);
         done = run_job(it);
+        __atomic_store_n(&g_run_chan, 0, __ATOMIC_RELEASE);
         pm_lock(&g_qlk);
         if (!done)
             g_qparked[it->chan] = 1; /* its jobs make room for others */
@@ -762,8 +765,56 @@ static int run_pass(i64* wake) {
     }
     return 0;
 }
+void gpu_wait_note(const char* what, u64 value) {
+    if (!t_gpu) return;
+    if (what) {
+        __atomic_store_n(&g_wait_value, value, __ATOMIC_RELAXED);
+        __atomic_store_n(&g_wait_since, plat_ns(), __ATOMIC_RELAXED);
+    }
+    __atomic_store_n(&g_wait_what, what, __ATOMIC_RELEASE);
+}
+/* read unlocked from the watchdog's thread: each value on its own, which is enough to say where the GPU thread is */
+void gpu_report_stall(void) {
+    u64 now = plat_ns();
+    const char* what = __atomic_load_n(&g_wait_what, __ATOMIC_ACQUIRE);
+    u32 run = __atomic_load_n(&g_run_chan, __ATOMIC_ACQUIRE), c;
+    if (!__atomic_load_n(&g_qthread, __ATOMIC_RELAXED)) {
+        WARN("gpu: nothing was submitted yet\n");
+        return;
+    }
+    if (run)
+        WARN("gpu: the GPU thread runs a job of channel %u, for %llu ms\n", run - 1,
+             (unsigned long long)((now - __atomic_load_n(&g_run_since, __ATOMIC_RELAXED)) / 1000000u));
+    else
+        WARN("gpu: the GPU thread is between jobs\n");
+    if (what)
+        WARN("gpu: it has waited %llu ms for %s (%llx)\n",
+             (unsigned long long)((now - __atomic_load_n(&g_wait_since, __ATOMIC_RELAXED)) / 1000000u), what,
+             (unsigned long long)__atomic_load_n(&g_wait_value, __ATOMIC_RELAXED));
+    for (c = 0; c < 128; c++) {
+        u32 jobs = __atomic_load_n(&g_qjobs[c], __ATOMIC_RELAXED), park;
+        const GpuChannel* ch = g_gpu.chan[c];
+        if (!jobs || !ch) continue;
+        park = __atomic_load_n(&ch->park, __ATOMIC_RELAXED);
+        if (!park || !__atomic_load_n(&g_qparked[c], __ATOMIC_RELAXED)) {
+            WARN("gpu: channel %u has %u jobs queued\n", c, jobs);
+            continue;
+        }
+        {
+            u64 addr = __atomic_load_n(&ch->park_addr, __ATOMIC_RELAXED);
+            u32 val = __atomic_load_n(&ch->park_val, __ATOMIC_RELAXED);
+            int sp = park == GPU_PARK_SYNCPOINT || park == GPU_PARK_FENCE;
+            WARN("gpu: channel %u has %u jobs queued, and waits for %s %llx to %s %u (it is %u)\n", c, jobs,
+                 park_name(park), (unsigned long long)addr,
+                 sp || __atomic_load_n(&ch->park_geq, __ATOMIC_RELAXED) ? "reach" : "be", val,
+                 sp ? syncpt_read((u32)addr) : gmem_r32(addr));
+        }
+    }
+    if (g_renderer && g_renderer->report_stall) g_renderer->report_stall();
+}
 static void gpu_thread(void* arg) {
     (void)arg;
+    t_gpu = 1;
     pm_lock(&g_qlk);
     for (;;) {
         u64 gen = g_qgen;
@@ -959,6 +1010,7 @@ void gpu_channel_close(u32 channel) {
     pm_unlock(&g_qlk);
     dma_snap_reset(channel);
     if (ch) {
+        if (ch->render_pred) g_renderer->render_predicate_drop(ch->render_pred);
         free(ch->inline_indices);
         free(ch->i2m.buf);
         free(ch);

@@ -19,6 +19,8 @@
 #include "nx/runtime/platform/log.h"
 #include "nx/runtime/platform/plat.h"
 #include "nx/gpu/vk/vk.h"
+#include "nx/memory/mem.h"
+#include "nx/memory/own.h"
 #include "nx/gpu/vk/pending_pages.h"
 #include "nx/gpu/renderer.h"
 
@@ -77,6 +79,7 @@ static int vkr_start(void) {
     if (g_vk_scale != 1.0f) LOG("vulkan: render targets at %.2fx\n", g_vk_scale);
     vk_cmd_init();
     vk_pipeline_init();
+    vk_own_init(); /* GPU engines' results stay on the GPU where guest memory can be trapped (memory/own.c) */
     g_gpu_before_write = vkr_before_write;
     g_gpu_mapping_begin = vkr_mapping_begin;
     g_gpu_mapping_end = vkr_mapping_end;
@@ -106,6 +109,9 @@ static void vkr_clear(GpuChannel* ch, u32 v) {
     vk_unlock();
 }
 static void vkr_draw(GpuChannel* ch, int indexed, u32 topology, u32 first, u32 count, u32 bv, u32 bi, u32 instances) {
+    /* a draw predicated on the GPU (gpu.h render_pred) counts too: whether it runs isn't known here without the wait
+       the predicate is there to avoid, and the counters made up from this (maxwell/engines.c counter_report) only
+       stand in for what the console counts, growing with the work given */
     g_draws++;
     vk_lock();
     vk_render_draw(ch, indexed, topology, first, count, bv, bi, instances);
@@ -155,12 +161,11 @@ static int vkr_blit(const Surf2D* s, const Surf2D* d, int dx, int dy, int dw, in
     vk_unlock();
     return r; /* 0: the front end copies through memory, with the renderer's rt_flush and rt_reload around it */
 }
-static int vkr_vic_compose(const VicJob* j) {
-    static int off = -1;
-    if (off < 0) off = getenv("SNX_NO_VIC_GPU") != NULL;
-    if (off) return 0;
-    return vk_vic_compose(j); /* 0: the caller composes in guest memory. It takes vk_lock where it needs it */
-}
+static int vkr_vic_compose(const VicJob* j) { return vk_vic_compose(j); } /* it takes vk_lock */
+static int vkr_nvdec_write(const NvdecPic* p) { return vk_nvdec_write(p); }   /* it takes vk_lock */
+static void* vkr_nvdec_hw_device(void) { return vk_nvdec_hw_device(); }
+static int vkr_dma_copy(const GpuDmaOp* o) { return vk_dma_copy(o); }         /* it takes vk_lock */
+static int vkr_blit_mem(const GpuBlit* b) { return vk_blit_mem(b); }          /* it takes vk_lock */
 static void vkr_rt_flush(u64 gva) {
     vk_lock();
     vk_gfx_image_mem_need(gva, 1);
@@ -190,7 +195,8 @@ static void vkr_before_syncwait(void) {
 static void vkr_stream_incr(u32 id) { vk_release_incr(id); }
 
 /* ------------------------------------------------------------ presenting */
-/* the frame from memory when no render target holds it (the game drew it on the CPU, or a video frame) */
+/* the frame from memory when no render target holds it (the game drew it on the CPU, or a video frame): staged as it
+   is, deswizzled and converted on the GPU (vk/blocklinear.c, vk/texconv.c) */
 static Surf* cpu_frame(u64 cpu_addr, u32 w, u32 h, u32 pitch, u32 layout, u32 bhl, u32 fmt) {
     if (g_cpu_img && (g_cpu_img->w != w || g_cpu_img->h != h)) {
         vk_defer_image(g_cpu_img->img, g_cpu_img->mem, VK_NULL_HANDLE, g_cpu_img->att);
@@ -222,17 +228,61 @@ static Surf* cpu_frame(u64 cpu_addr, u32 w, u32 h, u32 pitch, u32 layout, u32 bh
             return NULL;
         }
     }
-    VkBuffer buf;
-    u64 off;
-    u32* px = (u32*)vk_stage((u64)w * h * 4, 4, &buf, &off);
-    if (!px) return NULL;
-    vi_convert_cpu(cpu_addr, w, h, pitch, layout, bhl, fmt, px);
+    /* its bytes, staged as they are: a block linear one's whole rows of blocks, a pitch linear one's rows (and
+       16 bytes, as a conversion reads whole words and a row of 2 byte pixels may end inside one) */
+    u32 bpp = fmt == 4 || fmt == 6 || fmt == 7 ? 2 : 4, row_bytes = w * bpp;
+    u32 stride = pitch > row_bytes ? pitch : row_bytes, bl = layout == 3; /* libnx's NvLayout: 3 block linear */
+    VkBlMove m = {stride, h, bhl, 0, 0, h, 0, 1, (stride + 15) & ~15u};
+    u64 lo = 0, hi = (u64)stride * h, at, cap;
+    if (bl) vk_bl_range(&m, &lo, &hi);
+    if (cpu_addr >= AS_SIZE || hi > AS_SIZE - cpu_addr) {
+        WARN_LIMIT(5, "vi: buffer at %llx runs outside guest memory, not shown\n", (unsigned long long)cpu_addr);
+        return NULL;
+    }
+    /* a pitch linear one whose rows don't start on words is staged a row at a time into rows that do */
+    u32 in_pitch = bl ? m.lin_pitch : stride % 4 ? (row_bytes + 3) & ~3u : stride;
+    u64 staged_size = bl || in_pitch == stride ? hi : (u64)in_pitch * h;
+    VkBuffer staged;
+    u8* p = vk_stage(staged_size + 16, vk_stage_align(), &staged, &at);
+    if (!p) return NULL;
+    /* a CPU address (nvmap's), in the guest's address space: what the GPU holds of it (VIC's picture) is copied on
+       the GPU */
+    if (bl || in_pitch == stride)
+        vk_cpu_read(cpu_addr, hi, p, staged, at);
+    else
+        for (u32 y = 0; y < h; y++)
+            vk_cpu_read(cpu_addr + (u64)y * stride, row_bytes, p + (u64)y * in_pitch, staged, at + (u64)y * in_pitch);
+    memset(p + staged_size, 0, 16);
+    /* deswizzled and converted to RGBA8 on the GPU, in the scratch buffer: the linear rows, then the converted ones */
+    int conv = vk_tc_vi_converts(fmt);
+    VkTcShape tc = conv ? vk_tc_vi_shape(fmt, w) : (VkTcShape){.out_texels = in_pitch / 4};
+    u64 lin = bl ? (u64)m.lin_pitch * h : 0, out = (lin + 15) & ~15ull;
+    u64 need = out + (conv ? (u64)tc.out_texels * 4 * h : 0);
+    VkBuffer scratch = need ? vk_bl_scratch(need, &cap) : VK_NULL_HANDLE;
+    if (need && !scratch) return NULL;
     VkCommandBuffer cb = vk_cmd();
+    VkBuffer from = staged;
+    u64 from_at = at;
+    if (bl || conv) vk_bl_barrier(cb, 1);
+    if (bl) {
+        if (!vk_bl_move(cb, &m, 0, staged, at, scratch, 0)) return NULL;
+        vk_bl_barrier(cb, 0);
+        from = scratch;
+        from_at = 0;
+    }
+    if (conv) {
+        if (!vk_tc_convert_vi(cb, fmt, w, h, from, from_at, in_pitch, scratch, out)) return NULL;
+        vk_bl_barrier(cb, 0);
+        from = scratch;
+        from_at = out;
+    }
     vk_surf_use(cb, g_cpu_img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_PIPELINE_STAGE_2_COPY_BIT,
                 VK_ACCESS_2_TRANSFER_WRITE_BIT);
-    VkBufferImageCopy c = {
-        .bufferOffset = off, .imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}, .imageExtent = {w, h, 1}};
-    rec_CmdCopyBufferToImage(cb, buf, g_cpu_img->img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &c);
+    VkBufferImageCopy c = {.bufferOffset = from_at,
+                           .bufferRowLength = tc.out_texels,
+                           .imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1},
+                           .imageExtent = {w, h, 1}};
+    rec_CmdCopyBufferToImage(cb, from, g_cpu_img->img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &c);
     return g_cpu_img;
 }
 
@@ -387,16 +437,17 @@ static void show(Surf* src, u32 fw, u32 fh, u32 transform, int game) {
         memcpy(was, is, sizeof was);
         last_present_ns = now_ns;
         g_vk_present++;
-        if (g_last) g_last->last_used = g_vk_present; /* what screenshots read stays */
+        vk_mem_present();
+        if (g_last) vk_surf_touch(g_last); /* what screenshots read stays */
         vk_tex_frame();
         vk_buf_frame();
+        vk_mem_trim(0, 0);
         if (g_vk_present % 600 == 0) {
             char cs_why[256];
             u64 cs_skipped = vk_cs_skipped(cs_why, sizeof cs_why);
-            LOG("vulkan: %llu draws, %llu skipped (%llu for pipelines being made); %llu dispatches in %llu batches (%llu ms waiting), %llu skipped%s; "
+            LOG("vulkan: %llu draws, %llu skipped; %llu dispatches in %llu batches (%llu ms waiting), %llu skipped%s; "
                 "%llu finishes (%llu ms); %llu reads past queued releases; %llu descriptor sets written, %llu reused\n",
-                (unsigned long long)g_vk_drawn, (unsigned long long)g_vk_skipped,
-                (unsigned long long)vk_pipelines_skipped(), (unsigned long long)g_vk_dispatches,
+                (unsigned long long)g_vk_drawn, (unsigned long long)g_vk_skipped, (unsigned long long)g_vk_dispatches,
                 (unsigned long long)g_vk_cs_batches,
                 (unsigned long long)(__atomic_load_n(&g_vk_cs_wait_ns, __ATOMIC_RELAXED) / 1000000),
                 (unsigned long long)cs_skipped, cs_why, (unsigned long long)g_vk_finishes,
@@ -425,8 +476,10 @@ static void show(Surf* src, u32 fw, u32 fh, u32 transform, int game) {
                         (unsigned long long)early_left);
             }
             {
-                /* each memory heap's use by this process and the driver's budget for it (VK_EXT_memory_budget): past
-                   the budget the driver moves memory, and the heap the CPU maps (the BAR window) is the one to watch */
+                /* each memory heap's use and the driver's budget for it (VK_EXT_memory_budget), and our own memory in
+                   it (VMA's blocks): past the budget the driver moves memory, and the heap the CPU maps (the BAR window)
+                   is the one to watch. NVIDIA counts the whole system's use of the window as ours, and budgets what
+                   is left of it (cmd.c bar_room) */
                 VmaBudget b[VK_MAX_MEMORY_HEAPS];
                 const VkPhysicalDeviceMemoryProperties* mp;
                 char line[256];
@@ -434,15 +487,35 @@ static void show(Surf* src, u32 fw, u32 fh, u32 transform, int game) {
                 vmaGetHeapBudgets(g_vk.vma, b);
                 vmaGetMemoryProperties(g_vk.vma, &mp);
                 for (u32 q = 0; q < mp->memoryHeapCount && at < sizeof line; q++)
-                    at += (size_t)snprintf(line + at, sizeof line - at, "%s heap %u %llu of %llu MB", q ? "," : "", q,
-                                           (unsigned long long)(b[q].usage >> 20),
-                                           (unsigned long long)(b[q].budget >> 20));
+                    at += (size_t)snprintf(line + at, sizeof line - at, "%s heap %u %llu of %llu MB (%llu ours)",
+                                           q ? "," : "", q, (unsigned long long)(b[q].usage >> 20),
+                                           (unsigned long long)(b[q].budget >> 20),
+                                           (unsigned long long)(b[q].statistics.blockBytes >> 20));
                 LOG("vulkan: memory used and budgeted:%s\n", line);
+            }
+            {
+                /* what the caches hold, which vk_mem_trim keeps within the budget */
+                u32 nrt, ntex, nbuf, parked, none;
+                u64 brt, btex, bbuf, usage, budget, trimmed;
+                vk_surf_stats(VK_LRU_RT, &nrt, &brt, &parked);
+                vk_surf_stats(VK_LRU_TEX, &ntex, &btex, &none);
+                vk_buf_stats(&nbuf, &bbuf);
+                vk_mem_use(&usage, &budget);
+                trimmed = vk_mem_trimmed();
+                LOG("vulkan: caches: %u render targets (%llu MB, %u parked), %u textures (%llu MB), %u buffers (%llu "
+                    "MB); %llu of %llu MB in use as they count it, %llu MB freed for the budget so far\n",
+                    nrt, (unsigned long long)(brt >> 20), parked, ntex, (unsigned long long)(btex >> 20), nbuf,
+                    (unsigned long long)(bbuf >> 20), (unsigned long long)(usage >> 20),
+                    (unsigned long long)(budget >> 20), (unsigned long long)(trimmed >> 20));
             }
             LOG("vulkan: %llu draws sampled a target they render to in place (%llu barriers in passes, %llu passes "
                 "begun again), %llu through a copy\n",
                 (unsigned long long)g_vk_fb_draws, (unsigned long long)g_vk_fb_barriers,
                 (unsigned long long)g_vk_fb_restarts, (unsigned long long)g_vk_rt_copies);
+            /* what the GPU engines keep on the GPU (docs/GPU_OWNERSHIP.md), and what the CPU had to wait for */
+            LOG("vulkan: GPU-owned guest memory landed for the CPU %llu times, render targets written back for an "
+                "engine %llu times\n",
+                (unsigned long long)own_landings(), (unsigned long long)g_vk_rt_readbacks);
         }
     }
     /* Offscreen frames still submit and advance the frame ring. g_last remains available for readback. */
@@ -614,6 +687,18 @@ static u64 vkr_screenshot(const char* path) {
     return hash;
 }
 
+/* the stall watchdog: the releases queued and how far the submissions they wait for have got */
+static void vk_report_stall(void) {
+    u64 n, gate, cgate, gsub, gdone, csub, cdone;
+    vk_release_queued(&n, &gate, &cgate);
+    vk_submit_progress(&gsub, &gdone);
+    vk_compute_progress(&csub, &cdone);
+    WARN("vulkan: %llu releases queued (the oldest waits for graphics submission %llu and compute batch %llu), "
+         "graphics submissions done %llu of %llu, compute batches %llu of %llu, %llu bytes of commands not recorded\n",
+         (unsigned long long)n, (unsigned long long)gate, (unsigned long long)cgate, (unsigned long long)gdone,
+         (unsigned long long)gsub, (unsigned long long)cdone, (unsigned long long)csub,
+         (unsigned long long)vk_rec_behind());
+}
 const Renderer vk_renderer = {
     .name = "Vulkan",
     .start = vkr_start,
@@ -624,6 +709,10 @@ const Renderer vk_renderer = {
     .method_barrier = vkr_method_barrier,
     .blit = vkr_blit,
     .vic_compose = vkr_vic_compose,
+    .nvdec_write = vkr_nvdec_write,
+    .nvdec_hw_device = vkr_nvdec_hw_device,
+    .dma_copy = vkr_dma_copy,
+    .blit_mem = vkr_blit_mem,
     .rt_flush = vkr_rt_flush,
     .rt_reload = vkr_rt_reload,
     .dispatch = vkr_dispatch,
@@ -636,7 +725,10 @@ const Renderer vk_renderer = {
     .release_need = vk_release_need,
     .release_read = vk_release_read,
     .release_value = vk_release_value,
+    .render_predicate = vk_render_predicate,
+    .render_predicate_drop = vk_render_predicate_drop,
     .release_retire = vk_release_retire,
+    .report_stall = vk_report_stall,
     .samples_reset = vkr_samples_reset,
     .samples_enable = vkr_samples_enable,
     .samples_report = vkr_samples_report,
