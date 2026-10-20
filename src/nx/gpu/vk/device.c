@@ -8,6 +8,7 @@
 #include "nx/runtime/platform/backend.h"
 #include "nx/runtime/platform/log.h"
 #include "nx/runtime/platform/plat.h"
+#include "nx/gpu/gpu.h"
 #include "nx/gpu/vk/vk.h"
 
 int g_vk_preserve_infnan;
@@ -20,7 +21,11 @@ VkState g_vk;
 static PMutex g_vklock;
 static _Thread_local int t_vkdepth;
 void vk_lock(void) {
-    if (!t_vkdepth++) pm_lock(&g_vklock);
+    if (!t_vkdepth++ && !pm_trylock(&g_vklock)) { /* held: the GPU thread says so for the stall report */
+        gpu_wait_note("vk_lock, which another thread holds", 0);
+        pm_lock(&g_vklock);
+        gpu_wait_note(NULL, 0);
+    }
 }
 void vk_unlock(void) {
     if (!--t_vkdepth) pm_unlock(&g_vklock);
@@ -298,7 +303,7 @@ static int create_device(void) {
     const char* ext[12];
     int has_budget = 0;
     u32 next = 0;
-    int has_shader_clock = 0, has_feedback_dynamic = 0;
+    int has_shader_clock = 0, has_feedback_dynamic = 0, has_cond = 0;
     if (!g_opt_headless) ext[next++] = VK_KHR_SWAPCHAIN_EXTENSION_NAME;
     {
         u32 n = 0;
@@ -315,6 +320,7 @@ static int create_device(void) {
                 has_feedback_dynamic = 1;
             if (!strcmp(e[i].extensionName, VK_KHR_DYNAMIC_RENDERING_LOCAL_READ_EXTENSION_NAME))
                 g_vk.has_local_read = 1;
+            if (!strcmp(e[i].extensionName, VK_EXT_CONDITIONAL_RENDERING_EXTENSION_NAME)) has_cond = 1;
             /* the driver's budget for each heap, the other processes' use taken out, for VMA: without it VMA took
                80% of a heap's size as its budget, blind to what the desktop and other programs hold */
             if (!strcmp(e[i].extensionName, VK_EXT_MEMORY_BUDGET_EXTENSION_NAME)) has_budget = 1;
@@ -361,8 +367,15 @@ static int create_device(void) {
         *tail = &qlocal;
         tail = &qlocal.pNext;
     }
+    VkPhysicalDeviceConditionalRenderingFeaturesEXT qcond = {
+        .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_CONDITIONAL_RENDERING_FEATURES_EXT};
+    if (has_cond) {
+        *tail = &qcond;
+        tail = &qcond.pNext;
+    }
     if (has_shader_clock) *tail = &qclock;
     vkGetPhysicalDeviceFeatures2(g_vk.phys, &f2);
+    g_vk.has_cond_render = has_cond && qcond.conditionalRendering;
     /* the dynamic state and the barriers within a pass only serve feedback loops */
     g_vk.has_feedback = g_vk.has_feedback && qloop.attachmentFeedbackLoopLayout;
     g_vk.has_feedback_dynamic =
@@ -454,6 +467,15 @@ static int create_device(void) {
     if (g_vk.has_local_read) {
         chain = &flocal;
         ext[next++] = VK_KHR_DYNAMIC_RENDERING_LOCAL_READ_EXTENSION_NAME;
+    }
+    /* the render enable's comparison of an occlusion query's count, made on the GPU (gpu/vk/query.c) */
+    VkPhysicalDeviceConditionalRenderingFeaturesEXT fcond = {
+        .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_CONDITIONAL_RENDERING_FEATURES_EXT,
+        .pNext = chain,
+        .conditionalRendering = VK_TRUE};
+    if (g_vk.has_cond_render) {
+        chain = &fcond;
+        ext[next++] = VK_EXT_CONDITIONAL_RENDERING_EXTENSION_NAME;
     }
     VkDeviceCreateInfo dci = {.sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO,
                               .pNext = chain,

@@ -90,13 +90,16 @@ snx_component(vk gpu/vk/renderer.c gpu/vk/device.c gpu/vk/cmd.c gpu/vk/record.c 
                  gpu/vk/buffer.c gpu/vk/writeback.c gpu/vk/pipeline.c gpu/vk/pipeline_file.c gpu/vk/render.c gpu/vk/release.c gpu/vk/query.c gpu/vk/compute.c
                  gpu/vk/pending_pages.c gpu/vk/memory.c gpu/vk/renderdoc.c gpu/vk/astc.c gpu/vk/ui.c gpu/texture/etc2.c gpu/texture/depth.c gpu/vk/vic.c gpu/vk/vma.cpp
                  "${volk_SOURCE_DIR}/volk.c")
-# the ASTC decoder's and the VIC composition's SPIR-V, compiled from their GLSL at build time (cmake/glsl.cmake). The
-# VIC shader is built twice: for word aligned rows, and for the rest (gpu/video/vic_compose.glsl)
+# the ASTC decoder's, the VIC composition's and the render enable predicates' SPIR-V, compiled from their GLSL at
+# build time (cmake/glsl.cmake). The VIC shader is built twice: for word aligned rows, and for the rest
+# (gpu/video/vic_compose.glsl)
 include("${PROJECT_SOURCE_DIR}/cmake/glsl.cmake")
 snx_glsl_spirv(snx_vk SOURCE gpu/texture/astc.comp NAME astc_spv HEADER nx/gpu/texture/astc_spv.h)
 snx_glsl_spirv(snx_vk SOURCE gpu/video/vic.comp NAME vic_spv HEADER nx/gpu/video/vic_spv.h)
 snx_glsl_spirv(snx_vk SOURCE gpu/video/vic.comp NAME vic_unaligned_spv HEADER nx/gpu/video/vic_spv.h
                DEFINES VIC_UNALIGNED)
+snx_glsl_spirv(snx_vk SOURCE gpu/vk/query_predicate.comp NAME query_predicate_spv
+               HEADER nx/gpu/vk/query_predicate_spv.h)
 set(components core kernel hle video gpu platform shader vk)
 # third-party code (vma.cpp is VMA's implementation)
 set_source_files_properties("${volk_SOURCE_DIR}/volk.c" gpu/vk/vma.cpp PROPERTIES COMPILE_OPTIONS -w)

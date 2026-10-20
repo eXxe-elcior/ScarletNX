@@ -87,6 +87,9 @@ static int rec_enabled(void) {
 }
 
 void vk_rec_init(void) { rec_enabled(); }
+u64 vk_rec_behind(void) {
+    return g_rec > 0 ? __atomic_load_n(&g_head, __ATOMIC_ACQUIRE) - __atomic_load_n(&g_tail, __ATOMIC_ACQUIRE) : 0;
+}
 
 /* a command for cb goes through the ring */
 static int rec_on(VkCommandBuffer cb) { return cb == g_rec_cb && g_rec > 0; }
@@ -276,6 +279,39 @@ REC3(CmdResetQueryPool, VkQueryPool, u32, u32)
 REC3(CmdBeginQuery, VkQueryPool, u32, VkQueryControlFlags)
 REC2(CmdEndQuery, VkQueryPool, u32)
 REC7(CmdCopyQueryPoolResults, VkQueryPool, u32, u32, VkBuffer, VkDeviceSize, VkDeviceSize, VkQueryResultFlags)
+REC0(CmdEndConditionalRenderingEXT)
+
+/* conditional rendering on the word at buf + off, its begin info made from the arguments */
+typedef struct {
+    VkCommandBuffer cb;
+    VkBuffer buf;
+    VkDeviceSize off;
+    VkConditionalRenderingFlagsEXT flags;
+} CondArgs;
+static void cond_call(VkCommandBuffer cb, VkBuffer buf, VkDeviceSize off, VkConditionalRenderingFlagsEXT flags) {
+    VkConditionalRenderingBeginInfoEXT ci = {.sType = VK_STRUCTURE_TYPE_CONDITIONAL_RENDERING_BEGIN_INFO_EXT,
+                                             .buffer = buf,
+                                             .offset = off,
+                                             .flags = flags};
+    vkCmdBeginConditionalRenderingEXT(cb, &ci);
+}
+static void cond_run(const void* p) {
+    const CondArgs* x = p;
+    cond_call(x->cb, x->buf, x->off, x->flags);
+}
+void rec_CmdBeginConditionalRenderingEXT(VkCommandBuffer cb, VkBuffer buf, VkDeviceSize off,
+                                         VkConditionalRenderingFlagsEXT flags) {
+    if (!rec_on(cb)) {
+        cond_call(cb, buf, off, flags);
+        return;
+    }
+    CondArgs* x = rec_push(cond_run, sizeof *x);
+    x->cb = cb;
+    x->buf = buf;
+    x->off = off;
+    x->flags = flags;
+    rec_commit();
+}
 
 /* ------------------------------------------------------------ commands with arrays, copied after their arguments */
 /* the packet's arrays follow its arguments, each at a multiple of 16 */
@@ -667,12 +703,15 @@ void rec_CmdBeginRendering(VkCommandBuffer cb, const VkRenderingInfo* ri) {
 
 /* ------------------------------------------------------------ descriptor sets */
 /* A draw's new descriptor set is allocated and written on the recording thread too, ahead of the commands that bind
-   it: the GPU thread gets a stand-in handle at once (an odd number, which a driver's handle, a pointer or an offset
-   aligned to more, never is), and the recording thread keeps which set it stands for until the commands binding it
-   are recorded. The sets come from the recording thread's own pools for each frame slot, reset in order with the
-   commands when the slot is reused (vk_rec_frame_reset). Stand-ins count up and are reused after REC_SETS, more sets
-   than two frames ever make before vk_frame_check ends one */
+   it: the GPU thread gets a stand-in handle at once (REC_STANDIN in the top bits, which no handle has: a driver's is a
+   pointer or a small offset, and the validation layer's are counters), and the recording thread keeps which set it
+   stands for until the commands binding it are recorded. The sets come from the recording thread's own pools for
+   each frame slot, reset in order with the commands when the slot is reused (vk_rec_frame_reset). Stand-ins count up
+   and are reused after REC_SETS, more sets than two frames ever make before vk_frame_check ends one */
 #define REC_SETS        (1u << 17)
+/* not merely odd: half of the validation layer's handles are odd, and a real set taken for a stand-in went unbound,
+   its dispatch reading no descriptors until the GPU hung */
+#define REC_STANDIN     0x5EC5000000000000ull
 #define REC_SPARE_SETS  32
 #define REC_SPARE_KINDS 16
 static VkDescriptorSet g_rset[REC_SETS];
@@ -689,9 +728,9 @@ typedef struct {
 static RecPools g_rpools[VK_FRAMES];
 static u32 g_frame_sets[VK_FRAMES]; /* stand-ins handed out in each slot since its reset (the GPU thread's count) */
 
-static int rec_set_standin(VkDescriptorSet s) { return ((u64)(uintptr_t)s & 1) != 0; }
+static int rec_set_standin(VkDescriptorSet s) { return ((u64)(uintptr_t)s & ~(u64)(REC_SETS - 1)) == REC_STANDIN; }
 static VkDescriptorSet rec_set_real(VkDescriptorSet s) {
-    return rec_set_standin(s) ? g_rset[((u64)(uintptr_t)s >> 1) & (REC_SETS - 1)] : s;
+    return rec_set_standin(s) ? g_rset[(u64)(uintptr_t)s & (REC_SETS - 1)] : s;
 }
 /* count sets of layout from slot f's pools into sets: count, or 1 when a fresh pool can't hold that many, 0 when none */
 static u32 rec_alloc_n(RecPools* f, VkDescriptorSetLayout layout, VkDescriptorSet* sets, u32 count) {
@@ -818,5 +857,5 @@ VkDescriptorSet vk_rec_new_set(VkDescriptorSetLayout layout, u32 n, const VkWrit
     }
     g_frame_sets[slot]++;
     rec_commit();
-    return (VkDescriptorSet)(uintptr_t)(((u64)id << 1) | 1);
+    return (VkDescriptorSet)(uintptr_t)(REC_STANDIN | id);
 }

@@ -9,6 +9,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include "nx/runtime/platform/log.h"
+#include "nx/gpu/gpu.h"
 #include "nx/gpu/vk/vk.h"
 #include "nx/runtime/platform/plat.h"
 
@@ -42,6 +43,7 @@ typedef struct {
     /* destroyed once this frame's work is done */
     Dead* dead;
     int ndead, capdead;
+    u64 dead_bytes; /* device memory evicted cache entries among them release (vk_defer_bytes) */
     /* descriptor pools, reset when the frame is reused and kept */
     VkDescriptorPool pool_d[64];
     int npool, ipool; /* pool_d[ipool] is the one allocating; the ones after it are reset and waiting */
@@ -55,6 +57,7 @@ typedef struct {
 } Frame;
 
 static Frame g_fr[VK_FRAMES];
+static u64 g_dead_bytes; /* every frame's dead_bytes */
 static u32 g_cur;
 static u32 g_cb_begun = 1; /* command buffers begun, so a command buffer's state is told from an earlier one's */
 static u64 g_frame_id;
@@ -183,7 +186,9 @@ static void ring_reset(Ring* r, const VmaBudget* budget) {
 static void timeline_wait(u64 value) {
     VkSemaphoreWaitInfo wi = {
         .sType = VK_STRUCTURE_TYPE_SEMAPHORE_WAIT_INFO, .semaphoreCount = 1, .pSemaphores = &g_gsem, .pValues = &value};
+    gpu_wait_note("a graphics submission", value);
     VK_OK(vkWaitSemaphores(g_vk.dev, &wi, UINT64_MAX));
+    gpu_wait_note(NULL, 0);
 }
 /* the storage results of every submission up to value, which has finished, land in guest memory, in order */
 static void land_through(u64 value) {
@@ -198,6 +203,8 @@ static void frame_recycle(Frame* f) {
         f->last = 0;
     }
     dead_free(f);
+    g_dead_bytes -= f->dead_bytes;
+    f->dead_bytes = 0;
     vkResetCommandPool(g_vk.dev, f->pool, 0);
     /* the pools stay, reset: a frame's draws fill several, and making them again every frame costs */
     for (int i = 0; i < f->npool; i++) vkResetDescriptorPool(g_vk.dev, f->pool_d[i], 0);
@@ -336,7 +343,7 @@ void vk_submit(VkSemaphore wait, VkPipelineStageFlags2 wait_stage, VkSemaphore s
     /* ended and submitted after its commands, on the recording thread (a submission that fails signals the timeline
        from the host there, so waits for it end) */
     vk_rec_submit(cb, w, nw, s, signal ? 2u : 1u);
-    g_gval++;
+    __atomic_store_n(&g_gval, g_gval + 1, __ATOMIC_RELAXED); /* read by the stall report too */
     f->recording = 0;
     f->icb++;
     f->last = g_gval;
@@ -372,6 +379,11 @@ void vk_frame_check(void) {
 u64 vk_submit_number(void) { return g_gval + 1; }
 u32 vk_cb_begun(void) { return g_cb_begun; }
 u64 vk_last_submit(void) { return g_gval; }
+void vk_submit_progress(u64* submitted, u64* done) {
+    *submitted = __atomic_load_n(&g_gval, __ATOMIC_RELAXED);
+    *done = 0;
+    if (g_gsem) VK_OK(vkGetSemaphoreCounterValue(g_vk.dev, g_gsem, done));
+}
 void vk_wait_submit(u64 value) { timeline_wait(value); }
 void vk_land_through(u64 value) { land_through(value < g_gval ? value : g_gval); }
 u64 vk_frame_id(void) { return g_frame_id; }
@@ -445,6 +457,11 @@ void vk_defer_buffer(VkBuffer b, VmaAllocation a) {
     vk_cmd();
     dead_push(&g_fr[g_cur], (Dead){.buf = b, .mem = a});
 }
+void vk_defer_bytes(u64 bytes) {
+    g_fr[g_cur].dead_bytes += bytes;
+    g_dead_bytes += bytes;
+}
+u64 vk_deferred_bytes(void) { return g_dead_bytes; }
 void vk_defer_buffer_view(VkBufferView v) {
     vk_cmd();
     dead_push(&g_fr[g_cur], (Dead){.view = v});
