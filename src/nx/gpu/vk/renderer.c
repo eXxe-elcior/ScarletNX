@@ -396,6 +396,10 @@ static void show(Surf* src, u32 fw, u32 fh, u32 transform, int game) {
         vk_buf_frame();
         vk_mem_trim(0, 0);
         if (g_vk_present % 600 == 0) {
+            static u64 stats_ns;
+            if (stats_ns && now_ns > stats_ns)
+                LOG("vulkan: %.1f FPS in the last 600 presents\n", 600.0e9 / (double)(now_ns - stats_ns));
+            stats_ns = now_ns;
             LOG("vulkan: %llu draws, %llu skipped; %llu dispatches in %llu batches (%llu ms waiting), %llu skipped; "
                 "%llu finishes (%llu ms); %llu reads past queued releases; %llu descriptor sets written, %llu reused\n",
                 (unsigned long long)g_vk_drawn, (unsigned long long)g_vk_skipped, (unsigned long long)g_vk_dispatches,
