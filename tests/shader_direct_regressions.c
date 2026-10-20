@@ -22,7 +22,7 @@ static const char* storage_paths[2];
 static const char* nro_paths[4];
 static const char* dc_color_path;
 static const char* audit_paths[6];
-static const char* issue126_paths[17];
+static const char* issue126_paths[19];
 static const char* stage_paths[3];
 static const char* query_paths[2];
 static const char* opcode_paths[3];
@@ -33,7 +33,7 @@ static const char* beyond_paths[3];
 static const char* attribute_paths[6];
 static const char* pexit_path;
 static const char* passthrough_paths[6];
-static char* fixture_paths[64];
+static char* fixture_paths[96];
 static size_t fixture_count;
 
 static const char* fixture_path(const char* directory, const char* name) {
@@ -883,6 +883,16 @@ static void issue126_shader_modes(void) {
         (unguarded(0xea70070200980b0aull, 9, 0, 4) & ~(0xffull << 20)) | (1ull << 20),
         unguarded(0xeb203a0200f77614ull, 12, 0, 4),
     };
+    /* Astral Chain: a 64-bit global base swapped in halves with xor before the load, and a typeless 2D-array
+       surface store whose coordinates are (x, y, layer) */
+    const u64 global_base_xor[] = {
+        0x4c1008000d57ff06ull, /* IADD_C R6, c[0][0x354] (the high half of the base) */
+        0x4c1080000d470707ull, /* IADD_C R7, R7, c[0][0x350] (the low, tagged half) */
+        0x5c47040000670707ull, /* LOP.XOR R7, R7, R6 */
+        0x5c47040000670706ull, /* LOP.XOR R6, R7, R6 */
+        0xeed4200000070615ull, /* LDG R21, [R6] */
+    };
+    const u64 sust_2d_array[] = {0xeb28048800f70804ull}; /* SUST.P on a 2D-array surface */
     /* TXQ.B: the handle in R4, the level in R5 */
     const u64 bindless_query[] = {HANDLE_CBUF_R4, 0x5c9807800ff70005ull, 0xdf50000180470400ull};
     /* a 2D texture offset from a register the translator can't resolve: the coordinates move instead */
@@ -931,8 +941,10 @@ static void issue126_shader_modes(void) {
                  {clip_flow, 2, ST_VS, 1, 65},
                  {dynamic_2d_offset, 2, ST_FS, 0, 103},
                  {lane_after_branch, 3, ST_FS, 0, 354},
-                 {indexed_table, 7, ST_FS, 0, 95}};
-    for (int i = 0; i < 17; i++) {
+                 {indexed_table, 7, ST_FS, 0, 95},
+                 {global_base_xor, 5, ST_CS, 0, 61},
+                 {sust_2d_array, 1, ST_CS, 0, 99}};
+    for (int i = 0; i < 19; i++) {
         ShaderInfo info;
         size_t words = 0;
         g_shader_texture_arrays = i == 16; /* the device's non-uniform indexing, for the table */
@@ -961,6 +973,10 @@ static void issue126_shader_modes(void) {
                 check(info.ntex == 1 && info.tex[0].flags == (SNX_TEX_INDEXED | 4 << 4) &&
                           count_opcode(code, words, 17, 5307) == 1,
                       "an indexed handle samples an element of the texture array, 16 bytes apart");
+            if (i == 17)
+                check(count_opcode(code, words, 65, 0xffffffffu) > 0,
+                      "a global base swapped in halves stays tracked to its load");
+            if (i == 18) check(info.nimg == 1 && info.img[0].type == 4, "a 2D-array surface store is arrayed");
             save_fixture(issue126_paths[i], code, words);
         }
         free(code);
@@ -2172,7 +2188,7 @@ int main(int argc, char** argv) {
         static const char* nro_names[] = {"nro_raw", "nro_ms", "nro_ms_array", "nro_exchange"};
         for (int i = 0; i < 4; i++) nro_paths[i] = fixture_path(argv[1], nro_names[i]);
         char name[32];
-        for (int i = 0; i < 17; i++) {
+        for (int i = 0; i < 19; i++) {
             snprintf(name, sizeof name, "issue126_%d", i);
             issue126_paths[i] = fixture_path(argv[1], name);
         }
@@ -2216,7 +2232,7 @@ int main(int argc, char** argv) {
             snprintf(name, sizeof name, "audit_%d", i);
             audit_paths[i] = fixture_path(argv[1], name);
         }
-        if (fixture_count != 64) {
+        if (fixture_count != 66) {
             fprintf(stderr, "failed to allocate fixture paths\n");
             return 2;
         }

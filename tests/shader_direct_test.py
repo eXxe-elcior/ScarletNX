@@ -39,7 +39,7 @@ def main():
         nro_ms_array = Path(directory) / 'nro_ms_array.spv'
         nro_exchange = Path(directory) / 'nro_exchange.spv'
         dc_color = Path(directory) / 'dc_color.spv'
-        issue126 = tuple(Path(directory) / f'issue126_{i}.spv' for i in range(17))
+        issue126 = tuple(Path(directory) / f'issue126_{i}.spv' for i in range(19))
         stages = tuple(Path(directory) / f'stage_{i}.spv' for i in range(3))
         queries = tuple(Path(directory) / f'query_{i}.spv' for i in range(2))
         opcodes = tuple(Path(directory) / f'opcode_{i}.spv' for i in range(3))

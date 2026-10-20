@@ -1501,7 +1501,7 @@ static int supported(u64 w, int op) {
         case O_SULD:
             return (B(w, 33, 3) == 3 && (!B(w, 52, 1) || B(w, 20, 4) == 4)) ||
                    (B(w, 33, 3) == 1 && B(w, 52, 1) && B(w, 20, 4) == 4);
-        case O_SUST: return !B(w, 52, 1) && (B(w, 33, 3) == 3 || B(w, 33, 3) == 1);
+        case O_SUST: return !B(w, 52, 1) && (B(w, 33, 3) == 3 || B(w, 33, 3) == 4 || B(w, 33, 3) == 1);
         /* 32-bit atomics other than INC and DEC, which wrap at the operand. Bindless is bit 54 here. */
         case O_SUATOM:
             return (B(w, 33, 3) == 3 || B(w, 33, 3) == 1) && (B(w, 51, 3) <= 1 || B(w, 51, 3) == 6) &&
@@ -2469,7 +2469,8 @@ u32* shader_to_spirv(const u8* code, u32 max_bytes, int stage, ShaderInfo* si, s
                 }
         }
         if (op->id == O_SULD || op->id == O_SUST || op->id == O_SURED || op->id == O_SUATOM) {
-            int buffer = B(insn[i], 33, 3) == 1;
+            int surface_type = (int)B(insn[i], 33, 3);
+            int buffer = surface_type == 1;
             u32 bank, off, handle;
             int bindless;
             if (buffer && stage != ST_CS) return direct_reject(si, "buffer surface outside compute");
@@ -2483,6 +2484,7 @@ u32* shader_to_spirv(const u8* code, u32 max_bytes, int stage, ShaderInfo* si, s
                 return direct_reject(si, "untracked surface handle");
             if (a < 255) used[a] = 1;
             if (!buffer && a + 1 < 255) used[a + 1] = 1;
+            if (surface_type == 4 && a + 2 < 255) used[a + 2] = 1;
             if (bindless && handle < 255) used[handle] = 1;
             int raw = op->id == O_SULD && B(insn[i], 52, 1);
             u32 mask = raw ? 1u : B(insn[i], 20, 4), target = d;
@@ -2501,7 +2503,7 @@ u32* shader_to_spirv(const u8* code, u32 max_bytes, int stage, ShaderInfo* si, s
                16384 texels, and the dispatch's own stores and atomics wouldn't reach it */
             if (op->id != O_SULD || buffer) {
                 int r32ui = op->id != O_SUST;
-                int type = buffer ? 1 : 3;
+                int type = surface_type;
                 int slot = direct_image_slot(&image_info, off, bindless, bank, r32ui, type);
                 if (slot == image_info.nimg) {
                     if (slot >= 8) return direct_reject(si, "storage image descriptor count");
@@ -2913,6 +2915,24 @@ u32* shader_to_spirv(const u8* code, u32 max_bytes, int stage, ShaderInfo* si, s
             tag = gbuf_tag(stage, B(w, 34, 5), B(w, 20, 14) * 4);
         else if (op == O_ISCADD_R && B(w, 48, 2) != 1 && b < 255)
             tag = gtags[b];
+        /* Bitwise address work: masking keeps the buffer, and the xor pair a 64-bit base swap is made of keeps it
+           too. Two different buffers make the result ambiguous, so that drops the tag. */
+        else if (op == O_LOP_R || op == O_LOP_C || op == O_LOP_I || op == O_LOP3_R || op == O_LOP3_C ||
+                 op == O_LOP3_I || op == O_LOP32I) {
+            int rb = (op == O_LOP_R || op == O_LOP3_R) ? (int)b : 255;
+            int rc = (op == O_LOP3_R || op == O_LOP3_C || op == O_LOP3_I) ? (int)B(w, 39, 8) : 255;
+            int t = 0, mixed = 0;
+            if (a < 255 && gtags[a]) t = gtags[a];
+            if (rb < 255 && gtags[rb]) {
+                if (t && t != gtags[rb]) mixed = 1;
+                else t = gtags[rb];
+            }
+            if (rc < 255 && gtags[rc]) {
+                if (t && t != gtags[rc]) mixed = 1;
+                else t = gtags[rc];
+            }
+            tag = mixed ? 0 : t;
+        }
         if (tag == 0xb1 && op != O_MOV_C && op != O_LDC && op != O_MOV_R) tag = 0;
         if (op == O_LDG || op == O_STG || op == O_RED || op == O_ATOM || op == O_ATOM_CAS) {
             int current = a < 255 ? gtags[a] : 0, slot = 0;
@@ -3322,9 +3342,10 @@ u32* shader_to_spirv(const u8* code, u32 max_bytes, int stage, ShaderInfo* si, s
        format of the same bits */
     for (int i = 0; i < image_info.nimg; i++) {
         int integer = image_info.img[i].kind != 0, buffer = image_info.img[i].type == 1;
+        int arrayed = image_info.img[i].type == 4;
         c->image[i] =
             spv_emit_storage_image(&c->emit, integer ? c->u32_type : c->f32_type, shader_vk_set(stage),
-                                   (buffer ? SNX_VKB_IMGBUF : SNX_VKB_IMG) + (u32)i, buffer ? 5 : 1, 0,
+                                   (buffer ? SNX_VKB_IMGBUF : SNX_VKB_IMG) + (u32)i, buffer ? 5 : 1, arrayed,
                                    integer && (!buffer || image_info.img[i].kind == 1) ? 33 : 0, &c->image_type[i]);
         interfaces[count++] = c->image[i];
     }
@@ -5806,17 +5827,27 @@ u32* shader_to_spirv(const u8* code, u32 max_bytes, int stage, ShaderInfo* si, s
                     if (target < 255) target++;
                 }
         } else if (op == O_SULD || op == O_SUST || op == O_SURED || op == O_SUATOM) {
-            int buffer = B(w, 33, 3) == 1;
+            int surface_type = (int)B(w, 33, 3);
+            int buffer = surface_type == 1, arrayed = surface_type == 4;
             u32 bank = 0, off = B(w, 36, 13);
             int bindless = op == O_SUATOM ? (int)B(w, 54, 1) : !B(w, 51, 1);
             if (bindless) direct_track_image_handle(insn, n, i, B(w, 39, 8), &bank, &off, 0);
             u32 x = spv_emit_bitcast(&c->emit, i32_type, reg_read(c, a));
-            u32 coord = buffer ? x
-                               : spv_emit_vec2_construct(&c->emit, vec2_i32, x,
-                                                         spv_emit_bitcast(&c->emit, i32_type, reg_read(c, a + 1)));
+            u32 coord = x;
+            if (!buffer) {
+                u32 y = spv_emit_bitcast(&c->emit, i32_type, reg_read(c, a + 1));
+                if (arrayed) {
+                    u32 layer = spv_emit_bitcast(
+                        &c->emit, i32_type,
+                        spv_emit_bitwise_and_u32(&c->emit, c->u32_type, reg_read(c, a + 2),
+                                                 spv_emit_constant_u32(&c->emit, c->u32_type, 0xffff)));
+                    coord = spv_emit_vec3_construct(&c->emit, vec3_i32, x, y, layer);
+                } else
+                    coord = spv_emit_vec2_construct(&c->emit, vec2_i32, x, y);
+            }
             u32 mask = op == O_SULD && B(w, 52, 1) ? 1u : B(w, 20, 4), source = d;
             if (op != O_SULD || buffer) {
-                int slot = direct_image_slot(&image_info, off, bindless, bank, op != O_SUST, buffer ? 1 : 3);
+                int slot = direct_image_slot(&image_info, off, bindless, bank, op != O_SUST, surface_type);
                 int kind = image_info.img[slot].kind;
                 if (op == O_SULD) {
                     u32 texel = spv_emit_image_read(&c->emit, vec4_u32, c->image_type[slot], c->image[slot], coord);
