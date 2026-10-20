@@ -193,6 +193,7 @@ typedef struct {
     /* the Settings' groups: App, then a group per section of the settings, its first row and rows; a row each */
     int groups, group_first[GUI_GROUPS_MAX], group_rows[GUI_GROUPS_MAX];
     GuiThemeKey group_keys[GUI_GROUPS_MAX];
+    char group_name[GUI_GROUPS_MAX][64]; /* each one's key: a copy, the list it is from being freed apart */
     char group_about[GUI_GROUPS_MAX][128];
     GuiAppForm app_form;
     int language;       /* Settings > App's Language: 0 Auto (the system's), else snx_gui_languages' index + 1 */
@@ -268,7 +269,6 @@ static const char* const items[] = {SNX_TR_NOOP("Load Switch NSP/XCI/NRO"),
 #define SAY_DONE       SNX_TR_NOOP("Tap to return to menu")
 #define SAY_ABORT      SNX_TR_NOOP("Tap here to abort and return to menu")
 #define SAY_NO_GAMES   SNX_TR_NOOP("No games in games/: put a game's .nro, .xci or .nsp there.")
-#define SAY_LOG_FAILED SNX_TR_NOOP("The log could not be saved in the data folder.")
 #define SAY_EDITOR     SNX_TR_KEYS("Tap a key to change, type or pick it. Back: go back.")
 #define SAY_PICKER     SNX_TR_KEYS("Drag a bar, or tap #RRGGBB to type it. Tap outside: keep. Back: put back.")
 #define SAY_SETTINGS   SAY_EDITOR
@@ -290,7 +290,6 @@ static const char* const items[] = {SNX_TR_NOOP("Load Switch NSP/XCI/NRO"),
 #define SAY_DONE       SNX_TR_NOOP("Press [ESC] to return to menu")
 #define SAY_ABORT      SNX_TR_NOOP("Press [ESC] to abort and return to menu")
 #define SAY_NO_GAMES   SNX_TR_NOOP("No games in games/ or the folders of Settings > App.")
-#define SAY_LOG_FAILED SNX_TR_NOOP("The log could not be saved: check the folder's permissions.")
 #define SAY_EDITOR     SNX_TR_KEYS("Up/Down: key. Left/Right: change. Enter: edit. Ctrl+S: save. ESC: back.")
 #define SAY_PICKER     SNX_TR_KEYS("Up/Down: row. Left/Right: 1. PgUp/PgDn: 16. Enter: keep. ESC: put back.")
 #define SAY_SETTINGS   SNX_TR_KEYS("Up/Down: setting. Left/Right: change. Enter: type. Del: default. ESC: back.")
@@ -2456,13 +2455,22 @@ static char* capture(App* app, const char* const* argv) {
     }
     return out;
 }
+/* The Settings' list freed, with what was made from it: its groups (their rows are the list's), a group's view, and
+   a form on its rows, which would read the list freed. The only way the list goes, so nothing outlives it */
+static void settings_forget(App* app) {
+    if ((app->settings.values && app->editor.object == (char*)app->settings.values) ||
+        app->editor.keys == app->group_keys || app->editor.keys == app->view_keys)
+        gui_editor_form(&app->editor, NULL, 0, &app->app_form, NULL);
+    gui_settings_free(&app->settings);
+    app->groups = 0;
+    app->view_count = 0;
+}
 /* the Settings' rows: the runtime's list, read the first time from the program that runs Switch inputs, after the
    launcher's own */
 static GuiSettings* settings_of(App* app) {
     char* driver;
     char* list;
     if (app->settings.keys) return &app->settings;
-    app->groups = 0; /* made from a list read before, whose section names they point into */
     driver = find_driver(app, GUI_SWITCH);
 #ifdef SDL_PLATFORM_IOS /* no program to ask: the game's .ini keeps its settings */
     list = NULL;
@@ -2490,9 +2498,9 @@ static GuiSettings* settings_of(App* app) {
 }
 /* ---- the theme editor's preview: the menu or a run in the theme being edited ---- */
 #define GUI_PREVIEW_MS 8000
-static const char preview_run[] = "Extracting Cult of the Lamb.nsp\n"
+static const char preview_run[] = "Extracting A Game.nsp\n"
                                   "Extracted 3 NCAs, the program's 4 modules\n"
-                                  "Recompiling Cult of the Lamb (4 modules)\n"
+                                  "Recompiling A Game (4 modules)\n"
                                   "Functions: 48211  instructions: 2915002\n"
                                   "LLVM: 5 code units and the module descriptor\n"
                                   "  compiled block 1/6: code_000, 9874 functions (8.1 s)\n"
@@ -2524,6 +2532,8 @@ static bool preview_texture(App* app) {
     app->menu.running = run;
     app->editing = false; /* the menu's own tabs */
     app->finished = app->aborting = app->abnormal_exit = app->confirm.shown = false;
+    /* the box of users is the editor's: its pictures, made or replaced on this copy, would go with it */
+    app->users_shown = false;
     app->native = 0;
     app->entering_ms = app->leaving_ms = 0;
     app->fade_ms = run ? app->preview_since : 0; /* a run fades in from black, as after the menu */
@@ -2532,7 +2542,7 @@ static bool preview_texture(App* app) {
     if (run) {
         app->steps = app->preview_steps;
         app->console = app->preview_console;
-        app->file = (char*)"games/Cult of the Lamb.nsp";
+        app->file = (char*)"games/A Game.nsp";
         app->menu.selected = GUI_SWITCH;
     }
     SDL_SetRenderTarget(app->renderer, app->preview);
@@ -2830,7 +2840,8 @@ static void group_add(App* app, const char* name, int first, const char* about) 
     GuiThemeKey* k = &app->group_keys[g];
     memset(k, 0, sizeof *k);
     k->section = "";
-    k->key = name;
+    snprintf(app->group_name[g], sizeof app->group_name[g], "%s", name);
+    k->key = app->group_name[g];
     k->type = GUI_KEY_ACTION;
     k->about = app->group_about[g];
     snprintf(app->group_about[g], sizeof app->group_about[g], "%s", about);
@@ -2848,7 +2859,8 @@ static void settings_groups(App* app) {
         size_t n = strlen(about);
         if (strchr(s->keys[r].section, '/')) continue; /* a page's: its row in the group opens it */
         /* past the most groups the rest go in the last one: every row is still reached */
-        if (g == 0 || (strcmp(s->keys[r].section, app->group_keys[g].key) && app->groups < GUI_GROUPS_MAX)) {
+        if (g == 0 ||
+            (strcmp(s->keys[r].section, s->keys[app->group_first[g]].section) && app->groups < GUI_GROUPS_MAX)) {
             group_add(app, s->keys[r].section, r, "");
             g = app->groups - 1;
             about = app->group_about[g];
@@ -3215,7 +3227,7 @@ static int player_key(const char* key, const char* name) {
 /* group g's rows, wherever they are: its section's own, and its pages' rows (a second page's comes after the first
    page's rows) */
 static int in_group(const App* app, int g, int r) {
-    return !strcmp(app->settings.keys[r].section, app->group_keys[g].key);
+    return !strcmp(app->settings.keys[r].section, app->settings.keys[app->group_first[g]].section);
 }
 /* group g's page row of the players (the runtime's "Player" page), -1 for none */
 static int players_row(const App* app, int g) {
@@ -4314,7 +4326,10 @@ static void render(App* app) {
         render_pad(app);
     else if (app->editing) {
         draw_form(app);
-        if (app->confirm.shown) render_ask(app); /* a folder picked on the folders' screen */
+        if (app->confirm.shown)
+            render_ask(app); /* a folder picked on the folders' screen */
+        else if (app->users_shown)
+            render_users(app); /* opened from the form's head, as from the menu's */
     } else
         draw_screen(app);
     if (app->cleaned_shown) render_files(app, 1); /* over the menu, or the App's rows it was started from */
@@ -4960,9 +4975,13 @@ static void keys_result(App* app, bool ok) {
 }
 static void keys_write(App* app, const char* data, size_t size) {
     char why[256];
-    if (!app->keys_path) {
+    if (!app->keys_path) { /* home_keys_path's: the variables it reads are unset */
+#ifdef _WIN32
         snprintf(app->message, sizeof(app->message), "%s",
-                 snx_tr("Cannot locate your home directory. Keys were not installed."));
+                 snx_tr("Cannot install prod.keys: neither USERPROFILE nor HOME is set"));
+#else
+        snprintf(app->message, sizeof(app->message), "%s", snx_tr("Cannot install prod.keys: HOME is not set"));
+#endif
         keys_result(app, false);
         return;
     }
@@ -5160,8 +5179,13 @@ static void share_log(App* app) {
                       app->cleaned.count ? "Clean old settings:\n" : "", app->cleaned.text ? app->cleaned.text : "",
                       summary, app->run_log ? app->run_log : "", run, game ? game : "no game log", played);
     saved = folder ? snx_path_join(folder, "scarletnx.log") : NULL;
-    if (!saved || snx_write_file(saved, text, strlen(text)))
-        snprintf(app->message, sizeof(app->message), "%s", snx_tr(SAY_LOG_FAILED));
+    if (!saved)
+        snprintf(app->message, sizeof(app->message), "%s", snx_tr("The log could not be saved: no working folder"));
+    else if (snx_write_file(saved, text, strlen(text))) {
+        char why[256];
+        snprintf(app->message, sizeof(app->message), snx_tr("The log could not be saved to %s: %s"), saved,
+                 snx_os_error(why, sizeof why));
+    }
 #ifdef SDL_PLATFORM_ANDROID
     else if (gui_android_share(saved, app->message, sizeof(app->message)))
         snprintf(app->message, sizeof(app->message), snx_tr("Log saved to %s"), saved);
@@ -6004,10 +6028,17 @@ static bool initialize(App* app, const char* self) {
     SDL_SetEventEnabled(SDL_EVENT_DROP_FILE, true);
     SDL_SetEventEnabled(SDL_EVENT_DROP_TEXT, true);
     app->font = create_font(app->renderer);
+    if (!app->font) {
+        char why[256];
+        SDL_strlcpy(why, SDL_GetError(), sizeof why); /* SDL_SetError writes over the text it formats */
+        return SDL_SetError(snx_tr("Cannot make the menu's font: %s"), why);
+    }
     app->process = gui_process_create();
+    if (!app->process) return SDL_SetError("%s", snx_tr("Cannot start the menu: out of memory"));
     app->cwd = SDL_GetCurrentDirectory();
 #ifdef SDL_PLATFORM_ANDROID
     app->drivers = gui_android_libraries() ? snx_strdup(gui_android_libraries()) : NULL;
+    if (!app->drivers) return SDL_SetError("%s", snx_tr("Cannot find the folder of the app's libraries"));
     /* the app's own storage: no FUSE between it and the drivers, as the shared storage has */
     if (gui_android_own_folder()) {
         SDL_free(app->cwd);
@@ -6022,6 +6053,11 @@ static bool initialize(App* app, const char* self) {
     }
 #else
     app->drivers = self ? snx_dirname(self) : SDL_GetBasePath() ? snx_strdup(SDL_GetBasePath()) : NULL;
+    if (!app->drivers) { /* SDL_GetBasePath's failure */
+        char why[256];
+        SDL_strlcpy(why, SDL_GetError(), sizeof why);
+        return SDL_SetError(snx_tr("Cannot find the folder ScarletNX runs from: %s"), why);
+    }
     app->data_dir = snx_data_dir(app->drivers);
     if (!app->data_dir) app->data_dir = snx_strdup(app->cwd ? app->cwd : ".");
     app->checkout = snx_checkout(GUI_CHECKOUT, GUI_BUILD, app->drivers);
@@ -6029,12 +6065,8 @@ static bool initialize(App* app, const char* self) {
     app->home_dir = snx_strdup(app->data_dir);
     app->place_row = -1;
     places_apply(app); /* games/, themes/, work/ and the keys, by the data folder */
-    if (app->drivers) app->themes_dirs[1] = shipped_themes(app->drivers);
+    app->themes_dirs[1] = shipped_themes(app->drivers);
     gui_console_init(&app->console, 78, 17);
-    if (!app->font || !app->process || !app->drivers) {
-        SDL_SetError("%s", snx_tr("Cannot initialize GUI resources"));
-        return false;
-    }
 #ifdef SDL_PLATFORM_ANDROID
     SDL_AddEventWatch(lifecycle, app);
 #endif
@@ -6049,7 +6081,7 @@ static void cleanup(App* app) {
     gui_process_destroy(app->process);
     space_stop(app);
     space_end(&app->left_space, &app->left_counter);
-    gui_settings_free(&app->settings);
+    settings_forget(app);
     free(app->settings_file);
     for (int i = 0; i < app->folder_count; ++i) free(app->folders[i]);
     free(app->folder_asked);

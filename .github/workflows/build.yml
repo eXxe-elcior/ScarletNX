@@ -169,6 +169,74 @@ jobs:
           name: ScarletNX-linux-${{ matrix.arch }}-${{ steps.commit.outputs.short }}-install
           path: stage
 
+  # x86-64 with ASan and UBSan (SNX_TEST_SANITIZERS): every test, and the programs and libraries of ours it runs or
+  # links, built with them (runtime_architecture names any left out), so our code reading memory after it was freed or
+  # past its end fails on every run, not only where it happens to crash. A report stops the program that made it, a
+  # code generator of the build or a test, and fails the job, printed whole. Its own compiler cache; the linux job's
+  # CPM sources and FFmpeg and OpenSSL builds, which the sanitizers leave as they are, are read and never saved here
+  linux-sanitizers:
+    name: Linux (x86_64, ASan + UBSan)
+    runs-on: ubuntu-26.04
+    timeout-minutes: 60
+    container: archlinux:latest
+    env:
+      ASAN_OPTIONS: halt_on_error=1
+      UBSAN_OPTIONS: halt_on_error=1:print_stacktrace=1
+      # a block only a stale stack slot or register still points at is a leak, on every machine alike: with them
+      # read, what a leak check finds depends on what the stack happened to hold at exit
+      LSAN_OPTIONS: use_stacks=0:use_registers=0
+    steps:
+      - name: Install tools
+        run: |
+          for try in 1 2 3; do
+            pacman -Syu --noconfirm --needed cmake ninja make patch nasm perl python git clang llvm pkgconf sdl3 libxtst libxrandr libxss vulkan-swrast ccache gdb jq glslang && break
+            [ "$try" = 3 ] && exit 1
+            sleep 5
+          done
+      - uses: actions/checkout@v7
+      - uses: actions/cache/restore@v5
+        with:
+          path: .cache/cpm
+          key: cpm-linux-x86_64-${{ hashFiles('cmake/dependencies.cmake') }}
+      - uses: actions/cache/restore@v5
+        with:
+          path: .cache/deps
+          key: deps-linux-x86_64-${{ github.run_id }}
+          restore-keys: deps-linux-x86_64-
+      - uses: actions/cache/restore@v5
+        with:
+          path: .cache/ccache
+          key: ccache-${{ github.job }}-${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: ccache-${{ github.job }}-
+      - name: Set up the caches
+        shell: bash
+        run: |
+          ws=${GITHUB_WORKSPACE//\\//}
+          {
+            echo "CCACHE_DIR=$ws/.cache/ccache"
+            echo "CCACHE_BASEDIR=$ws"
+            echo "CCACHE_NOHASHDIR=true"
+            echo "SNX_DEPS_CACHE=$ws/.cache/deps"
+            echo "SNX_CCACHE_START=$(date +%s)"
+          } >> "$GITHUB_ENV"
+      - name: Build with the sanitizers
+        run: |
+          cmake --preset default -B build/sanitizers -DSNX_TEST_SANITIZERS=ON -DSNX_DEPLOY=OFF \
+            -DCMAKE_C_COMPILER_LAUNCHER=ccache -DCMAKE_CXX_COMPILER_LAUNCHER=ccache
+          cmake --build build/sanitizers --parallel "$(getconf _NPROCESSORS_ONLN)"
+      - name: Trim the compiler cache
+        run: |
+          ccache --show-stats --verbose
+          ccache --evict-older-than "$(( $(date +%s) - SNX_CCACHE_START ))s"
+          ccache --zero-stats
+          du -sh "$CCACHE_DIR"
+      - uses: actions/cache/save@v5
+        with:
+          path: .cache/ccache
+          key: ccache-${{ github.job }}-${{ github.run_id }}-${{ github.run_attempt }}
+      - name: Test under the sanitizers
+        run: ctest --test-dir build/sanitizers --output-on-failure --parallel 4
+
   # # ppc64le, cross-built on an x86-64 runner and tested under qemu-user: nothing is compiled under the emulator, which
   # # is 10 to 20 times slower. Debian, not Arch: it has a ppc64el archive, which the sysroot (scripts/ppc64-sysroot.sh)
   # # comes from, cached a week at a time. One build, without debug symbols (SNX_OPT_FLAGS), through ccache, with
@@ -388,9 +456,9 @@ jobs:
   # (cmake/cross.cmake) against an Arch system root of the architecture, then packaged as the appimage job packages its
   # own (scripts/make-appimage.sh with SYSROOT). The system root is pkgforge's Arch image of the architecture, unpacked
   # with the runner's Docker (its files only: it never runs), so the job runs on the runner and enters pkgforge's x86-64
-  # container with docker exec, the workspace mounted at /src. ppc64le only: riscv64 and loongarch64 need the recompiler
-  # first (its linker and STXP's 16-byte compare-and-swap, #407). No POWER machine has run the AppImage yet, so like the
-  # macOS and iOS jobs it may fail without failing the run (scripts/publish-builds.py, OPTIONAL)
+  # container with docker exec, the workspace mounted at /src. platform is Docker's name of the architecture (loong64
+  # for LoongArch). No POWER, RISC-V or LoongArch machine has run the AppImages yet, so like the macOS and iOS jobs they
+  # may fail without failing the run (scripts/publish-builds.py, OPTIONAL)
   appimage-cross:
     name: Linux AppImage (${{ matrix.arch }})
     runs-on: ubuntu-26.04
@@ -403,6 +471,12 @@ jobs:
           - arch: ppc64le
             platform: ppc64le
             preset: linux-ppc64le-cross
+          - arch: riscv64
+            platform: riscv64
+            preset: linux-riscv64-cross
+          - arch: loongarch64
+            platform: loong64
+            preset: linux-loongarch64-cross
     steps:
       # Artifacts carry the commit they came from: the branch's head in a pull request, else the commit pushed
       - name: Name the commit
@@ -465,7 +539,7 @@ jobs:
           SUMS
           EOF
       # The build machine's: Clang and LLD build for the target (cmake/cross.cmake), glslang the shaders, qemu-user runs
-      # the target's llvm-config (scripts/ppc64-llvm-config.sh) and its loader behind the packaging's ldd, wayland's
+      # the target's llvm-config (scripts/cross-llvm-config.sh) and its loader behind the packaging's ldd, wayland's
       # wayland-scanner the protocols SDL3 builds (appimagetool brings its own compressor, as in the appimage job). The
       # target's: the libraries the runtime links and bundles, gcc for the crt files, libgcc and libstdc++ Clang links
       # the target's programs with, and what the pinned SDL3's build needs, as Arch POWER's SDL3 is older than the pin
@@ -1089,9 +1163,16 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        include:
+        include: # platform as Docker names it, qemu as qemu-user and binfmt_misc do
           - arch: ppc64le
             platform: ppc64le
+            qemu: ppc64le
+          - arch: riscv64
+            platform: riscv64
+            qemu: riscv64
+          - arch: loongarch64
+            platform: loong64
+            qemu: loongarch64
     steps:
       - name: Name the commit
         id: commit
@@ -1126,14 +1207,14 @@ jobs:
             case $i in 7|8|9|10|11|12|13|14|15) byte=00 m=00 ;; 16) m=fe ;; *) m=ff ;; esac
             magic=$magic\\x$byte mask=$mask\\x$m i=$((i + 1))
           done
-          printf ':appimage-%s:M::%s:%s:%s:POCF\n' ${{ matrix.platform }} "$magic" "$mask" "$(command -v qemu-${{ matrix.platform }})" |
+          printf ':appimage-%s:M::%s:%s:%s:POCF\n' ${{ matrix.qemu }} "$magic" "$mask" "$(command -v qemu-${{ matrix.qemu }})" |
             sudo tee /proc/sys/fs/binfmt_misc/register
-          grep -qx enabled /proc/sys/fs/binfmt_misc/appimage-${{ matrix.platform }}
-          head -n 3 /proc/sys/fs/binfmt_misc/qemu-${{ matrix.platform }} /proc/sys/fs/binfmt_misc/appimage-${{ matrix.platform }}
+          grep -qx enabled /proc/sys/fs/binfmt_misc/appimage-${{ matrix.qemu }}
+          head -n 3 /proc/sys/fs/binfmt_misc/qemu-${{ matrix.qemu }} /proc/sys/fs/binfmt_misc/appimage-${{ matrix.qemu }}
       - name: Run the AppImage as a user would
         run: |
-          grep -qx enabled /proc/sys/fs/binfmt_misc/qemu-${{ matrix.platform }} ||
-            { echo "no binfmt handler runs ${{ matrix.platform }} programs here" >&2; exit 1; }
+          grep -qx enabled /proc/sys/fs/binfmt_misc/qemu-${{ matrix.qemu }} ||
+            { echo "no binfmt handler runs ${{ matrix.qemu }} programs here" >&2; exit 1; }
           chmod +x dist/*.AppImage
           scripts/check-package.sh dist/*.AppImage
 

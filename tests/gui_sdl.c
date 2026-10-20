@@ -352,6 +352,23 @@ static void app_select(App* app, int row) {
     key(app, SDLK_RETURN);
     if (app->editing && app->form == GUI_FORM_APP) leave_editor(app);
 }
+/* the theme editor's preview as last drawn, its pixels */
+static SDL_Surface* preview_pixels(App* app) {
+    SDL_Surface* read;
+    assert(app->preview && SDL_SetRenderTarget(app->renderer, app->preview));
+    read = SDL_RenderReadPixels(app->renderer, NULL);
+    assert(SDL_SetRenderTarget(app->renderer, NULL) && read);
+    return read;
+}
+static bool same_pixels(const SDL_Surface* a, const SDL_Surface* b) {
+    int y;
+    if (a->w != b->w || a->h != b->h || a->format != b->format) return false;
+    for (y = 0; y < a->h; ++y)
+        if (memcmp((const Uint8*)a->pixels + y * a->pitch, (const Uint8*)b->pixels + y * b->pitch,
+                   (size_t)a->w * SDL_BYTESPERPIXEL(a->format)))
+            return false;
+    return true;
+}
 /* the launcher's gdbstub on or off */
 static void launcher(App* app, bool on) {
     assert(gui_settings_set(&app->settings, "gdbstub", on ? "on" : "off"));
@@ -456,9 +473,7 @@ static void players_view(App* app) {
         "Controllers/Player\tgamepad_p2_swap_ab\t-1\tint\t-1\t1\t\tSwap A/B\t-1=As All|0=Off|1=On\n"
         "Controllers/Player\tgamepad_p2_map\t\ttext\t\t\t\tButton map\t\n";
     int r;
-    gui_settings_free(&app->settings);
-    memset(&app->settings, 0, sizeof app->settings);
-    app->groups = 0; /* they point into the list just freed, as settings_of drops them */
+    settings_forget(app);
     assert(!gui_settings_read(&app->settings, list));
     gui_settings_mark(&app->settings);
     app->player = 0;
@@ -563,6 +578,14 @@ static void players_view(App* app) {
     assert(!gui_settings_value(&app->settings, "gamepad_p1_swap_ab"));
     /* every row the view shows is a row of the settings, the Player row first */
     for (r = 0; r < app->view_count; ++r) assert(setting_of(app, r) >= 0 && setting_of(app, r) < app->settings.count);
+    /* the list freed with the view open (a new start, a list read again): the view, the groups and the form on the
+       view's rows go with it, and the groups' names were never the list's */
+    assert(app->view_count > 0 && app->groups > 1 && app->editor.keys == app->view_keys);
+    assert(app->group_keys[1].key == app->group_name[1]);
+    settings_forget(app);
+    assert(!app->view_count && !app->groups && !app->editor.count && !app->settings.keys);
+    assert(!gui_settings_read(&app->settings, list));
+    gui_settings_mark(&app->settings);
     key(app, SDLK_ESCAPE);
     assert(app->form == GUI_FORM_SETTINGS);
     app->player = 0;
@@ -586,9 +609,7 @@ static void button_map(App* app) {
     float x = 0, y = 0; /* mingw's assert returns, as far as the compiler knows */
     int page = -1, focus;
     SDL_SetHint(SDL_HINT_GAMECONTROLLER_IGNORE_DEVICES_EXCEPT, "0x045e/0x02ea"); /* a real pad plugged in stays out */
-    gui_settings_free(&app->settings);
-    memset(&app->settings, 0, sizeof app->settings);
-    app->groups = 0; /* they point into the list just freed, as settings_of drops them */
+    settings_forget(app);
     assert(!gui_settings_read(&app->settings, list));
     gui_settings_mark(&app->settings);
     for (int i = 0; i < app->settings.count; ++i)
@@ -854,6 +875,14 @@ static void keys_outcome(App* app, bool ok) {
     assert(app->menu.view == GUI_LOAD_NONE && !app->keys_done);
     app->clock = 0;
 }
+/* name set (NULL: unset) where getenv reads it as well as SDL: on Windows the C runtime keeps a copy of its own, which
+   SDL_setenv_unsafe leaves naming the real user's folders */
+static void set_env(const char* name, const char* value) {
+#ifdef _WIN32
+    assert(!_putenv_s(name, value ? value : ""));
+#endif
+    assert(!(value ? SDL_setenv_unsafe(name, value, 1) : SDL_unsetenv_unsafe(name)));
+}
 int main(int argc, char** argv) {
 #ifdef _WIN32
     snx_test_crash_said();
@@ -964,11 +993,18 @@ int main(int argc, char** argv) {
         return nx ? 0 : 7; /* Both successful and failed drivers need ESC acknowledgement. */
     }
     App app;
-    /* the menu's data folder from the test's own environment, never the user's */
-    SDL_setenv_unsafe("XDG_DATA_HOME", "/nonexistent/snx-gui-test", 1);
-    SDL_setenv_unsafe("XDG_CONFIG_HOME", "/nonexistent/snx-gui-test/config", 1);
-    SDL_setenv_unsafe("XDG_STATE_HOME", "/nonexistent/snx-gui-test/state", 1);
-    SDL_setenv_unsafe("XDG_CACHE_HOME", "/nonexistent/snx-gui-test/cache", 1);
+    /* the menu's data folder from the test's own environment, never the user's: XDG's here, and a home of the test's
+       own where it comes from HOME, APPDATA or USERPROFILE */
+    char* own_home = snx_temp_dir(NULL);
+    assert(own_home);
+    set_env("HOME", own_home);
+    set_env("APPDATA", own_home);
+    set_env("USERPROFILE", own_home);
+    assert(getenv("APPDATA") && !strcmp(getenv("APPDATA"), own_home));
+    set_env("XDG_DATA_HOME", "/nonexistent/snx-gui-test");
+    set_env("XDG_CONFIG_HOME", "/nonexistent/snx-gui-test/config");
+    set_env("XDG_STATE_HOME", "/nonexistent/snx-gui-test/state");
+    set_env("XDG_CACHE_HOME", "/nonexistent/snx-gui-test/cache");
     /* the menu runs Switch inputs with the runtime it is part of, the other drivers from beside it */
     assert(initialize(&app, "/nonexistent/snx-gui-test/bin/scarletnx"));
     assert(!strcmp(app.self, "/nonexistent/snx-gui-test/bin/scarletnx"));
@@ -1099,7 +1135,7 @@ int main(int argc, char** argv) {
         char *bare = snx_path_join(temporary, "bare-home"),
              *saved_home = getenv("HOME") ? SDL_strdup(getenv("HOME")) : NULL;
         assert(!snx_mkdirs(bare));
-        SDL_setenv_unsafe("HOME", bare, 1);
+        set_env("HOME", bare);
         assert(!keys_red(&app, off) && keys_red(&app, on));
         shows(&app, "- Setup device keys", rgb(app.theme.page));
         key(&app, SDLK_DOWN);
@@ -1110,9 +1146,9 @@ int main(int argc, char** argv) {
         app.theme.blink_ms = gui_theme_builtin(app.theme.id)->blink_ms;
         app.clock = 0;
         if (saved_home)
-            SDL_setenv_unsafe("HOME", saved_home, 1);
+            set_env("HOME", saved_home);
         else
-            SDL_unsetenv_unsafe("HOME");
+            set_env("HOME", NULL);
         SDL_free(saved_home);
         free(bare);
     }
@@ -1202,6 +1238,17 @@ int main(int argc, char** argv) {
     assert(app.menu.view == GUI_LOAD_KEYS && snx_is_dir(app.keys_path) && app.message[0]);
     assert(app.keys_done && !app.keys_ok); /* not installed: said, then the menu after a while */
     assert(!snx_remove_tree(app.keys_path));
+    {
+        char* keys_path = app.keys_path; /* NULL when home_keys_path finds no home: the variable it reads is named */
+        app.keys_path = NULL;
+        drop(&app, source_keys, false);
+#ifdef _WIN32
+        assert(!strcmp(app.message, "Cannot install prod.keys: neither USERPROFILE nor HOME is set"));
+#else
+        assert(!strcmp(app.message, "Cannot install prod.keys: HOME is not set"));
+#endif
+        app.keys_path = keys_path;
+    }
     drop(&app, source_keys, false); /* a try that works says so in place of it */
     assert(snx_is_file(app.keys_path));
     keys_outcome(&app, true);
@@ -1256,7 +1303,7 @@ int main(int argc, char** argv) {
         char *home = snx_path_join(temporary, "home"), *saved_home = getenv("HOME") ? SDL_strdup(getenv("HOME")) : NULL;
         char *dir = snx_path_join(home, ".switch"), *found = snx_path_join(dir, "prod.keys"), *in_use;
         assert(!snx_mkdirs(dir) && !snx_write_file(found, "home keys", 9));
-        SDL_setenv_unsafe("HOME", home, 1);
+        set_env("HOME", home);
         in_use = keys_in_use(&app);
         assert(in_use && !strcmp(in_use, app.keys_path)); /* those installed above come first */
         free(in_use);
@@ -1269,9 +1316,9 @@ int main(int argc, char** argv) {
         render(&app);
         key(&app, SDLK_ESCAPE);
         if (saved_home)
-            SDL_setenv_unsafe("HOME", saved_home, 1);
+            set_env("HOME", saved_home);
         else
-            SDL_unsetenv_unsafe("HOME");
+            set_env("HOME", NULL);
         SDL_free(saved_home);
         free(found);
         free(dir);
@@ -2158,10 +2205,9 @@ int main(int argc, char** argv) {
                !strstr(kept, "gdbstub"));
         free(kept);
         assert(app.groups > 0);           /* the Settings' groups were made, each naming a section of the list */
-        gui_settings_free(&app.settings); /* as a new start has none read */
+        settings_forget(&app);            /* as a new start has none read */
         assert(setting_is(&app, "fullscreen", NULL) && settings_of(&app) && setting_is(&app, "fullscreen", "1"));
-        /* read anew, the list drops the groups that named the old one's sections: the screens drawn later (the theme
-           editor's width) read none of the freed names */
+        /* the groups went with the list: the screens drawn later (the theme editor's width) read none of its names */
         assert(app.groups == 0);
     }
     key(&app, SDLK_UP);
@@ -2228,12 +2274,12 @@ int main(int argc, char** argv) {
     /* a menu that is no runtime's (a build without one) looks for scarletnx beside it, then on PATH */
     {
         char* own = app.self;
-        char* path = SDL_strdup(SDL_getenv("PATH"));
+        char* path = SDL_strdup(getenv("PATH"));
         app.self = NULL;
-        SDL_setenv_unsafe("PATH", "/nonexistent", 1);
+        set_env("PATH", "/nonexistent");
         launch(&app, snx_strdup(input), false);
         assert(!app.menu.running && !strcmp(app.message, "Cannot find scarletnx beside the GUI or on PATH."));
-        SDL_setenv_unsafe("PATH", path, 1);
+        set_env("PATH", path);
         SDL_free(path);
         app.self = own;
         app.message[0] = 0;
@@ -4433,6 +4479,47 @@ int main(int argc, char** argv) {
                 assert(!kept || !strstr(kept, "user="));
                 free(kept);
             }
+            /* the theme editor's preview is the menu in the theme, drawn on a copy of the app put back after it: the
+               box of users opened from the editor's head is not on it, as the pictures the copy made for it would go
+               with the copy, and the app's own be destroyed under it */
+            {
+                int text_size = app.menu.text_size;
+                Uint64 clock = app.clock;
+                GuiPlace head;
+                SDL_Surface *plain, *boxed;
+                app.clock = 1;
+                app.menu.text_size = 2; /* the preview's own scale is 1: its pictures are of another size */
+                app_select(&app, GUI_APP_EDITOR);
+                assert(app.editing && app.form == GUI_FORM_THEME && app.scale == 2);
+                render(&app);
+                plain = preview_pixels(&app);
+                place_screen(&app, &head, "", 0, GUI_SHOWS_TABS);
+                swipe_px(&app, head.badge.x + head.badge.w / 2, head.badge.y + head.badge.h / 2,
+                         head.badge.x + head.badge.w / 2, head.badge.y + head.badge.h / 2);
+                assert(app.users_shown && app.editing && app.form == GUI_FORM_THEME);
+                render(&app);
+                boxed = preview_pixels(&app);
+                assert(same_pixels(plain, boxed));
+                /* the box shows over the editor itself, its pictures the app's at the size it draws them, render
+                   after render */
+                assert(find_text(&app, "Who plays the games", rgb(app.theme.page), 1, &nx, &ny));
+                render(&app);
+                for (int i = 0; i < g_user_count; ++i) {
+                    float w = 0, h = 0;
+                    assert(app.users_pictures[i] && SDL_GetTextureSize(app.users_pictures[i], &w, &h) &&
+                           (int)w == app.users_side);
+                }
+                SDL_DestroySurface(plain);
+                SDL_DestroySurface(boxed);
+                key(&app, SDLK_ESCAPE);
+                assert(!app.users_shown && app.editing && app.form == GUI_FORM_THEME);
+                key(&app, SDLK_ESCAPE);
+                assert(app.editing && app.form == GUI_FORM_APP);
+                leave_editor(&app);
+                app.menu.text_size = text_size;
+                app.clock = clock;
+                render(&app);
+            }
             /* none: neither the box nor the nickname, and the title against the right again */
             app.theme.picture = GUI_PICTURE_NONE;
             render(&app);
@@ -4644,7 +4731,7 @@ int main(int argc, char** argv) {
         /* an installed build's in its state folder, as the working folder is the home folder from the desktop */
         {
             char *state = snx_path_join(temporary, "state"), *logged = snx_path_join(state, "scarletnx/scarletnx.log");
-            SDL_setenv_unsafe("XDG_STATE_HOME", state, 1);
+            set_env("XDG_STATE_HOME", state);
             key(&app, SDLK_RETURN);
             assert(strstr(app.message, logged) && !snx_path_exists(saved));
             text = (char*)snx_read_file(logged, &size);
@@ -4695,6 +4782,18 @@ int main(int argc, char** argv) {
             free(log);
             free(game);
         }
+        /* a working folder that is gone: the file it was to be and the system's reason */
+        {
+            char *cwd = app.cwd, *gone = snx_path_join(temporary, "gone"), *log = snx_path_join(gone, "scarletnx.log");
+            char* said = snx_format("The log could not be saved to %s: ", log);
+            app.cwd = gone;
+            key(&app, SDLK_RETURN);
+            assert(!strncmp(app.message, said, strlen(said)) && app.message[strlen(said)] && !snx_path_exists(log));
+            app.cwd = cwd;
+            free(said);
+            free(log);
+            free(gone);
+        }
         free(app.data_dir);
         app.data_dir = installed_dir;
         assert(!snx_remove_tree(portable));
@@ -4738,6 +4837,8 @@ int main(int argc, char** argv) {
         app.home_dir = data;
         app.data_dir = full;
         app.menu_old = old;
+        free(app.users_dir); /* the users test's: open_files names the new data folder's */
+        app.users_dir = NULL;
         open_files(&app);
         config = menu_folder(&app, SNX_USER_CONFIG, false);
         state = menu_folder(&app, SNX_USER_STATE, false);
@@ -4826,7 +4927,7 @@ int main(int argc, char** argv) {
         char *old = snx_path_join(data, "scarletnx/gui"), *recent = snx_path_join(old, "recent.txt");
         char *run = snx_path_join(old, "last-run.log"), *folder, *expected = snx_path_join(state, "scarletnx"), *now;
         assert(!snx_mkdirs(old) && !snx_write_file(recent, "recent", 6) && !snx_write_file(run, "run", 3));
-        SDL_setenv_unsafe("XDG_DATA_HOME", data, 1);
+        set_env("XDG_DATA_HOME", data);
         folder = menu_folder(&app, SNX_USER_STATE, true);
         assert(folder && !strcmp(folder, expected) && snx_file_size(recent) == 6 && snx_file_size(run) == 3);
         now = snx_path_join(folder, "recent.txt");
@@ -4846,8 +4947,8 @@ int main(int argc, char** argv) {
             unsigned char meta[0xa0];
             const char* at;
             int i;
-            SDL_setenv_unsafe("XDG_CONFIG_HOME", config, 1);
-            SDL_setenv_unsafe("XDG_CACHE_HOME", cache, 1);
+            set_env("XDG_CONFIG_HOME", config);
+            set_env("XDG_CACHE_HOME", cache);
             app.data_dir = snx_path_join(data, "scarletnx");
             app.games_dir = snx_path_join(app.data_dir, "games");
             app.recent_file = snx_path_join(expected, "recent.txt");
@@ -5073,8 +5174,8 @@ int main(int argc, char** argv) {
                     app.drivers = drivers;
                 }
             }
-            SDL_setenv_unsafe("XDG_CONFIG_HOME", "/nonexistent/snx-gui-test/config", 1);
-            SDL_setenv_unsafe("XDG_CACHE_HOME", "/nonexistent/snx-gui-test/cache", 1);
+            set_env("XDG_CONFIG_HOME", "/nonexistent/snx-gui-test/config");
+            set_env("XDG_CACHE_HOME", "/nonexistent/snx-gui-test/cache");
             free(app.recent_file);
             app.recent_file = NULL;
             free(app.games_dir);
@@ -5095,7 +5196,7 @@ int main(int argc, char** argv) {
         folder = menu_folder(&app, SNX_USER_STATE, true);
         assert(folder && snx_is_dir(folder));
         free(folder);
-        SDL_setenv_unsafe("XDG_DATA_HOME", "/nonexistent/snx-gui-test", 1);
+        set_env("XDG_DATA_HOME", "/nonexistent/snx-gui-test");
         free(expected);
         free(run);
         free(recent);
@@ -5170,8 +5271,7 @@ int main(int argc, char** argv) {
         GuiFormBoxes f;
         GuiRect b;
         int s = app.scale, cw = 8 * s, row;
-        gui_settings_free(&app.settings);
-        memset(&app.settings, 0, sizeof app.settings);
+        settings_forget(&app);
         assert(!gui_settings_read(&app.settings, list));
         gui_settings_mark(&app.settings);
         app.theme = *gui_theme_builtin("yorha");
@@ -5215,6 +5315,8 @@ int main(int argc, char** argv) {
     cleanup(&app);
     assert(!snx_remove_tree(temporary));
     free(temporary);
+    assert(!snx_remove_tree(own_home));
+    free(own_home);
     free(self);
     free(input);
     puts("SDL3 GUI: keyboard, font rendering, drops, dispatch and return-to-menu passed");
