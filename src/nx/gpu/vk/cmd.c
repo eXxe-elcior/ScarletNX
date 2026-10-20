@@ -8,6 +8,7 @@
    submit would reset them mid-draw, and wait for the GPU at every submit. */
 #include <stdlib.h>
 #include <string.h>
+#include "common/utilities/common.h"
 #include "nx/runtime/platform/log.h"
 #include "nx/gpu/gpu.h"
 #include "nx/gpu/vk/vk.h"
@@ -190,9 +191,49 @@ static void timeline_wait(u64 value) {
     VK_OK(vkWaitSemaphores(g_vk.dev, &wi, UINT64_MAX));
     gpu_wait_note(NULL, 0);
 }
-/* the storage results of every submission up to value, which has finished, land in guest memory, in order */
+/* the storage results of every submission up to value, which has finished, land in guest memory, in order. The landing
+   thread, a frame slot's recycle and a demand read all ask for the same frames, so g_landed and the lists it walks
+   stay under vk_lock. */
 static void land_through(u64 value) {
+    vk_lock();
     while (g_landed < value) vk_buf_frame_done(++g_landed);
+    vk_unlock();
+}
+
+/* Landing is CPU work on results the GPU has already written. A separate thread waits the graphics timeline and does
+   it, so the GPU thread can keep recording instead of stopping to copy guest memory. Demand reads still land
+   synchronously (buffer.c) when the guest needs the bytes before this thread gets to them. */
+static PMutex g_land_lock = PMUTEX_INIT;
+static PCond g_land_cv;
+static u64 g_land_gate;
+static int g_land_thread;
+
+static void land_thread(void* p) {
+    (void)p;
+    for (;;) {
+        u64 gate;
+        pm_lock(&g_land_lock);
+        while (!g_land_gate) pc_wait(&g_land_cv, &g_land_lock, -1);
+        gate = g_land_gate;
+        g_land_gate = 0;
+        pm_unlock(&g_land_lock);
+        vk_wait_submit(gate);
+        land_through(gate);
+    }
+}
+static void land_kick(u64 gate) {
+    pm_lock(&g_land_lock);
+    if (gate > g_land_gate) g_land_gate = gate;
+    if (!g_land_thread) {
+        pc_init(&g_land_cv);
+        g_land_thread = 1;
+        if (plat_thread(land_thread, NULL, (size_t)1 << 20)) {
+            char why[256];
+            fatal("could not start the GPU landing thread: %s", snx_os_error(why, sizeof why));
+        }
+    }
+    pc_broadcast(&g_land_cv);
+    pm_unlock(&g_land_lock);
 }
 
 /* the frame's previous use is done, its results landed and what it held freed, before it records again */
@@ -349,9 +390,8 @@ void vk_submit(VkSemaphore wait, VkPipelineStageFlags2 wait_stage, VkSemaphore s
     f->recording = 0;
     f->icb++;
     f->last = g_gval;
-    /* results of submissions the GPU has finished land now, so a later release doesn't find them pending */
-    u64 done = 0;
-    if (VK_OK(vkGetSemaphoreCounterValue(g_vk.dev, g_gsem, &done))) land_through(done < g_gval ? done : g_gval);
+    /* the landing thread takes this submission once the GPU finishes it, and the GPU thread goes on recording */
+    land_kick(g_gval);
 }
 
 u64 g_vk_finishes, g_vk_finish_ns;
