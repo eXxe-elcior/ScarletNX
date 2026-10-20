@@ -61,6 +61,12 @@ static void own_unlink(Vb* e) {
 /* Optional copy telemetry. Counters are updated under vk_lock. */
 static u64 g_copy_stage, g_copy_owned, g_copy_uncached, g_copy_zero, g_copy_calls, g_copy_peak, g_read_bound;
 static u64 g_wb_outputs, g_wb_bytes, g_wb_waits, g_wb_wait_ns, g_wb_reuses;
+/* what a GPU write meets: results it covers whole (droppable), partial results (must land), and aliases through the
+   GMMU (must land). Counted only with stats on. */
+static u64 g_wb_wfull, g_wb_wfull_bytes, g_wb_wpart, g_wb_wpart_bytes, g_wb_walias;
+/* writable binds, and those that staged a range this frame already has pending: the copies a frame-wide result would
+   remove. Counted only with stats on. */
+static u64 g_wb_writes, g_wb_writes_bytes, g_wb_repeat, g_wb_repeat_bytes;
 static u64 g_alias_draws, g_alias_pages;
 enum { WB_DRAW, WB_READ, WB_WRITE, WB_SIGNAL, WB_SYNCWAIT, WB_MAP, WB_REASON_N };
 static u64 g_wb_reason[WB_REASON_N], g_wb_reason_ns[WB_REASON_N], g_wb_draw_miss[4];
@@ -438,11 +444,38 @@ int vk_buf_pending(u64 gva, u64 len) {
     return 0;
 }
 void vk_buf_mem_need_map(u64 gva, u64 len) { mem_need_reason(gva, len, WB_MAP); }
+/* Measure what a GPU write would save: a result the write covers whole can be dropped without landing or waiting;
+   a partial result has to land; an alias through another GPU address has to land too. */
+static void out_write_stats(u64 gva, u64 len) {
+    RangePages q;
+    u64 end = gva + len;
+    range_pages(gva, len, &q);
+    for (GfxOut* o = g_out; o; o = o->next) {
+        if (gva < o->addr + o->size && o->addr < end) {
+            if (gva <= o->addr && o->addr + o->size <= end) {
+                g_wb_wfull++;
+                g_wb_wfull_bytes += o->size;
+            } else {
+                g_wb_wpart++;
+                g_wb_wpart_bytes += o->size;
+            }
+        } else if (backing_overlap(&q, o)) {
+            g_wb_walias++;
+        }
+    }
+}
 void vk_buf_before_write(u64 gva, u64 len) {
-    if (len)
-        mem_need_reason(gva, len, WB_WRITE);
-    else
+    if (!len) {
         land_reason(WB_SIGNAL);
+        return;
+    }
+    if (!g_gfx_any || g_out_landing) return;
+    if (copy_stats_on()) {
+        vk_lock();
+        if (g_gfx_any && !g_out_landing && pend_hit(&g_out_pages, gva, len)) out_write_stats(gva, len);
+        vk_unlock();
+    }
+    mem_need_reason(gva, len, WB_WRITE);
 }
 /* GPU copies of pending results into staging, in the order the results were recorded, after the shaders and copies
    that wrote them: copies over bytes an earlier copy wrote wait for it behind a barrier (one copy command mustn't
@@ -789,6 +822,10 @@ int vk_buf_copy(u64 gva, u64 len, VkBuffer* buf, u64* off) {
 int vk_buf_copy_writable(u64 gva, u32 len, VkBuffer* buf, u64* off) {
     GfxOut* o;
     if (!gva) return vk_buf_copy(0, len, buf, off);
+    if (copy_stats_on()) {
+        g_wb_writes++;
+        g_wb_writes_bytes += len;
+    }
     /* Repeated bindings of one writable range in the same draw must name the same storage. */
     for (GfxOut* p = g_prep; p; p = p->next)
         if (p->addr == gva && p->size == len) {
@@ -798,6 +835,13 @@ int vk_buf_copy_writable(u64 gva, u32 len, VkBuffer* buf, u64* off) {
         }
     int pending = gfx_gpu_src(gva, len, buf, off, 1);
     if (pending == 1) return 1;
+    if (copy_stats_on())
+        for (GfxOut* p = g_out; p; p = p->next)
+            if (p->addr == gva && p->size == len && p->frame_id == vk_frame_id()) {
+                g_wb_repeat++;
+                g_wb_repeat_bytes += len;
+                break;
+            }
     o = gfx_out_new((u32)(((gva & 0xFFF) + len + 0xFFF) >> 12), len);
     if (!o) return 0;
     if (pending == 2) { /* guest memory's bytes, with the earlier results copied over them below (out_rebase) */
@@ -1286,10 +1330,19 @@ void vk_buf_frame(void) {
             (unsigned long long)g_wb_reason[WB_MAP], (unsigned long long)(g_wb_reason_ns[WB_MAP] / 1000000),
             (unsigned long long)g_wb_draw_miss[0], (unsigned long long)g_wb_draw_miss[2],
             (unsigned long long)g_wb_draw_miss[1], (unsigned long long)g_wb_draw_miss[3]);
+        LOG("vulkan: buffer writes: full=%llu/%llu partial=%llu/%llu alias=%llu\n",
+            (unsigned long long)g_wb_wfull, (unsigned long long)g_wb_wfull_bytes,
+            (unsigned long long)g_wb_wpart, (unsigned long long)g_wb_wpart_bytes,
+            (unsigned long long)g_wb_walias);
+        LOG("vulkan: writable binds=%llu/%llu repeat=%llu/%llu\n", (unsigned long long)g_wb_writes,
+            (unsigned long long)g_wb_writes_bytes, (unsigned long long)g_wb_repeat,
+            (unsigned long long)g_wb_repeat_bytes);
         LOG("vulkan: aliased storage draws=%llu pages=%llu\n", (unsigned long long)g_alias_draws,
             (unsigned long long)g_alias_pages);
         g_copy_uncached = g_copy_stage = g_copy_owned = g_copy_zero = g_copy_calls = g_copy_peak = g_read_bound = 0;
         g_wb_outputs = g_wb_bytes = g_wb_waits = g_wb_wait_ns = g_wb_reuses = 0;
+        g_wb_wfull = g_wb_wfull_bytes = g_wb_wpart = g_wb_wpart_bytes = g_wb_walias = 0;
+        g_wb_writes = g_wb_writes_bytes = g_wb_repeat = g_wb_repeat_bytes = 0;
         g_alias_draws = g_alias_pages = 0;
         memset(g_wb_reason, 0, sizeof g_wb_reason);
         memset(g_wb_reason_ns, 0, sizeof g_wb_reason_ns);
