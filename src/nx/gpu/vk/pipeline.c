@@ -465,6 +465,7 @@ VkSh* vk_shader_get(const GpuChannel* ch, u64 gva, u64 gva_a, int stage, u64 int
         u64 t0 = plat_ns();
         size_t nw = 0;
         u32* spv = vk_translate_spirv(code, 0x10000, stage, &s->si, &nw, sh_cb_read, &s->cbr);
+        vk_latency_report("Maxwell graphics shader translation", plat_ns() - t0);
         for (int i = 0; i < s->si.ntex; i++) s->indexed |= (s->si.tex[i].flags & SNX_TEX_INDEXED) != 0;
         if (spv && s->si.nimg) {
             u32 image_slots = g_vk.props.limits.maxPerStageDescriptorStorageImages;
@@ -483,10 +484,12 @@ VkSh* vk_shader_get(const GpuChannel* ch, u64 gva, u64 gva_a, int stage, u64 int
         if (spv) {
             VkShaderModuleCreateInfo mi = {
                 .sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO, .codeSize = nw * 4, .pCode = spv};
+            u64 module_started = vk_latency_enabled() ? plat_ns() : 0;
             if (!VK_OK(vkCreateShaderModule(g_vk.dev, &mi, NULL, &s->mod)))
                 s->failed = 1;
             else
                 pf_shader_record(s, spv, nw);
+            if (module_started) vk_latency_report("vkCreateShaderModule graphics", plat_ns() - module_started);
             free(spv);
         } else {
             s->failed = 1;
@@ -860,7 +863,9 @@ VkPipeline vk_pipeline_get(const PipeKey* k) {
             gpu_wait_note("a pipeline being made", h);
             VkPipeline got = pipe_wait(p, -1);
             gpu_wait_note(NULL, 0);
-            g_pipe_wait_ns += plat_ns() - t0;
+            u64 elapsed = plat_ns() - t0;
+            g_pipe_wait_ns += elapsed;
+            vk_latency_report("wait for cached graphics pipeline worker", elapsed);
             return got;
         }
     Pipe* p = calloc(1, sizeof *p);
@@ -875,7 +880,9 @@ VkPipeline vk_pipeline_get(const PipeKey* k) {
     u64 t0 = plat_ns();
     p->p = pipe_make(p);
     __atomic_store_n(&p->ready, 1, __ATOMIC_RELEASE);
-    g_pipe_wait_ns += plat_ns() - t0;
+    u64 elapsed = plat_ns() - t0;
+    g_pipe_wait_ns += elapsed;
+    vk_latency_report("synchronous graphics pipeline compilation", elapsed);
     return p->p;
 }
 void vk_pipeline_stats(u64* pipes, u64* hits, u64* make_ms, u64* wait_ms, u64* shaders, u64* shader_ms) {

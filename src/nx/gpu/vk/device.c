@@ -20,11 +20,39 @@ VkState g_vk;
 /* reentrant on the thread that holds it: landing compute results writes guest memory, which can come back here */
 static PMutex g_vklock;
 static _Thread_local int t_vkdepth;
+/* The threshold is kept outside the hot path. By default only the existing
+   per-frame counters run; opt into individual latency reports with
+   SNX_VK_TRACE_MS=5 (for example). */
+static struct {
+    int threshold_ms;
+    int initialized;
+} g_vk_latency;
+
+int vk_latency_enabled(void) {
+    if (!__atomic_load_n(&g_vk_latency.initialized, __ATOMIC_ACQUIRE)) {
+        const char* value = getenv("SNX_VK_TRACE_MS");
+        int threshold = value ? atoi(value) : 0;
+        if (threshold < 0) threshold = 0;
+        __atomic_store_n(&g_vk_latency.threshold_ms, threshold, __ATOMIC_RELAXED);
+        __atomic_store_n(&g_vk_latency.initialized, 1, __ATOMIC_RELEASE);
+    }
+    return __atomic_load_n(&g_vk_latency.threshold_ms, __ATOMIC_RELAXED) != 0;
+}
+
+void vk_latency_report(const char* operation, u64 elapsed_ns) {
+    if (!vk_latency_enabled() ||
+        elapsed_ns < (u64)__atomic_load_n(&g_vk_latency.threshold_ms, __ATOMIC_RELAXED) * 1000000ull)
+        return;
+    LOG_LIMIT(500, "vulkan latency: %s took %llu.%03llu ms (CPU wall time, not GPU execution time)\n", operation,
+              (unsigned long long)(elapsed_ns / 1000000ull), (unsigned long long)((elapsed_ns / 1000ull) % 1000ull));
+}
 void vk_lock(void) {
     if (!t_vkdepth++ && !pm_trylock(&g_vklock)) { /* held: the GPU thread says so for the stall report */
+        u64 start_ns = vk_latency_enabled() ? plat_ns() : 0;
         gpu_wait_note("vk_lock, which another thread holds", 0);
         pm_lock(&g_vklock);
         gpu_wait_note(NULL, 0);
+        if (start_ns) vk_latency_report("vk_lock contention", plat_ns() - start_ns);
     }
 }
 void vk_unlock(void) {

@@ -10,6 +10,11 @@ typedef struct {
     SpvEmitter emit;
     u32 u32_type, f32_type, f16_type, f64_type, bool_type, zero, true_value, false_value, glsl;
     u32 reg[255];
+    /* These parallel arrays are a straight-line SSA cache. Register variables remain the
+       conservative backing store for every path that has control flow. */
+    u32 register_value[255];
+    u8 register_valid[255];
+    int register_forwarding;
     u32 pred[7];
     u32 cc_c, cc_o, cc_z, cc_s;
     u32 cbuf[18], cbuf_pointer[18];
@@ -32,12 +37,26 @@ int g_shader_float16 = 1;
 int g_shader_tessellation = 1;
 int g_shader_clock_scopes;
 
-static u32 reg_read(DirectCtx* c, u32 r) {
-    return r >= 255 ? c->zero : spv_emit_load(&c->emit, c->u32_type, c->reg[r]);
+static u32 reg_read(DirectCtx* context, u32 reg) {
+    if (reg >= 255) return context->zero;
+    if (context->register_forwarding && context->register_valid[reg])
+        return context->register_value[reg];
+    u32 value = spv_emit_load(&context->emit, context->u32_type, context->reg[reg]);
+    if (context->register_forwarding) {
+        context->register_value[reg] = value;
+        context->register_valid[reg] = 1;
+    }
+    return value;
 }
 
-static void reg_write(DirectCtx* c, u32 r, u32 value) {
-    if (r < 255) spv_emit_store(&c->emit, c->reg[r], value);
+static void reg_write(DirectCtx* context, u32 reg, u32 value) {
+    if (reg >= 255) return;
+    /* Preserve backing stores: a later conditional instruction may require them. */
+    spv_emit_store(&context->emit, context->reg[reg], value);
+    if (context->register_forwarding) {
+        context->register_value[reg] = value;
+        context->register_valid[reg] = 1;
+    }
 }
 
 /* How a fragment shader's generic input interpolates (the SPH's imap: 1 constant, 2 perspective, 3 screen
@@ -3573,6 +3592,13 @@ u32* shader_to_spirv(const u8* code, u32 max_bytes, int stage, ShaderInfo* si, s
         u32 d = B(w, 0, 8), a = B(w, 8, 8), b = B(w, 20, 8);
         u32 guard_merge = 0;
         int skip_helper = stage == ST_FS && helper_side_effect(op);
+        /* Forward values only inside an unconditional straight-line region. SPIR-V
+           values made in a conditional arm cannot dominate its merge. Disable
+           forwarding for the entire guarded instruction and invalidate at its
+           boundary. Complex Maxwell control flow always uses the backing store. */
+        c->register_forwarding = !has_flow && B(w, 16, 3) == 7 && !B(w, 19, 1) &&
+                                 !(flow_has_cc(op) && B(w, 0, 5) != 15) && !skip_helper;
+        if (!c->register_forwarding) memset(c->register_valid, 0, sizeof c->register_valid);
         if (op != O_SSY && op != O_PBK && op != O_PCNT && op != O_PEXIT && op != O_CAL &&
             (B(w, 16, 3) != 7 || B(w, 19, 1) || (flow_has_cc(op) && B(w, 0, 5) != 15) || skip_helper)) {
             u32 execute = spv_emit_id(&c->emit);
@@ -5493,7 +5519,9 @@ u32* shader_to_spirv(const u8* code, u32 max_bytes, int stage, ShaderInfo* si, s
         } else if (op == O_IPA) {
             u32 addr = B(w, 30, 8) * 4;
             u32 component = (addr >> 2) & 3;
-            u32 value;
+            /* Some Maxwell attribute encodings do not map to a declared input.
+               They must never read an uninitialized host-side SPIR-V id. */
+            u32 value = zero_f;
             u32 interpolation = 0;
             if (addr == 0x64) {
                 value = layer_input ? spv_emit_bitcast(&c->emit, c->f32_type,

@@ -198,7 +198,9 @@ static void land_through(u64 value) {
 /* the frame's previous use is done, its results landed and what it held freed, before it records again */
 static void frame_recycle(Frame* f) {
     if (f->last) {
+        u64 wait_started = vk_latency_enabled() ? plat_ns() : 0;
         timeline_wait(f->last);
+        if (wait_started) vk_latency_report("frame slot GPU timeline wait", plat_ns() - wait_started);
         land_through(f->last);
         f->last = 0;
     }

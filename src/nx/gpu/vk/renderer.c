@@ -478,7 +478,9 @@ static void show(Surf* src, u32 fw, u32 fh, u32 transform, int game) {
                                .pSwapchains = &g_vk.swapchain,
                                .pImageIndices = &idx};
         vk_rec_queue(g_vk.gfx); /* the present waits on the frame's submission's semaphore */
+        u64 present_started = vk_latency_enabled() ? plat_ns() : 0;
         VkResult r = vkQueuePresentKHR(g_vk.gfx, &pi);
+        if (present_started) vk_latency_report("vkQueuePresentKHR host call", plat_ns() - present_started);
         if (r == VK_ERROR_OUT_OF_DATE_KHR || (r == VK_SUBOPTIMAL_KHR && !g_vk.sc_turned))
             recreate = 1;
         else if (r == VK_ERROR_SURFACE_LOST_KHR)
@@ -500,6 +502,7 @@ static void show(Surf* src, u32 fw, u32 fh, u32 transform, int game) {
    no image to draw to) is still submitted, with the per-present bookkeeping, so frames don't pile up */
 static void vkr_present_buffer(u64 cpu_addr, u32 w, u32 h, u32 pitch, u32 layout, u32 bhl, u32 fmt, const i32 crop[4],
                                u32 transform) {
+    u64 frame_started = vk_latency_enabled() ? plat_ns() : 0;
     vk_lock();
     vk_buf_writable_abort(); /* a draw abandoned during setup has no shader writes to land */
     vk_render_end();
@@ -536,6 +539,7 @@ static void vkr_present_buffer(u64 cpu_addr, u32 w, u32 h, u32 pitch, u32 layout
     show(src, x1 - x0, y1 - y0, transform, 1);
     __atomic_store_n(&g_shown_ns, plat_ns(), __ATOMIC_RELAXED);
     vk_unlock();
+    if (frame_started) vk_latency_report("render and present a guest frame", plat_ns() - frame_started);
 }
 
 /* The last frame again, under the controls and the menu, while the game shows none: a game loading, stuck, or drawing

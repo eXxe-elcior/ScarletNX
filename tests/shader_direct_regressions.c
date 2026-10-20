@@ -332,6 +332,44 @@ static int switch_selects_current_pc(const u32* code, size_t words) {
     return 0;
 }
 
+/* A source register can reach a consumer through an OpLoad (backing-store
+   fallback) or directly through an SSA id (straight-line forwarding). These
+   tests recognize both, without requiring the compiler to emit redundant loads. */
+static u32 stored_seed_id(const u32* code, size_t words, u32 seed) {
+    for (size_t index = 5; index < words;) {
+        u32 span = code[index] >> 16;
+        if (!span || index + span > words) return 0;
+        if ((code[index] & 0xffff) == 62 && span == 3 &&
+            is_constant_value(code, words, code[index + 2], seed))
+            return code[index + 2];
+        index += span;
+    }
+    return 0;
+}
+
+static int seeded_direct_feeds(const u32* code, size_t words, u32 seed, u32 operation, u32 operand_index) {
+    u32 original = stored_seed_id(code, words, seed);
+    if (!original) return 0;
+    for (size_t index = 5; index < words;) {
+        u32 span = code[index] >> 16;
+        if (!span || index + span > words) return 0;
+        if ((code[index] & 0xffff) == operation && span > operand_index) {
+            u32 operand = code[index + operand_index];
+            if (operand == original) return 1;
+            for (size_t candidate = 5; candidate < words;) {
+                u32 candidate_span = code[candidate] >> 16;
+                if (!candidate_span || candidate + candidate_span > words) return 0;
+                if ((code[candidate] & 0xffff) == 124 && candidate_span == 4 &&
+                    code[candidate + 3] == original && code[candidate + 2] == operand)
+                    return 1;
+                candidate += candidate_span;
+            }
+        }
+        index += span;
+    }
+    return 0;
+}
+
 static int prmt_selector_uses_seeded_register(const u32* code, size_t words) {
     u32 register_pointer = 0;
     for (size_t i = 5; i < words;) {
@@ -342,6 +380,8 @@ static int prmt_selector_uses_seeded_register(const u32* code, size_t words) {
         i += width;
     }
     if (!register_pointer) return 0;
+    if (seeded_direct_feeds(code, words, 0x1234, 199, 3) ||
+        seeded_direct_feeds(code, words, 0x1234, 199, 4)) return 1;
     for (size_t i = 5; i < words;) {
         u32 width = code[i] >> 16;
         if (!width || i + width > words) return 0;
@@ -363,6 +403,7 @@ static int prmt_selector_uses_seeded_register(const u32* code, size_t words) {
 }
 
 static int seeded_register_feeds(const u32* code, size_t words, u32 seed, u32 opcode, u32 operand_index) {
+    if (seeded_direct_feeds(code, words, seed, opcode, operand_index)) return 1;
     u32 pointer = 0;
     for (size_t i = 5; i < words;) {
         u32 width = code[i] >> 16;
@@ -398,6 +439,34 @@ static int seeded_register_feeds(const u32* code, size_t words, u32 seed, u32 op
 }
 
 static int seeded_gradient_component(const u32* code, size_t words, u32 seed, u32 gradient, u32 component) {
+    u32 original = stored_seed_id(code, words, seed);
+    if (original) {
+        for (size_t index = 5; index < words;) {
+            u32 span = code[index] >> 16;
+            if (!span || index + span > words) return 0;
+            if ((code[index] & 0xffff) == 124 && span == 4 && code[index + 3] == original) {
+                u32 value = code[index + 2];
+                for (size_t vector_index = 5; vector_index < words;) {
+                    u32 vector_span = code[vector_index] >> 16;
+                    if (!vector_span || vector_index + vector_span > words) return 0;
+                    if ((code[vector_index] & 0xffff) == 80 && vector_span > 3 + component &&
+                        code[vector_index + 3 + component] == value) {
+                        u32 vector = code[vector_index + 2];
+                        for (size_t sample_index = 5; sample_index < words;) {
+                            u32 sample_span = code[sample_index] >> 16;
+                            if (!sample_span || sample_index + sample_span > words) return 0;
+                            if ((code[sample_index] & 0xffff) == 88 && sample_span > 6 + gradient &&
+                                code[sample_index + 5] == 4 && code[sample_index + 6 + gradient] == vector)
+                                return 1;
+                            sample_index += sample_span;
+                        }
+                    }
+                    vector_index += vector_span;
+                }
+            }
+            index += span;
+        }
+    }
     u32 pointer = 0;
     for (size_t i = 5; i < words;) {
         u32 width = code[i] >> 16;

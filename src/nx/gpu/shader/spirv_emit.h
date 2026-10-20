@@ -16,9 +16,19 @@ typedef struct {
     uint32_t storage, pointee, id;
 } SpvPointerType;
 
+/* Constant identity includes the result type, operation, and exact operand bits.
+   Empty ids are hash-table sentinels; SPIR-V ids begin at one. */
+typedef struct {
+    uint32_t type, operation, operands[4], id;
+    uint32_t operand_count;
+} SpvConstantEntry;
+
 typedef struct {
     SpvWords capabilities, extensions, imports, entry_points, execution_modes, debug, decorations, types, functions;
     uint32_t next_id;
+    /* Compiler-local open-addressed interning table, never shared between shaders. */
+    SpvConstantEntry* constants;
+    size_t constant_count, constant_capacity;
     SpvPointerType* pointer_types;
     size_t pointer_count, pointer_capacity;
     uint32_t sampled_image_types[96], image_types[96], sampled_image_pointee[3];

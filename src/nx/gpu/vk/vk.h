@@ -151,6 +151,9 @@ u64 vk_deferred_bytes(void);
    is checked against it), and the frame (grows at vk_frame_next: frame f's work is done once f + VK_FRAMES started) */
 u64 vk_submit_number(void);
 u32 vk_cb_begun(void); /* command buffers begun so far: changes when a new one starts recording */
+/* Optional CPU-side latency attribution. Set SNX_VK_TRACE_MS to a threshold. */
+int vk_latency_enabled(void);
+void vk_latency_report(const char* operation, u64 elapsed_ns);
 u64 vk_frame_id(void);
 u64 vk_last_submit(void);        /* the last submission's number, which its completion signals */
 void vk_submit_progress(u64* submitted, u64* done); /* the last submission and the last done (any thread) */

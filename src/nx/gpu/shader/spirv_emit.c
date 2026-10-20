@@ -170,6 +170,7 @@ void spv_emit_destroy(SpvEmitter* e) {
                             &e->debug,        &e->decorations, &e->types,   &e->functions};
     for (size_t i = 0; i < sizeof sections / sizeof sections[0]; i++) free(sections[i]->words);
     free(e->pointer_types);
+    free(e->constants);
     free(e->nonuniform);
     memset(e, 0, sizeof *e);
 }
@@ -578,67 +579,109 @@ uint32_t spv_emit_type_function_void(SpvEmitter* e, uint32_t void_type) {
     return id;
 }
 
-uint32_t spv_emit_constant_u32(SpvEmitter* e, uint32_t type, uint32_t value) {
-    uint32_t id = spv_emit_id(e);
-    instruction(&e->types, OP_CONSTANT, 4);
-    put(&e->types, type);
-    put(&e->types, id);
-    put(&e->types, value);
+/* FNV-1a over the exact SPIR-V constant identity. A typed integer and a
+   bitwise-identical float cannot collide semantically because the type id is
+   included in both the hash and equality check. */
+static uint32_t constant_hash(uint32_t operation, uint32_t type,
+                              const uint32_t* operands, uint32_t count) {
+    uint32_t hash = 2166136261u;
+    hash = (hash ^ operation) * 16777619u;
+    hash = (hash ^ type) * 16777619u;
+    hash = (hash ^ count) * 16777619u;
+    for (uint32_t index = 0; index < count; index++)
+        hash = (hash ^ operands[index]) * 16777619u;
+    return hash;
+}
+
+static size_t constant_bucket(const SpvConstantEntry* entries, size_t capacity,
+                              uint32_t operation, uint32_t type,
+                              const uint32_t* operands, uint32_t count) {
+    size_t bucket = constant_hash(operation, type, operands, count) & (capacity - 1);
+    for (;;) {
+        const SpvConstantEntry* candidate = &entries[bucket];
+        if (!candidate->id ||
+            (candidate->operation == operation && candidate->type == type &&
+             candidate->operand_count == count &&
+             (!count || !memcmp(candidate->operands, operands, count * sizeof(uint32_t)))))
+            return bucket;
+        bucket = (bucket + 1) & (capacity - 1);
+    }
+}
+
+static void constant_grow(SpvEmitter* emitter) {
+    size_t new_capacity = emitter->constant_capacity ? emitter->constant_capacity * 2 : 64;
+    if (new_capacity < emitter->constant_capacity ||
+        new_capacity > SIZE_MAX / sizeof(SpvConstantEntry)) abort();
+    SpvConstantEntry* new_entries = calloc(new_capacity, sizeof(*new_entries));
+    if (!new_entries) abort();
+    for (size_t index = 0; index < emitter->constant_capacity; index++) {
+        const SpvConstantEntry* existing = &emitter->constants[index];
+        if (!existing->id) continue;
+        size_t bucket = constant_bucket(new_entries, new_capacity, existing->operation,
+                                        existing->type, existing->operands,
+                                        existing->operand_count);
+        new_entries[bucket] = *existing;
+    }
+    free(emitter->constants);
+    emitter->constants = new_entries;
+    emitter->constant_capacity = new_capacity;
+}
+
+static uint32_t intern_constant(SpvEmitter* emitter, uint32_t operation, uint32_t type,
+                                const uint32_t* operands, uint32_t operand_count) {
+    assert(operand_count <= 4);
+    /* A load factor below 0.5 keeps expected probe counts low during compilation. */
+    if (emitter->constant_count >= emitter->constant_capacity / 2) constant_grow(emitter);
+    size_t bucket = constant_bucket(emitter->constants, emitter->constant_capacity,
+                                    operation, type, operands, operand_count);
+    SpvConstantEntry* entry = &emitter->constants[bucket];
+    if (entry->id) return entry->id;
+    uint32_t id = spv_emit_id(emitter);
+    entry->type = type;
+    entry->operation = operation;
+    entry->operand_count = operand_count;
+    if (operand_count) memcpy(entry->operands, operands, operand_count * sizeof(uint32_t));
+    entry->id = id;
+    emitter->constant_count++;
+    instruction(&emitter->types, operation, operand_count + 3);
+    put(&emitter->types, type);
+    put(&emitter->types, id);
+    for (uint32_t index = 0; index < operand_count; index++)
+        put(&emitter->types, operands[index]);
     return id;
 }
 
-uint32_t spv_emit_constant64(SpvEmitter* e, uint32_t type, uint64_t value) {
-    uint32_t id = spv_emit_id(e);
-    instruction(&e->types, OP_CONSTANT, 5);
-    put(&e->types, type);
-    put(&e->types, id);
-    put(&e->types, (uint32_t)value); /* the low word first */
-    put(&e->types, (uint32_t)(value >> 32));
-    return id;
+uint32_t spv_emit_constant_u32(SpvEmitter* emitter, uint32_t type, uint32_t value) {
+    return intern_constant(emitter, OP_CONSTANT, type, &value, 1);
 }
 
-uint32_t spv_emit_constant_bool(SpvEmitter* e, uint32_t type, int value) {
-    uint32_t id = spv_emit_id(e);
-    instruction(&e->types, value ? OP_CONSTANT_TRUE : OP_CONSTANT_FALSE, 3);
-    put(&e->types, type);
-    put(&e->types, id);
-    return id;
+uint32_t spv_emit_constant64(SpvEmitter* emitter, uint32_t type, uint64_t value) {
+    const uint32_t words[] = {(uint32_t)value, (uint32_t)(value >> 32)};
+    return intern_constant(emitter, OP_CONSTANT, type, words, 2);
 }
 
-uint32_t spv_emit_constant_f32(SpvEmitter* e, uint32_t type, float value) {
+uint32_t spv_emit_constant_bool(SpvEmitter* emitter, uint32_t type, int value) {
+    return intern_constant(emitter, value ? OP_CONSTANT_TRUE : OP_CONSTANT_FALSE, type, NULL, 0);
+}
+
+uint32_t spv_emit_constant_f32(SpvEmitter* emitter, uint32_t type, float value) {
     uint32_t bits;
     memcpy(&bits, &value, sizeof bits);
-    return spv_emit_constant_u32(e, type, bits);
+    return spv_emit_constant_u32(emitter, type, bits);
 }
 
-uint32_t spv_emit_constant_vec4(SpvEmitter* e, uint32_t type, const uint32_t components[4]) {
-    uint32_t id = spv_emit_id(e);
-    instruction(&e->types, OP_CONSTANT_COMPOSITE, 7);
-    put(&e->types, type);
-    put(&e->types, id);
-    for (size_t i = 0; i < 4; i++) put(&e->types, components[i]);
-    return id;
+uint32_t spv_emit_constant_vec4(SpvEmitter* emitter, uint32_t type, const uint32_t components[4]) {
+    return intern_constant(emitter, OP_CONSTANT_COMPOSITE, type, components, 4);
 }
 
-uint32_t spv_emit_constant_vec2(SpvEmitter* e, uint32_t type, uint32_t x, uint32_t y) {
-    uint32_t id = spv_emit_id(e);
-    instruction(&e->types, OP_CONSTANT_COMPOSITE, 5);
-    put(&e->types, type);
-    put(&e->types, id);
-    put(&e->types, x);
-    put(&e->types, y);
-    return id;
+uint32_t spv_emit_constant_vec2(SpvEmitter* emitter, uint32_t type, uint32_t x, uint32_t y) {
+    const uint32_t components[] = {x, y};
+    return intern_constant(emitter, OP_CONSTANT_COMPOSITE, type, components, 2);
 }
 
-uint32_t spv_emit_constant_vec3(SpvEmitter* e, uint32_t type, uint32_t x, uint32_t y, uint32_t z) {
-    uint32_t id = spv_emit_id(e);
-    instruction(&e->types, OP_CONSTANT_COMPOSITE, 6);
-    put(&e->types, type);
-    put(&e->types, id);
-    put(&e->types, x);
-    put(&e->types, y);
-    put(&e->types, z);
-    return id;
+uint32_t spv_emit_constant_vec3(SpvEmitter* emitter, uint32_t type, uint32_t x, uint32_t y, uint32_t z) {
+    const uint32_t components[] = {x, y, z};
+    return intern_constant(emitter, OP_CONSTANT_COMPOSITE, type, components, 3);
 }
 
 uint32_t spv_emit_storage_buffer(SpvEmitter* e, uint32_t struct_type, uint32_t set, uint32_t binding) {

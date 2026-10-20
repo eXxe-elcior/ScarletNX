@@ -84,7 +84,9 @@ def main():
             if f'OpTypeImage %float 2D 0 {array} 1 1 Unknown' not in ms_code or ' Sample %' not in ms_code:
                 raise AssertionError('multisample texture load must fetch a specified sample')
         exchange_code = disassemble(args.disassembler, nro_exchange)
-        if exchange_code.count('OpAccessChain %_ptr_Workgroup_uint') < 4 or exchange_code.count('OpLoad %uint') < 4:
+        # Register forwarding removes the two redundant register loads; the two
+        # remaining OpLoads read both shared-memory words.
+        if exchange_code.count('OpAccessChain %_ptr_Workgroup_uint') < 4 or exchange_code.count('OpLoad %uint') < 2:
             raise AssertionError('64-bit shared exchange must access both words')
         dc_code = subprocess.run([args.disassembler, str(dc_color)], check=True, capture_output=True, text=True).stdout
         if 'Dref' in dc_code or 'OpFOrdGreaterThan' not in dc_code or 'OpSelect %float' not in dc_code:
