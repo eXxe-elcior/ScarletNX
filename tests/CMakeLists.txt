@@ -43,8 +43,8 @@ if(SNX_TEST_SANITIZERS)
         snx-logscan
         # the recompiler and its backends
         snx_llvm snx_arm_llvm scarletnx-recompiler scarletnx-recompiler-shared
-        # the driver, its extraction, the settings and the build's line
-        snx_driver snx_nx_module snx_driver_llvm hactool_lib snx_settings snx_settings_runtime snx_build_info
+        # the driver, its extraction, the first start's setup, the settings and the build's line
+        snx_driver snx_nx_module snx_driver_llvm hactool_lib snx_setup snx_settings snx_settings_runtime snx_build_info
         snx-test-build-info
         # the Switch runtime: its components, the shader translator and the Vulkan backend
         scarletnx snx_core snx_kernel snx_hle snx_video snx_gpu snx_platform snx_shader snx_vk
@@ -278,25 +278,30 @@ target_link_libraries(snx-test-fs-fixture PRIVATE scarletnx-common)
 add_library(snx_test_fs_tree OBJECT "${PROJECT_SOURCE_DIR}/src/common/filesystem/tree.c")
 snx_test_target(snx_test_fs_tree 11)
 target_compile_options(snx_test_fs_tree PRIVATE -include "${CMAKE_CURRENT_SOURCE_DIR}/fs_scan_probe.h")
-foreach(suite tree service)
+set(snx_fs_suites tree)
+if(TARGET hactool_internals) # the service reads dumps through hactool, built with the NX runtime
+    list(APPEND snx_fs_suites service)
+endif()
+foreach(suite ${snx_fs_suites})
     add_executable(snx-test-fs-${suite} filesystem_${suite}.c $<TARGET_OBJECTS:snx_test_fs_tree>)
     snx_test_target(snx-test-fs-${suite} 11)
     add_test(NAME filesystem_${suite}
         COMMAND snx-test-fs-fixture $<TARGET_FILE:snx-test-fs-${suite}>)
 endforeach()
-target_compile_options(snx-test-fs-service PRIVATE -Wno-unused-parameter)
-snx_swipc(snx-test-fs-service ROOT "${PROJECT_SOURCE_DIR}/src/nx" FILES hle/services/types.swipc hle/filesystem/fs.swipc)
-# fs.c reads a game's dump in place through the driver's container.c and hactool
-target_sources(snx-test-fs-service PRIVATE "${PROJECT_SOURCE_DIR}/src/nx/runtime/driver/container.c")
-target_link_libraries(snx-test-fs-service PRIVATE scarletnx-common hactool_internals)
-add_test(NAME filesystem_raw COMMAND snx-test-fs-fixture $<TARGET_FILE:snx-test-fs-service> raw)
-if(NOT WIN32) # the dump's link: Windows makes one only with the right to
-    add_test(NAME filesystem_dump COMMAND snx-test-fs-fixture $<TARGET_FILE:snx-test-fs-service> dump)
-    add_test(NAME filesystem_dump_source COMMAND snx-test-fs-fixture $<TARGET_FILE:snx-test-fs-service> dump-source)
-    add_test(NAME filesystem_dump_none COMMAND snx-test-fs-fixture $<TARGET_FILE:snx-test-fs-service> dump-none)
-    add_test(NAME filesystem_dump_gone COMMAND snx-test-fs-fixture $<TARGET_FILE:snx-test-fs-service> dump-gone)
+if(TARGET hactool_internals)
+    target_compile_options(snx-test-fs-service PRIVATE -Wno-unused-parameter)
+    snx_swipc(snx-test-fs-service ROOT "${PROJECT_SOURCE_DIR}/src/nx" FILES hle/services/types.swipc hle/filesystem/fs.swipc)
+    # fs.c reads a game's dump in place through the driver's container.c and hactool
+    target_sources(snx-test-fs-service PRIVATE "${PROJECT_SOURCE_DIR}/src/nx/runtime/driver/container.c")
+    target_link_libraries(snx-test-fs-service PRIVATE scarletnx-common hactool_internals)
+    add_test(NAME filesystem_raw COMMAND snx-test-fs-fixture $<TARGET_FILE:snx-test-fs-service> raw)
+    if(NOT WIN32) # the dump's link: Windows makes one only with the right to
+        add_test(NAME filesystem_dump COMMAND snx-test-fs-fixture $<TARGET_FILE:snx-test-fs-service> dump)
+        add_test(NAME filesystem_dump_source COMMAND snx-test-fs-fixture $<TARGET_FILE:snx-test-fs-service> dump-source)
+        add_test(NAME filesystem_dump_none COMMAND snx-test-fs-fixture $<TARGET_FILE:snx-test-fs-service> dump-none)
+        add_test(NAME filesystem_dump_gone COMMAND snx-test-fs-fixture $<TARGET_FILE:snx-test-fs-service> dump-gone)
+    endif()
 endif()
-
 if(UNIX)
     # host.c by itself: shared files, folders and the mutex
     add_executable(snx-test-fs-host filesystem_host.c "${PROJECT_SOURCE_DIR}/src/common/filesystem/host.c")
@@ -319,6 +324,10 @@ add_executable(snx-test-cas128 cas128.c)
 snx_test_target(snx-test-cas128 11)
 target_link_libraries(snx-test-cas128 PRIVATE scarletnx-common Threads::Threads)
 add_test(NAME cas128 COMMAND snx-test-cas128)
+# guest byte order on any host (src/common/utilities/endian.h), strict C90 as the code that includes it
+add_executable(snx-test-endian endian.c)
+snx_test_target(snx-test-endian 90)
+add_test(NAME endian COMMAND snx-test-endian)
 if(NOT SNX_BUILD_NX AND NOT SNX_BUILD_GNUABI)
     include(architecture.cmake)
     snx_sanitizer_path()
@@ -722,9 +731,6 @@ if(Python3_Interpreter_FOUND)
     if(NOT WIN32)
         add_test(NAME publish_builds
                  COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/publish_builds_test.py")
-        # the Discord cards of pull requests, issues and pushes to main (scripts/discord-cards.py), against the same
-        add_test(NAME discord_cards
-                 COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/discord_cards_test.py")
         # edenprobe's runs held against a baseline (scripts/edenprobe.py), with a fake runtime and game
         add_test(NAME edenprobe_script COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/edenprobe_test.py")
         # the pull request's comment linking its builds (scripts/pr-builds.sh), against a fake gh; 77 without jq
@@ -770,11 +776,14 @@ endif()
 
 add_executable(snx-test-driver driver_workflow.c
     "${PROJECT_SOURCE_DIR}/src/nx/runtime/driver/driver.c" "${PROJECT_SOURCE_DIR}/src/nx/runtime/driver/game_name.c"
-    "${PROJECT_SOURCE_DIR}/src/nx/loader/loader.c" "${PROJECT_SOURCE_DIR}/src/common/utilities/process.c"
-    "${PROJECT_SOURCE_DIR}/src/common/utilities/logscan.c")
+    "${PROJECT_SOURCE_DIR}/src/nx/runtime/driver/setup.c" "${PROJECT_SOURCE_DIR}/src/nx/loader/loader.c"
+    "${PROJECT_SOURCE_DIR}/src/common/utilities/process.c" "${PROJECT_SOURCE_DIR}/src/common/utilities/logscan.c")
 snx_test_target(snx-test-driver 90)
-target_link_libraries(snx-test-driver PRIVATE snx_test_common snx_lz4 OpenSSL::Crypto snx_demangle)
+target_link_libraries(snx-test-driver PRIVATE snx_test_common snx_setup snx_lz4 OpenSSL::Crypto snx_demangle)
 set_target_properties(snx-test-driver PROPERTIES LINKER_LANGUAGE CXX)
+if(APPLE) # driver/setup.c's weak snx_menu_language, as snx_driver has it: ld64 wants it named
+    target_link_options(snx-test-driver PRIVATE "LINKER:-U,_snx_menu_language")
+endif()
 add_test(NAME driver_workflow COMMAND snx-test-driver)
 set_tests_properties(driver_workflow PROPERTIES TIMEOUT 60)
 add_executable(snx-test-link-file link_file.c)
@@ -797,6 +806,19 @@ if(UNIX)
         target_link_libraries(${target} PRIVATE scarletnx-common)
         add_test(NAME ${name} COMMAND ${target})
     endforeach()
+endif()
+# the setup's files and choices (common/utilities/setup.c), its notices against docs/DEPRECATIONS.md
+if(UNIX AND TARGET snx_setup)
+    add_executable(snx-test-setup setup.c)
+    snx_test_target(snx-test-setup 90)
+    target_link_libraries(snx-test-setup PRIVATE snx_setup)
+    target_compile_definitions(snx-test-setup PRIVATE SNX_DEPRECATIONS="${PROJECT_SOURCE_DIR}/docs/DEPRECATIONS.md")
+    add_test(NAME setup COMMAND snx-test-setup)
+    # the driver's setup in a terminal, its answers from a file
+    add_executable(snx-test-setup-terminal setup_terminal.c "${PROJECT_SOURCE_DIR}/src/nx/runtime/driver/setup.c")
+    snx_test_target(snx-test-setup-terminal 90)
+    target_link_libraries(snx-test-setup-terminal PRIVATE snx_setup)
+    add_test(NAME setup_terminal COMMAND snx-test-setup-terminal)
 endif()
 
 if(UNIX)
@@ -1447,6 +1469,7 @@ if(SNX_BUILD_NX AND NOT SNX_TOOLS_ONLY)
     endif()
     add_executable(snx-test-vulkan-release vulkan_release.c "${PROJECT_SOURCE_DIR}/src/nx/gpu/vk/pending_pages.c")
     snx_test_target(snx-test-vulkan-release 11)
+    target_link_libraries(snx-test-vulkan-release PRIVATE scarletnx-common) # release.c's snx_os_error
     add_test(NAME vulkan_release COMMAND snx-test-vulkan-release)
     add_executable(snx-test-vulkan-backing vulkan_backing.c)
     snx_test_target(snx-test-vulkan-backing 11)

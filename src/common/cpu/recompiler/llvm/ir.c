@@ -171,8 +171,29 @@ static SnxIr* new_ir(const char* name, char opt, const char* target_triple, int 
             cpu = LLVMCreateMessage(riscv_triple(triple) ? "generic-rv64" : "generic-la64");
         }
     }
-    ir->tm =
-        LLVMCreateTargetMachine(target, triple, cpu, features, codegen_level(opt), LLVMRelocPIC, LLVMCodeModelDefault);
+    /* PowerPC64's ABI. The host's code is the runtime's own, which a triple doesn't settle: big-endian glibc is ELFv1
+       on Debian's ports and ELFv2 on Arch POWER, and their LLVMs pick each for powerpc64-*-linux-gnu. Another
+       triple's is what Clang picks for it: ELFv2 for little-endian and musl, ELFv1 for big-endian glibc */
+    if (ppc) {
+        LLVMTargetMachineOptionsRef options = LLVMCreateTargetMachineOptions();
+#if defined(_CALL_ELF) && _CALL_ELF == 2
+        ir->elfv2 = !target_triple;
+#endif
+        if (target_triple)
+            ir->elfv2 = !strncmp(triple, "powerpc64le", 11) || !strncmp(triple, "ppc64le", 7) ||
+                        strstr(triple, "musl") != NULL;
+        LLVMTargetMachineOptionsSetCPU(options, cpu);
+        LLVMTargetMachineOptionsSetFeatures(options, features);
+        LLVMTargetMachineOptionsSetABI(options, ir->elfv2 ? "elfv2" : "elfv1");
+        LLVMTargetMachineOptionsSetCodeGenOptLevel(options, codegen_level(opt));
+        LLVMTargetMachineOptionsSetRelocMode(options, LLVMRelocPIC);
+        LLVMTargetMachineOptionsSetCodeModel(options, LLVMCodeModelDefault);
+        ir->tm = LLVMCreateTargetMachineWithOptions(target, triple, options);
+        LLVMDisposeTargetMachineOptions(options);
+    } else {
+        ir->tm = LLVMCreateTargetMachine(target, triple, cpu, features, codegen_level(opt), LLVMRelocPIC,
+                                         LLVMCodeModelDefault);
+    }
 #ifdef __ANDROID__
     /* AArch64's machine outliner holds a unit's functions in memory and outlines nothing at O2: on Android that memory
        runs the recompile out of mappings */
@@ -184,6 +205,7 @@ static SnxIr* new_ir(const char* name, char opt, const char* target_triple, int 
     ir->mod = LLVMModuleCreateWithNameInContext(name, ir->ctx);
     LLVMSetTarget(ir->mod, triple);
     data = LLVMCreateTargetDataLayout(ir->tm);
+    ir->big_endian = LLVMByteOrder(data) == LLVMBigEndian;
     layout = LLVMCopyStringRepOfTargetData(data);
     LLVMSetDataLayout(ir->mod, layout);
     LLVMDisposeMessage(layout);
@@ -267,19 +289,22 @@ static LLVMValueRef ppc_stub(SnxIr* ir, LLVMTypeRef type, const char* name, cons
 }
 static LLVMValueRef ppc_dynamic_stub(SnxIr* ir, LLVMTypeRef type) {
     char text[640];
-    /* ELFv2 is little-endian's and musl's (as Clang picks it), ELFv1 big-endian glibc's, where a function pointer
-       is its descriptor, whose first doubleword is the code */
-    const char* target = LLVMGetTarget(ir->mod);
-    const char* jump = !strncmp(target, "powerpc64le", 11) || !strncmp(target, "ppc64le", 7) || strstr(target, "musl")
-                           ? "mtctr 12\n bctr"
-                           : "ld 0, 0(12)\n mtctr 0\n bctr";
-    /* r3 the CPU, r4 the pc: f = disp[(pc - code_lo) >> 2] when inside and aligned, else c->rt->miss */
+    /* the module's ABI (new_ir): in ELFv1 a function pointer is its descriptor, whose first doubleword is the code */
+    int v2 = ir->elfv2;
+    const char* jump = v2 ? "mtctr 12\n bctr" : "ld 0, 0(12)\n ld 2, 8(12)\n mtctr 0\n bctr";
+    const char* call = v2 ? "mtctr 12\n bctrl" : "ld 0, 0(12)\n ld 2, 8(12)\n mtctr 0\n bctrl";
+    /* the ABI's TOC save doubleword in the caller's frame: 24(r1) in ELFv2, 40(r1) in ELFv1 */
+    unsigned toc_save = v2 ? 24 : 40;
+    /* r3 the CPU, r4 the pc: f = disp[(pc - code_lo) >> 2] when inside and aligned, jumped to. Else c->rt->miss, the
+       runtime's, with a TOC of its own: it is called, not jumped to, from a frame of the stub's (ELFv1's minimum, 112
+       bytes) with the link register and r2 saved around it, so the guest's caller gets r2 back as it gave it */
     sprintf(text,
             "ld 11, %u(3)\n ld 12, %u(3)\n subf 12, 11, 12\n subf 11, 11, 4\n cmpld 11, 12\n bge 1f\n"
             " andi. 0, 4, 3\n bne 1f\n ld 12, %u(3)\n sldi 11, 11, 1\n ldx 12, 12, 11\n cmpdi 12, 0\n beq 1f\n"
-            " %s\n1:\n ld 12, %u(3)\n ld 12, %u(12)\n %s",
+            " %s\n1:\n mflr 0\n std 0, 16(1)\n std 2, %u(1)\n stdu 1, -112(1)\n ld 12, %u(3)\n ld 12, %u(12)\n"
+            " %s\n addi 1, 1, 112\n ld 2, %u(1)\n ld 0, 16(1)\n mtlr 0\n blr",
             (unsigned)offsetof(CPU, code_lo), (unsigned)offsetof(CPU, code_hi), (unsigned)offsetof(CPU, disp), jump,
-            (unsigned)offsetof(CPU, rt), (unsigned)offsetof(RtAPI, miss), jump);
+            toc_save, (unsigned)offsetof(CPU, rt), (unsigned)offsetof(RtAPI, miss), call, toc_save);
     return ppc_stub(ir, type, "snx_ppc_tail_dynamic", text);
 }
 static void ppc_tail_calls(SnxIr* ir) {
