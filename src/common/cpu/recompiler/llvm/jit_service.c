@@ -1,7 +1,6 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later
    Copyright 2026 the ScarletNX contributors */
-/* The runtime JIT (jit_service.h). C90 in style; the target's C11 is for the LLVM-C headers and cpu.h's inline
-   functions */
+/* The runtime JIT (jit_service.h). C99 in style; the target's C11 is for the LLVM-C headers */
 #if defined(__linux__) && !defined(_GNU_SOURCE)
 #define _GNU_SOURCE 1 /* sched_getaffinity: the CPUs this process may run on */
 #endif
@@ -228,7 +227,7 @@ static Entry* add(SnxJitService* s, SnxU64 pc, int state) {
     if ((s->entry_count + 1) * 2 > s->entry_capacity) {
         size_t capacity = s->entry_capacity ? s->entry_capacity * 2 : 1024, j;
         Entry* grown;
-        if (capacity > ((size_t)-1) / sizeof(*grown)) return NULL;
+        if (capacity > SIZE_MAX / sizeof(*grown)) return NULL;
         grown = (Entry*)calloc(capacity, sizeof(*grown));
         if (!grown) return NULL;
         for (j = 0; j < s->entry_capacity; ++j)
@@ -256,7 +255,7 @@ static int push(Queue* q, SnxU64 pc) {
     size_t capacity, i;
     if (q->count == q->capacity) {
         capacity = q->capacity ? q->capacity * 2 : 256;
-        if (capacity > ((size_t)-1) / sizeof(*grown)) return -1;
+        if (capacity > SIZE_MAX / sizeof(*grown)) return -1;
         grown = (SnxU64*)malloc(capacity * sizeof(*grown));
         if (!grown) return -1;
         for (i = 0; i < q->count; ++i) grown[i] = q->pcs[(q->head + i) & (q->capacity - 1)];
@@ -407,6 +406,39 @@ static SnxU64 resolve_aot(void* user, const char* name) {
     return direct(user, target);
 }
 
+#if defined(__powerpc64__)
+/* The TOC the AOT module's code keeps in r2, its one (link_elf.c, or library.c's arena), which the JIT's arena shares
+   (snx_code_loader_new_toc): units call and jump into the module's functions directly, and the module's jumps through
+   the dispatch table reach the units, each side with r2 as it left it. An ELFv1 function's descriptor holds it, and an
+   ELFv2 global entry computes it from r12 (addis r2, r12, hi; addi r2, r2, lo), which a function that uses no TOC
+   leaves out: the first function that shows it. When none does, none uses r2, and any address near them will do
+   for the arena's own (the first function's: the loader's veneers reach the others from it) */
+static uint64_t aot_toc(const SnxJitConfig* config) {
+    size_t i;
+    for (i = 0; i < config->aot_count; ++i) {
+        const unsigned char* f = (const unsigned char*)(size_t)config->aot_functions[i];
+        uint64_t toc;
+        if (!f) continue;
+#if defined(_CALL_ELF) && _CALL_ELF == 2
+        {
+            uint32_t hi, lo;
+            memcpy(&hi, f, 4);
+            memcpy(&lo, f + 4, 4);
+            if ((hi & 0xFFFF0000u) != 0x3C4C0000u || (lo & 0xFFFF0000u) != 0x38420000u) continue;
+            toc = (uint64_t)(size_t)f + (uint64_t)((int64_t)(int16_t)(hi & 0xFFFFu) * 65536) +
+                  (uint64_t)(int64_t)(int16_t)(lo & 0xFFFFu);
+        }
+#else
+        memcpy(&toc, f + 8, 8);
+#endif
+        if (toc) return toc;
+    }
+    for (i = 0; i < config->aot_count; ++i)
+        if (config->aot_functions[i]) return (uint64_t)(size_t)config->aot_functions[i];
+    return 0;
+}
+#endif
+
 /* The unit's object: every function of codegen, internal to it, and table_name, an array of their addresses in
    codegen's order, its only global. Internal functions give two units the same F_<address> without a clash in the
    loader's table, where every global stays */
@@ -549,10 +581,9 @@ static char* cache_key(const SnxJitService* s) {
     size_t n = strlen(cpu) + strlen(features) + 160;
     key = (char*)malloc(n);
     if (key)
-        sprintf(key, "abi=%d llvm=%s rtlib=%08lx%08lx cpu=%s opt=%c hook=%d svc=%d features=%s", SNX_ABI,
+        sprintf(key, "abi=%d llvm=%s rtlib=%016llx cpu=%s opt=%c hook=%d svc=%d features=%s", SNX_ABI,
                 LLVM_VERSION_STRING,
-                (unsigned long)(fnv(snx_rtlib_object, snx_rtlib_object_size, 0xCBF29CE484222325ULL) >> 32),
-                (unsigned long)(fnv(snx_rtlib_object, snx_rtlib_object_size, 0xCBF29CE484222325ULL) & 0xFFFFFFFFu), cpu,
+                (unsigned long long)fnv(snx_rtlib_object, snx_rtlib_object_size, 0xCBF29CE484222325ULL), cpu,
                 s->config.opt, s->config.hook_direct_calls, s->config.direct_svc, features);
     LLVMDisposeMessage(cpu);
     LLVMDisposeMessage(features);
@@ -1346,7 +1377,7 @@ int snx_jit_add_image(SnxJitService* s, const SnxCodeImage* image) {
     GuestFn* slots;
     unsigned char* pending;
     Region* r = NULL;
-    if (!image->text_size || (lo & 3) || hi < lo || n > ((size_t)-1) / sizeof(*slots)) return -1;
+    if (!image->text_size || (lo & 3) || hi < lo || n > SIZE_MAX / sizeof(*slots)) return -1;
     slots = (GuestFn*)calloc(n, sizeof(*slots));
     pending = (unsigned char*)calloc(n / 8 + 1, 1);
     if (!slots || !pending) {
@@ -1488,7 +1519,12 @@ SnxJitService* snx_jit_service_new(const SnxJitConfig* config, char* error, size
     s->regions[0].hi = s->config.code_hi > s->config.code_lo ? s->config.code_hi : s->config.code_lo;
     s->regions[0].slots = s->config.dispatch;
     s->regions[0].pending = (unsigned char*)calloc(bits / 8 + 1, 1);
-    s->loader = s->regions[0].pending ? snx_code_loader_new(0, error, error_size) : NULL;
+#if defined(__powerpc64__)
+    if (s->regions[0].pending && s->config.aot_count)
+        s->loader = snx_code_loader_new_toc(0, aot_toc(&s->config), error, error_size);
+    else
+#endif
+        s->loader = s->regions[0].pending ? snx_code_loader_new(0, error, error_size) : NULL;
     if (!s->loader) {
         if (!s->regions[0].pending) snprintf(error, error_size, "out of memory");
         free(s->regions[0].pending);
@@ -1510,7 +1546,7 @@ SnxJitService* snx_jit_service_new(const SnxJitConfig* config, char* error, size
     {
         SnxU64 seed = (SnxU64)time(NULL) << 20 ^ (SnxU64)clock() ^ (SnxU64)(size_t)s ^ (SnxU64)(size_t)&seed;
         seed = fnv((const unsigned char*)&seed, sizeof(seed), 0xCBF29CE484222325ULL);
-        sprintf(s->run, "%08lx%08lx", (unsigned long)(seed >> 32), (unsigned long)(seed & 0xFFFFFFFFu));
+        sprintf(s->run, "%016llx", (unsigned long long)seed);
     }
     if (s->config.cache_path) cache_open(s);
     lock_init(&s->lock);

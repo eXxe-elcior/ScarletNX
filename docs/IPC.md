@@ -162,6 +162,17 @@ zeroed:
 | object | `SvcObj*`, NULL when the client sent none: a reference the handler takes its own of to keep it | `SvcObj**`, a new object |
 | handle | the client's handle value, 0 when it sent none | `u32*`, a handle for the reply |
 
+The message is little-endian, as the guest is, whatever the host's byte order. A handler's raw arguments and outputs
+are host numbers: the generated code converts each scalar after it reads it from the request and before it writes it
+into the reply, and a struct field by field, with a function the header defines for each struct that has words in it
+(`swipc_le_<Type>(void* p)`, the type's name with `::` as `_`, nested structs and arrays included). `bytes<N>`, `u8` and `b8` need nothing.
+The process id, the handles and the domain object ids are host numbers too, as `ipc.c` reads the headers and writes
+the reply through converting accessors. What a buffer holds stays in the guest's byte order: the handler reads and
+writes its numbers with `snx_ld_le32`, `snx_st_le32` and their kin (`common/utilities/endian.h`), or `gr32` and
+`gw32` for a guest address. So does code that reads the request by hand (`ipc_in`, `c->raw`) or writes the reply
+(`c->out`) in a `@fallback` or a dispatcher of its own, while `out32` takes a host number. On a little-endian host
+every conversion compiles to nothing.
+
 It returns the result: 0, or an `RC(module, description)`. `I_new` makes an object whose dispatcher is the generated
 one. An object that needs a lock around every command, or a check before each one, has a dispatcher of its own that
 calls `I_dispatch`: fs.c's `file_disp`, `dir_disp` and `fs_disp`, ldr.c's `ro_dispatch`. `I_register` registers a
@@ -169,12 +180,13 @@ constructor under the interface's service names, in `services.c` or in the servi
 pl). Names that need constructors of their own register by hand: ldr:ro and ro:1 are one interface with two kinds of
 session, and bsd:u, bsd:a and bsd:s share one interface with bsd:s the system's.
 
-The generator is strict C90 with no dependencies, so a cross build also builds it for the machine doing the build
-(`cmake/swipc.cmake`, with that machine's compiler, `SNX_HOST_CC`). Its output is C90 as well. The tests
+The generator is strict C99 with no dependencies, so a cross build also builds it for the machine doing the build
+(`cmake/swipc.cmake`, with that machine's compiler, `SNX_HOST_CC`). Its output is C99 as well. The tests
 (`ctest -R swipc` in `build/default`): `tests/swipc_dispatch.c` drives the dispatchers generated from
-`tests/swipc/test.swipc` and `other.swipc` through the layout rules, against stand-ins for what `ipc.c` gives them.
-The same output is compiled with `-std=c90 -pedantic-errors` against a C90 stand-in for `ipc.h`
-(`tests/swipc/c90/`, on 64-bit hosts other than Windows). `tests/swipc/bad/` holds definitions the generator has to
+`tests/swipc/test.swipc` and `other.swipc` through the layout rules and the byte order of every raw argument, against
+stand-ins for what `ipc.c` gives them.
+The same output is compiled with `-std=c99 -pedantic-errors` against a C99 stand-in for `ipc.h`
+(`tests/swipc/c99/`). `tests/swipc/bad/` holds definitions the generator has to
 refuse, each with its line and message. What `ipc.c` itself does with a reply (the order of out objects among the move
 handles, domain ids, a NULL object) is not covered by these tests, nor by the services' own, which give the
 dispatchers stand-ins too: only the homebrew smoke test (nx_runtime_homebrew, with SNX_TEST_VULKAN) and the games go
@@ -184,7 +196,7 @@ through it.
 
 A result is a 32-bit value: 0 for success, otherwise a module in bits 0 to 8 and a description from bit 9, built with
 `RC(module, description)` (`RC(1, 123)` is the kernel's SessionClosed, 0xF601). `hle/result.h`, which `ipc.h`
-includes, holds `RC` and `RC_OK` with helpers in the style of Atmosphère's, written anew in C90:
+includes, holds `RC` and `RC_OK` with helpers in the style of Atmosphère's, written anew in C99:
 
 | Macro | What it does |
 | --- | --- |
@@ -197,5 +209,5 @@ includes, holds `RC` and `RC_OK` with helpers in the style of Atmosphère's, wri
 Each statement macro is a single statement (`do { } while (0)`), so it is safe as the body of an `if` or `else`
 without braces, and evaluates each argument at most once. `R_TRY` keeps the result in a 32-bit `unsigned int` in a
 block of its own, which converts back to the function's return type, `int` for a handler or `u32` for the kernel's
-`svc_` functions. The header includes nothing, so strict C90 code can use it. `tests/result_macros.c`
-(`ctest -R result_macros`) builds them with `-std=c90 -pedantic-errors`.
+`svc_` functions. The header includes nothing, so strict C99 code can use it. `tests/result_macros.c`
+(`ctest -R result_macros`) builds them with `-std=c99 -pedantic-errors`.

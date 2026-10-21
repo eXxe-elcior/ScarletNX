@@ -1,6 +1,6 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later
    Copyright 2026 the ScarletNX contributors */
-/* The generated test dispatchers compiled as C90 (tests/CMakeLists.txt): a service's file includes its .inc and
+/* The generated test dispatchers compiled as strict C99 (tests/CMakeLists.txt): a service's file includes its .inc and
    defines the handlers, as this one does with handlers that do nothing */
 #include "tests/swipc/other.swipc.inc"
 #include "tests/swipc/test.swipc.inc"
@@ -62,6 +62,10 @@ static int test_IThing_RawFail(SvcObj* self, u32 a, u32* v) {
 }
 static int test_IThing_Unsorted(SvcObj* self, const test_Uid* u, u32 a, u8 b, test_Tail* t, u8* c) {
     (void)self, (void)u, (void)a, (void)b, (void)t, (void)c;
+    return 0;
+}
+static int test_IThing_Nested(SvcObj* self, const test_Nest* n, const i16* s, test_Nest* m, u32* w) {
+    (void)self, (void)n, (void)s, (void)m, (void)w;
     return 0;
 }
 static int test_IThing_FixedOut(SvcObj* self, IpcBuf uid) {

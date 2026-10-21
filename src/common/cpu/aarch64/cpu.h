@@ -27,13 +27,7 @@ typedef double f64;
 #define RESTRICT    __restrict__
 #define LIKELY(x)   __builtin_expect(!!(x), 1)
 #define UNLIKELY(x) __builtin_expect(!!(x), 0)
-#if defined(__STDC_VERSION__) && __STDC_VERSION__ >= 199901L
 #define SNX_INLINE static inline __attribute__((always_inline))
-#else /* C90 has no inline: unused copies must not warn in every file that includes this one */
-#define SNX_INLINE static __attribute__((always_inline, unused))
-#endif
-/* a 64-bit constant from two 32-bit halves, since C90 has no long long literals */
-#define SNX_U64C(hi, lo) (((u64)(hi) << 32) | (u64)(lo))
 
 /* The version of the contract between a game module and the runtime: this header (the CPU layout, the SNX_FP_*
    numbers), the helpers in cpu_helpers.c, RtAPI and the module descriptor. The recompiler writes it into each
@@ -55,7 +49,8 @@ typedef double f64;
 #define SNX_EXPORT __attribute__((visibility("default")))
 #endif
 
-/* one 128-bit vector register, lane 0 in the lowest bytes (the host is little-endian, as the guest) */
+/* one 128-bit vector register holding the guest's bytes, lane 0 in the lowest-addressed ones: on a big-endian host the
+   views wider than a byte are byte-swapped numbers, read and written as numbers through SNX_VS and its kin */
 typedef union V128 {
     u8 b[16];
     i8 sb[16];
@@ -133,6 +128,16 @@ typedef char snx_check_cpu_tail[sizeof(void*) != 8 || (offsetof(CPU, disp) == 85
 #define SNX_GUEST32(v) (v)
 #define SNX_GUEST64(v) (v)
 #endif
+/* a vector register's lane as a number: V128 holds the guest's bytes (lane 0 lowest-addressed, as in memory), so on a
+   big-endian host each 16, 32 or 64-bit lane read or written as a number is swapped (the IR's ir_vd and ir_ve) */
+#define SNX_VB(v, i)         ((v).b[i])
+#define SNX_VH(v, i)         ((u16)SNX_GUEST16((v).h[i]))
+#define SNX_VS(v, i)         ((u32)SNX_GUEST32((v).s[i]))
+#define SNX_VD(v, i)         ((u64)SNX_GUEST64((v).d[i]))
+#define SNX_VSET_B(v, i, x)  ((v).b[i] = (u8)(x))
+#define SNX_VSET_H(v, i, x)  ((v).h[i] = (u16)SNX_GUEST16((u16)(x)))
+#define SNX_VSET_S(v, i, x)  ((v).s[i] = (u32)SNX_GUEST32((u32)(x)))
+#define SNX_VSET_D(v, i, x)  ((v).d[i] = (u64)SNX_GUEST64((u64)(x)))
 #define RD8(a)      (*(u8*)MP(a))
 #define RD16(a)     ((u16)SNX_GUEST16(*(u16*)MP(a)))
 #define RD32(a)     ((u32)SNX_GUEST32(*(u32*)MP(a)))
@@ -286,8 +291,8 @@ SNX_INLINE u64 bswap64(u64 x) { return __builtin_bswap64(x); }
 SNX_INLINE u32 cls64(u64 x) { return clz64(x ^ (u64)((i64)x >> 1)) - 1; }
 SNX_INLINE u32 cls32(u32 x) { return clz32(x ^ (u32)((i32)x >> 1)) - 1; }
 SNX_INLINE u64 rbit64(u64 x) {
-    const u64 m1 = SNX_U64C(0x55555555u, 0x55555555u), m2 = SNX_U64C(0x33333333u, 0x33333333u),
-              m4 = SNX_U64C(0x0F0F0F0Fu, 0x0F0F0F0Fu);
+    const u64 m1 = 0x5555555555555555ull, m2 = 0x3333333333333333ull,
+              m4 = 0x0F0F0F0F0F0F0F0Full;
     x = ((x & m1) << 1) | ((x >> 1) & m1); /* swap neighbouring bits, then pairs, then nibbles: bytes reversed */
     x = ((x & m2) << 2) | ((x >> 2) & m2);
     x = ((x & m4) << 4) | ((x >> 4) & m4);
@@ -296,7 +301,7 @@ SNX_INLINE u64 rbit64(u64 x) {
 SNX_INLINE u32 rbit32(u32 x) { return (u32)(rbit64(x) >> 32); }
 /* REV16: the bytes of each halfword swapped */
 SNX_INLINE u64 rev16_64(u64 x) {
-    const u64 m = SNX_U64C(0x00FF00FFu, 0x00FF00FFu);
+    const u64 m = 0x00FF00FF00FF00FFull;
     return ((x & m) << 8) | ((x >> 8) & m);
 }
 /* REV32: the bytes of each word reversed */
@@ -388,7 +393,7 @@ u32 ursqrte32(u32 x);
 
 /* ---- saturation of a value to a signed or unsigned bits-wide integer ---- */
 SNX_INLINE i64 sat_s(i64 v, int bits) {
-    i64 hi = bits >= 64 ? (i64)SNX_U64C(0x7FFFFFFFu, 0xFFFFFFFFu) : (i64)(((u64)1 << (bits - 1)) - 1);
+    i64 hi = bits >= 64 ? (i64)0x7FFFFFFFFFFFFFFFull : (i64)(((u64)1 << (bits - 1)) - 1);
     i64 lo = -hi - 1;
     return v > hi ? hi : v < lo ? lo : v;
 }
@@ -432,7 +437,7 @@ SNX_INLINE u32 snx_cas8(u8* p, u8 expected, u8 desired) {
     return __atomic_compare_exchange_n(p, &expected, desired, 0, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST);
 }
 /* one atomic 16-byte compare-and-swap of both halves (p[0] the low one): cmpxchg16b on x86-64, lqarx/stqcx. on
-   POWER8, c->rt->cas128 on RISC-V and LoongArch */
+   POWER8, c->rt->cas128 on RISC-V, LoongArch and PowerPC64 builds for an older baseline */
 u32 snx_cas128(CPU* c, u64* p, u64 o0, u64 o1, u64 n0, u64 n1);
 #define SNX_FENCE()    __atomic_thread_fence(__ATOMIC_SEQ_CST)
 /* ABI 3 made these and snx_cas128 atomic, so modules from before are refused */
@@ -530,21 +535,21 @@ void snx_msr(CPU* c, u32 sysreg, u64 v);
         u32 t__ = (u32)(E_);                                                                                           \
         V128* p__ = &c->v[D_];                                                                                         \
         p__->d[1] = 0;                                                                                                 \
-        p__->d[0] = t__;                                                                                               \
+        SNX_VSET_D(*p__, 0, t__);                                                                                      \
     } while (0)
 #define SETDB(D_, E_)                                                                                                  \
     do {                                                                                                               \
         u64 t__ = (u64)(E_);                                                                                           \
         V128* p__ = &c->v[D_];                                                                                         \
         p__->d[1] = 0;                                                                                                 \
-        p__->d[0] = t__;                                                                                               \
+        SNX_VSET_D(*p__, 0, t__);                                                                                      \
     } while (0)
 #define SETH(D_, E_)                                                                                                   \
     do {                                                                                                               \
         u16 t__ = (u16)(E_);                                                                                           \
         V128* p__ = &c->v[D_];                                                                                         \
         p__->d[1] = 0;                                                                                                 \
-        p__->d[0] = t__;                                                                                               \
+        SNX_VSET_D(*p__, 0, t__);                                                                                      \
     } while (0)
 #define SETHB(d, e) SETH(d, e)
 #define FPRM        ((int)((c->fpcr >> 22) & 3)) /* FPCR.RMode */

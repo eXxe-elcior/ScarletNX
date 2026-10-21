@@ -34,55 +34,89 @@
 #endif
 
 /* a value between the host's order and little-endian (the same conversion both ways) */
-static __inline__ uint16_t snx_le16(uint16_t v) { return SNX_LE16(v); }
-static __inline__ uint32_t snx_le32(uint32_t v) { return SNX_LE32(v); }
-static __inline__ uint64_t snx_le64(uint64_t v) { return SNX_LE64(v); }
+static inline uint16_t snx_le16(uint16_t v) { return SNX_LE16(v); }
+static inline uint32_t snx_le32(uint32_t v) { return SNX_LE32(v); }
+static inline uint64_t snx_le64(uint64_t v) { return SNX_LE64(v); }
 
-static __inline__ uint16_t snx_ld_le16(const void* p) {
+static inline uint16_t snx_ld_le16(const void* p) {
     uint16_t v;
     memcpy(&v, p, sizeof v);
     return SNX_LE16(v);
 }
-static __inline__ uint32_t snx_ld_le32(const void* p) {
+static inline uint32_t snx_ld_le32(const void* p) {
     uint32_t v;
     memcpy(&v, p, sizeof v);
     return SNX_LE32(v);
 }
-static __inline__ uint64_t snx_ld_le64(const void* p) {
+static inline uint64_t snx_ld_le64(const void* p) {
     uint64_t v;
     memcpy(&v, p, sizeof v);
     return SNX_LE64(v);
 }
-static __inline__ void snx_st_le16(void* p, uint16_t v) {
+static inline void snx_st_le16(void* p, uint16_t v) {
     v = SNX_LE16(v);
     memcpy(p, &v, sizeof v);
 }
-static __inline__ void snx_st_le32(void* p, uint32_t v) {
+static inline void snx_st_le32(void* p, uint32_t v) {
     v = SNX_LE32(v);
     memcpy(p, &v, sizeof v);
 }
-static __inline__ void snx_st_le64(void* p, uint64_t v) {
+static inline void snx_st_le64(void* p, uint64_t v) {
     v = SNX_LE64(v);
     memcpy(p, &v, sizeof v);
 }
 
-static __inline__ uint16_t snx_ld_be16(const void* p) {
+static inline uint16_t snx_ld_be16(const void* p) {
     uint16_t v;
     memcpy(&v, p, sizeof v);
     return SNX_BE16(v);
 }
-static __inline__ uint32_t snx_ld_be32(const void* p) {
+static inline uint32_t snx_ld_be32(const void* p) {
     uint32_t v;
     memcpy(&v, p, sizeof v);
     return SNX_BE32(v);
 }
-static __inline__ void snx_st_be16(void* p, uint16_t v) {
+static inline void snx_st_be16(void* p, uint16_t v) {
     v = SNX_BE16(v);
     memcpy(p, &v, sizeof v);
 }
-static __inline__ void snx_st_be32(void* p, uint32_t v) {
+static inline void snx_st_be32(void* p, uint32_t v) {
     v = SNX_BE32(v);
     memcpy(p, &v, sizeof v);
+}
+static inline uint64_t snx_ld_be64(const void* p) {
+    uint64_t v;
+    memcpy(&v, p, sizeof v);
+    return SNX_BE64(v);
+}
+static inline void snx_st_be64(void* p, uint64_t v) {
+    v = SNX_BE64(v);
+    memcpy(p, &v, sizeof v);
+}
+
+/* n words at p converted in place between little-endian and the host's order (the same conversion both ways): a
+   structure of guest words copied out of guest memory before its fields are read, or before it is copied back. They
+   do nothing on a little-endian host */
+static inline void snx_le16_array(void* p, size_t n) {
+    unsigned char* b = (unsigned char*)p;
+    for (; SNX_HOST_BE && n; --n, b += 2) {
+        uint16_t v = snx_ld_le16(b);
+        memcpy(b, &v, sizeof v);
+    }
+}
+static inline void snx_le32_array(void* p, size_t n) {
+    unsigned char* b = (unsigned char*)p;
+    for (; SNX_HOST_BE && n; --n, b += 4) {
+        uint32_t v = snx_ld_le32(b);
+        memcpy(b, &v, sizeof v);
+    }
+}
+static inline void snx_le64_array(void* p, size_t n) {
+    unsigned char* b = (unsigned char*)p;
+    for (; SNX_HOST_BE && n; --n, b += 8) {
+        uint64_t v = snx_ld_le64(b);
+        memcpy(b, &v, sizeof v);
+    }
 }
 
 #endif
