@@ -125,6 +125,11 @@ else()
         target_link_libraries(scarletnx PRIVATE scarletnx-gui)
         target_compile_definitions(scarletnx PRIVATE SNX_WITH_GUI)
     endif()
+    # also the other drivers, by its name (src/multicall), whose main it has then
+    if(SNX_MULTICALL)
+        target_link_libraries(scarletnx PRIVATE snx_multicall)
+        target_compile_definitions(scarletnx PRIVATE SNX_MULTICALL)
+    endif()
 endif()
 if(IOS)
     # the app (dist/apple): the menu and then the game it plays, in the one process an iOS app has
@@ -250,9 +255,8 @@ if(BUILD_TESTING AND SNX_TEST_VULKAN)
     target_link_libraries(snx-test-astc-vulkan PRIVATE snx_nx_flags scarletnx-filesystem Threads::Threads ${CMAKE_DL_LIBS})
     set_target_properties(snx-test-astc-vulkan PROPERTIES LINKER_LANGUAGE CXX)
     add_test(NAME astc_vulkan COMMAND snx-test-astc-vulkan)
-    add_test(NAME astc_vulkan_pieces COMMAND snx-test-astc-vulkan)
-    set_tests_properties(astc_vulkan_pieces PROPERTIES ENVIRONMENT SNX_VK_MAX_ALLOCATION_MB=4
-        PASS_REGULAR_EXPRESSION "memory in pieces")
+    add_test(NAME astc_vulkan_pieces COMMAND snx-test-astc-vulkan --vk_max_allocation_mb=4)
+    set_tests_properties(astc_vulkan_pieces PROPERTIES PASS_REGULAR_EXPRESSION "memory in pieces")
     set_tests_properties(astc_vulkan astc_vulkan_pieces PROPERTIES TIMEOUT 300)
 endif()
 if(BUILD_TESTING)
@@ -278,8 +282,20 @@ if(WIN32)
                 "${CMAKE_BINARY_DIR}/scarletnx-switch.exe" VERBATIM)
     install(PROGRAMS "${CMAKE_BINARY_DIR}/scarletnx-switch.exe" DESTINATION bin)
 elseif(NOT ANDROID AND NOT IOS)
-    add_custom_command(TARGET scarletnx POST_BUILD
-        COMMAND "${CMAKE_COMMAND}" -E create_symlink "$<TARGET_FILE_NAME:scarletnx>"
-                "${CMAKE_BINARY_DIR}/scarletnx-switch" VERBATIM)
-    install(PROGRAMS "${CMAKE_BINARY_DIR}/scarletnx-switch" DESTINATION bin)
+    set(snx_names scarletnx-switch)
+    # the other drivers, which it is too (SNX_MULTICALL, src/multicall), by the names they have as programs of their own
+    if(SNX_MULTICALL AND TARGET snx_ctr_program)
+        list(APPEND snx_names scarletnx-3ds)
+    endif()
+    if(SNX_MULTICALL AND TARGET snx_gnuabi_program)
+        list(APPEND snx_names scarletnx-gnuabi)
+    endif()
+    foreach(name IN LISTS snx_names)
+        # in place of the program of that name an older build made in this folder
+        add_custom_command(TARGET scarletnx POST_BUILD
+            COMMAND "${CMAKE_COMMAND}" -E rm -f "${CMAKE_BINARY_DIR}/${name}"
+            COMMAND "${CMAKE_COMMAND}" -E create_symlink "$<TARGET_FILE_NAME:scarletnx>" "${CMAKE_BINARY_DIR}/${name}"
+            VERBATIM)
+        install(PROGRAMS "${CMAKE_BINARY_DIR}/${name}" DESTINATION bin)
+    endforeach()
 endif()
