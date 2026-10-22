@@ -664,6 +664,7 @@ add_test(NAME llvm_dependency COMMAND "${CMAKE_COMMAND}"
 
 add_executable(snx-test-overlay overlay.c "${PROJECT_SOURCE_DIR}/src/nx/runtime/platform/overlay.c"
     "${PROJECT_SOURCE_DIR}/src/nx/runtime/platform/fatal_screen.c"
+    "${PROJECT_SOURCE_DIR}/src/nx/runtime/platform/prepare_screen.c"
     "${PROJECT_SOURCE_DIR}/src/nx/runtime/platform/vpad.c" "${PROJECT_SOURCE_DIR}/src/nx/runtime/platform/ui.c"
     "${PROJECT_SOURCE_DIR}/src/nx/runtime/ini.c")
 snx_test_target(snx-test-overlay 11)
@@ -723,7 +724,7 @@ if(Python3_Interpreter_FOUND)
     add_test(NAME ui_shaders_current
         COMMAND "${Python3_EXECUTABLE}" "${PROJECT_SOURCE_DIR}/scripts/build-ui-shaders.py" --check)
     add_test(NAME generators_crlf COMMAND "${Python3_EXECUTABLE}" "${PROJECT_SOURCE_DIR}/tests/generators_crlf.py")
-    # every 3D method that acts is in the fast path's table (engines.c g_m3d_acts)
+    # every 3D method that acts is marked in the fast path's table (engines.c g_m3d_group)
     add_test(NAME m3d_acts COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/m3d_acts_test.py")
     # no keys, dumps, stray binaries, piracy sites or the console maker's name in prose among the tracked files: the
     # checks on planted ones (self test), then on the checkout. Skipped (77) without git or outside a checkout
@@ -1037,7 +1038,8 @@ if(NOT SNX_TOOLS_ONLY)
     target_link_libraries(snx-test-tex-upload-rows PRIVATE snx_nx_flags)
     add_test(NAME tex_upload_rows COMMAND snx-test-tex-upload-rows)
     # the file of shaders and pipelines kept across runs (gpu/vk/pipeline_file.c): records back as written, pipelines
-    # by their shaders' records, a cut or changed record ending the reading, another key starting over, a full file
+    # by their shaders' records (a shipped shader's reference among them), a cut or changed record ending the reading,
+    # another key starting over, a full file; and the shipped shaders' file read through its mapping
     add_executable(snx-test-pipeline-file pipeline_file.c)
     snx_test_target(snx-test-pipeline-file 23)
     target_link_libraries(snx-test-pipeline-file PRIVATE snx_nx_flags scarletnx-common)
@@ -1100,6 +1102,12 @@ add_executable(snx-test-code-loader-unwind code_loader_unwind.c)
 snx_test_target(snx-test-code-loader-unwind 11)
 target_link_libraries(snx-test-code-loader-unwind PRIVATE snx_llvm)
 add_test(NAME code_loader_unwind COMMAND snx-test-code-loader-unwind)
+# the loader's objects as GDB's JIT interface lists them (gdb_jit.c); skipped on Windows, which registers none
+add_executable(snx-test-gdb-jit gdb_jit.c)
+snx_test_target(snx-test-gdb-jit 11)
+target_link_libraries(snx-test-gdb-jit PRIVATE snx_llvm)
+add_test(NAME gdb_jit COMMAND snx-test-gdb-jit)
+set_tests_properties(gdb_jit PROPERTIES SKIP_RETURN_CODE 77)
 if(NOT WIN32)
     # the relocations both ELF paths share (elf_object.c), AArch64's included, checked on any ELF host and on macOS,
     # whose JIT loads ELF objects
@@ -1349,6 +1357,16 @@ add_executable(snx-test-mme-jit mme_jit.c)
 snx_test_target(snx-test-mme-jit 23)
 target_link_libraries(snx-test-mme-jit PRIVATE snx_llvm)
 add_test(NAME mme_jit COMMAND snx-test-mme-jit)
+
+# the shader programs a game ships, found in containers built by the test (gpu/shader/shipped.c)
+add_executable(snx-test-shipped-shaders shipped_shaders.c "${PROJECT_SOURCE_DIR}/src/nx/gpu/shader/shipped.c")
+snx_test_target(snx-test-shipped-shaders 99)
+add_test(NAME shipped_shaders COMMAND snx-test-shipped-shaders)
+# the walk over a game's files and segments for those programs (gpu/shipped_pass.c), on a RomFS made by the test
+add_executable(snx-test-shipped-pass shipped_pass.c "${PROJECT_SOURCE_DIR}/src/nx/gpu/shipped_pass.c"
+               "${PROJECT_SOURCE_DIR}/src/nx/gpu/shader/shipped.c")
+snx_test_target(snx-test-shipped-pass 99)
+add_test(NAME shipped_pass COMMAND snx-test-shipped-pass)
 
 add_executable(snx-test-etc2 etc2_decode.c "${PROJECT_SOURCE_DIR}/src/nx/gpu/texture/etc2.c")
 snx_test_target(snx-test-etc2 23)
