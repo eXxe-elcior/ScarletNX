@@ -183,6 +183,12 @@ msgstr ""
 #. Keys: "Key: what it does." sentences. Keep each key, or its translation in this file, and each ~
 #: src/gui/main.c
 #, snx-keys
+msgid "AOT pack: tap it."
+msgstr ""
+
+#. Keys: "Key: what it does." sentences. Keep each key, or its translation in this file, and each ~
+#: src/gui/main.c
+#, snx-keys
 msgid "Back: go back."
 msgstr ""
 
@@ -268,6 +274,12 @@ msgstr ""
 #: src/gui/main.c
 #, snx-keys
 msgid "Up/Down: select. Enter/Space: open. R: recompile. M: mods folder. Left/Right/PgUp/PgDown: page. F5: refresh."
+msgstr ""
+
+#. Keys: "Key: what it does." sentences. Keep each key, or its translation in this file, and each ~
+#: src/gui/main.c
+#, snx-keys
+msgid "B: build AOT pack."
 msgstr ""
 
 #: src/gui/main.c
@@ -514,10 +526,6 @@ msgid "and %d more, which Share log lists"
 msgstr ""
 
 #: src/gui/main.c
-msgid "OK"
-msgstr ""
-
-#: src/gui/main.c
 msgid "tap again"
 msgstr ""
 
@@ -583,6 +591,10 @@ msgstr ""
 msgid "Move"
 msgstr ""
 
+#: src/gui/main.c src/gui/ui.txt
+msgid "OK"
+msgstr ""
+
 #. Keys: "Key: what it does." sentences. Keep each key, or its translation in this file, and each ~
 #: src/gui/main.c
 #, snx-keys
@@ -592,6 +604,11 @@ msgstr ""
 #: src/gui/main.c
 #, c-format
 msgid "No user shown: %s"
+msgstr ""
+
+#: src/gui/main.c
+#, c-format
+msgid "%s could not be drawn: the game shows no icon"
 msgstr ""
 
 #: src/gui/main.c
@@ -798,6 +815,28 @@ msgstr ""
 
 #: src/gui/main.c
 msgid "  (games/)"
+msgstr ""
+
+#: src/gui/main.c
+#, c-format
+msgid "JIT cache: %s, O%c"
+msgstr ""
+
+#: src/gui/main.c
+#, c-format
+msgid "AOT build: O%c%s"
+msgstr ""
+
+#: src/gui/main.c
+msgid " (levels differ)"
+msgstr ""
+
+#: src/gui/main.c
+msgid "JIT cache: none yet. Play once to collect one."
+msgstr ""
+
+#: src/gui/main.c
+msgid "JIT cache: unreadable. Play once to rebuild it."
 msgstr ""
 
 #: src/gui/main.c
@@ -1539,6 +1578,10 @@ msgid "This copy is portable: to install it, first move away %s"
 msgstr ""
 
 #: src/gui/main.c
+msgid "Skip stops on this page: it has no default to take"
+msgstr ""
+
+#: src/gui/main.c
 msgid "Portable"
 msgstr ""
 
@@ -1564,6 +1607,10 @@ msgstr ""
 
 #: src/gui/main.c
 msgid "Next"
+msgstr ""
+
+#: src/gui/main.c
+msgid "Skip"
 msgstr ""
 
 #: src/gui/main.c
@@ -1873,6 +1920,28 @@ msgid "%d moved, %d not"
 msgstr ""
 
 #: src/gui/main.c
+msgid "AOT pack build aborted."
+msgstr ""
+
+#: src/gui/main.c
+#, c-format
+msgid "AOT pack build failed (status %d)."
+msgstr ""
+
+#: src/gui/main.c
+#, c-format
+msgid "AOT pack built from %d cached function%s."
+msgstr ""
+
+#: src/gui/main.c
+msgid "AOT pack built, but no cached function matched the game."
+msgstr ""
+
+#: src/gui/main.c
+msgid "AOT pack built."
+msgstr ""
+
+#: src/gui/main.c
 msgid "Program ended abnormally (force-terminated by ESC)."
 msgstr ""
 
@@ -1938,6 +2007,23 @@ msgstr ""
 
 #: src/gui/main.c
 msgid "R recompiles Switch games only."
+msgstr ""
+
+#: src/gui/main.c
+msgid "B builds an AOT pack for a prepared Switch game in focus."
+msgstr ""
+
+#: src/gui/main.c
+msgid "No JIT cache for this game yet. Play it once to collect one."
+msgstr ""
+
+#: src/gui/main.c
+msgid "The JIT cache is unreadable. Play it once to rebuild it."
+msgstr ""
+
+#: src/gui/main.c
+#, c-format
+msgid "The JIT cache is O%c, but the game's AOT optimization is O%c. They must match: set Optimization level to O%c before building, or set JIT optimization to O%c and play once to make a matching cache."
 msgstr ""
 
 #: src/gui/main.c
@@ -2123,6 +2209,18 @@ msgstr ""
 #: src/gui/main.c
 #, snx-key
 msgid "R"
+msgstr ""
+
+#. A key of the foot's sentences, which a click finds by this word
+#: src/gui/main.c
+#, snx-key
+msgid "B"
+msgstr ""
+
+#. A key of the foot's sentences, which a click finds by this word
+#: src/gui/main.c
+#, snx-key
+msgid "AOT pack"
 msgstr ""
 
 #. A key of the foot's sentences, which a click finds by this word
@@ -2434,14 +2532,6 @@ msgid "a text too long for its box over its rows, or on one that slides"
 msgstr ""
 
 #: src/gui/theme.c
-msgid "the most pixels between two boxes of a list, times the text's size, 0 to 14"
-msgstr ""
-
-#: src/gui/theme.c
-msgid "a list longer than its column: center keeps the focus in its middle, edge moves at its ends"
-msgstr ""
-
-#: src/gui/theme.c
 msgid "in the margin, beside the focused box"
 msgstr ""
 
@@ -2659,6 +2749,11 @@ msgstr ""
 
 #: src/gui/theme.c
 #, c-format
+msgid "[body] %s = %s does nothing: ui.txt lays out the lists now (delete it)"
+msgstr ""
+
+#: src/gui/theme.c
+#, c-format
 msgid "%s could not be read (out of memory): it shows %s"
 msgstr ""
 
@@ -2805,6 +2900,18 @@ msgstr ""
 
 #: src/common/utilities/setup.c
 msgid "ui_scale =, shown as UI scale"
+msgstr ""
+
+#: src/common/utilities/setup.c
+msgid "A theme's lists"
+msgstr ""
+
+#: src/common/utilities/setup.c
+msgid "[body] gap and scroll in its theme.ini"
+msgstr ""
+
+#: src/common/utilities/setup.c
+msgid "nothing: ui.txt lays out every list"
 msgstr ""
 
 #: src/nx/runtime/settings.txt

@@ -137,6 +137,7 @@ static char* folder_game(const char* directory, const char* name, int kinds) {
     free(folder);
     return path;
 }
+char* gui_folder_game(const char* directory, const char* name) { return folder_game(directory, name, GUI_GAMES_RUN); }
 /* what the game at path, named name, is shown as: the name in its <name>_data/control.nacp, which the recompile
    copies there, else name */
 static char* shown_name(const char* path, const char* name) {
@@ -152,6 +153,30 @@ static char* shown_name(const char* path, const char* name) {
     free(stem);
     free(folder);
     return shown ? shown : snx_strdup(name);
+}
+char* gui_game_shown(const char* path) {
+    char *folder = snx_dirname(path), *shown;
+    const char* leaf = folder ? folder + strlen(folder) : NULL;
+    if (!leaf) return NULL;
+    while (leaf > folder && leaf[-1] != '/' && leaf[-1] != '\\') --leaf;
+    shown = shown_name(path, leaf);
+    free(folder);
+    return shown;
+}
+char* gui_game_icon(const char* path) {
+    char *folder, *icon;
+    const char* leaf;
+    if (!path || !gui_game_folder(path)) return NULL;
+    folder = snx_dirname(path);
+    leaf = folder + strlen(folder);
+    while (leaf > folder && leaf[-1] != '/' && leaf[-1] != '\\') --leaf;
+    icon = snx_format("%s/%s_data/icon.jpg", folder, leaf);
+    free(folder);
+    if (!snx_is_file(icon)) {
+        free(icon);
+        return NULL;
+    }
+    return icon;
 }
 /* whether the add-on named a (<game>_<entry>) is listed before b: updates first, the newest version first (one
    without a version last), then the DLCs by title ID */
