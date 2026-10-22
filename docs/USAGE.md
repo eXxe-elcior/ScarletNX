@@ -166,7 +166,8 @@ Run the same command again to retry after a failure or interruption:
   using `work/Game.extracting/` while running. An incomplete staging directory is discarded on retry.
 - A complete `recompiled/<id>/<id>` (`<id>.exe` on Windows), code module and `<id>.abi` stamp naming this build's
   ABI skip recompilation. The stamp holds `SNX_ABI`: a game a build of another ABI made is recompiled
-  automatically, as is one with a missing or invalid stamp. One another build of the same ABI made keeps its code,
+  automatically, as is one with a missing or invalid stamp, and that recompile takes from the unit cache (below) every
+  code unit whose code is the same. One another build of the same ABI made keeps its code,
   and its `recompiled/<id>/<id>` is replaced by this build's runtime when the two differ, so a newer build's fixes reach
   it. Failed builds never publish a valid ABI checkpoint. A change to the recompiler that keeps `SNX_ABI` isn't
   seen: there `-r` recompiles.
@@ -244,7 +245,16 @@ Remaining examples: POSIX.
   its checkout's `build/native-recomp` (`build/win64-recomp` on Windows). `-q` (`--quiet`) prints no progress.
   `--keep-c` is the deprecated spelling of `--keep-ir`.
 - **Codegen:** `--no-build` stages data/INI only; `--interp-only` omits AOT functions.
-  `--chunk N` sets instructions per code unit. Nothing is cached between runs.
+  `--chunk N` sets instructions per code unit. Each unit's object is kept in `units/` of the cache folder
+  ([Folders](#folders)), which every game's recompile shares, under the SHA-256 of the unit's LLVM IR, the LLVM, the
+  CPU and its features, the optimization level and the LLVM Internals: a unit found there is not compiled again (a
+  recompile after an `SNX_ABI` change that leaves the unit's IR alone, or of a game whose code changed in a few units),
+  and the last line says how many were (`unit cache: 241 of 259 units reused (310.2 MB) from ...`). The module
+  descriptor and the link are made each time. A kept object that is not whole is compiled again, and said. The cache
+  always leaves a tenth of its disk free: when a new unit would take that, the units reused longest ago are removed
+  for it, and a unit there is still no room for is not kept (said, with the disk's free bytes). `--unit_cache_gb=N`
+  (0, no limit, by default) also holds the folder to N GB after each recompile, the units reused longest ago removed
+  first. A cache folder that cannot be made stops the recompile, saying why.
   `--keep-ir` saves the generated code (LLVM IR) in `<outdir>/<NAME>/<NAME>_build/`.
   `--hook-direct-calls` sends calls and branches between guest functions through the dispatch table too, so
   `nvn_trace=1` also counts calls made by direct branch. The game runs slower, so use it only for investigating.
@@ -412,6 +422,7 @@ list). The user's data folder and a portable copy's keep each kind of file apart
 | its `<id>.log` and `threads.txt` | `recompiled/<id>/` | `~/.local/state/scarletnx/recompiled/<id>/` | `state/recompiled/<id>/` |
 | its pipeline cache | `recompiled/<id>/shader_cache/` | `~/.cache/scarletnx/recompiled/<id>/shader_cache/` | `cache/recompiled/<id>/shader_cache/` |
 | extractions (`3ds/` for the 3DS driver) | `work/` | `~/.cache/scarletnx/work/` | `cache/work/` |
+| the recompile's code units, `<key>.o`, every game's | `units/` of the user's cache folder | `~/.cache/scarletnx/units/` | `cache/units/` |
 | the menu's themes, `<name>/theme.ini` | - | `~/.local/share/scarletnx/themes/` | `themes/` |
 | the menu's `settings.ini`, `app.ini`, `folders.txt`, `gamecontrollerdb.txt` | - | `~/.config/scarletnx/` | `config/` |
 | the setup's `setup.ini` ([Setup](#setup)) | - | `~/.config/scarletnx/` | `config/` |
@@ -539,7 +550,8 @@ type, range and help, tab-separated. Every setting, the recompiler's too, is des
 | `fps_limit` | `game` | The pace the game asks for, as on the console: 60 FPS, or 30 for a game made for 30. `0` is unlimited, and `10` to `1000` is that many FPS |
 | `memory_gb` | `0` | Memory the game sees. Below `6` it is the console's 3.2 GB, `6` gives 4.8 GB and `8` gives 6.8 GB. Games that run out of memory on 3.2 GB need `6` |
 | `heap_max_mb` | `0` | The most heap the game can allocate, in MB. `0` is as much as the memory allows |
-| `pipeline_threads` | `0` | Threads that make the GPU's new pipelines while the game goes on, and those of earlier runs before it starts with `prepare_shaders=2`. `0` uses a quarter of the computer's threads, two to six. `1` to `32` is that many. More make a first run's new pipelines sooner, with less CPU left for the game |
+| `pipeline_threads` | `0` | Threads that make the GPU's new pipelines while the game goes on, and those of earlier runs before it starts with `prepare_shaders=2`. `0` uses all the computer's threads but two, two to twelve. `1` to `32` is that many. More make a first run's new pipelines sooner, with less CPU left for the game |
+| `async_pipelines` | `0` | `1` skips what a new shader draws while its pipeline is made, where the game would otherwise pause until it is ready. The game no longer stops where a new shader first appears, and the things that shader draws show up a few frames later. `0` waits for every pipeline |
 | `prepare_shaders` | `2` | Prepares the shaders the game ships in its files and executables ahead of time, so the game's draws needn't make them and it stutters less. They are prepared again after ScarletNX, the GPU or its driver is updated. `0` (Off) makes each shader only when the game first draws with it. `1` (While playing) prepares them in the background, and the game uses them once all are ready. `2` (Before starting) prepares them behind a loading screen in the launcher theme's look, which also waits for the shader cache of earlier sessions, so an opening movie doesn't stutter. A key that types, an arrow or the keypad, a gamepad button other than Home, or a tap starts the game at once, and the rest is prepared while it runs. Esc quits (on Android, back opens the menu, whose Exit quits). F2 or a gamepad's Home opens the menu, and F11 or Alt+Enter switches fullscreen, without starting the game. The screen shows only when the wait passes a quarter second, its words are in English, and a timed run (`--seconds`) starts its clock after it |
 | `jit_threads` | `0` | Threads compiling the game code the recompiler missed, which a thread waits for when it reaches it. `0` uses every CPU the game may run on but two, at most 8. They run below the game's threads |
 | `network` | `0` | `0` reports offline and lets the game reach only loopback, which is not a network sandbox. `1` uses the computer's connection, and the resolver blocks known console service domains. Local wireless works either way (`ldn`) |
@@ -622,8 +634,8 @@ after installation. Other HIDAPI controllers may need their vendor's own hidraw 
 | Enter / Backspace | Plus / Minus |
 
 F1 help; F2 the game's menu; F3 screenshot; F4 FPS limit off and on; F5 thread dump; F6 showcase on and off;
-F11/Alt+Enter fullscreen; Escape quit. A window shows at most one image per refresh and drops the rest unless images
-tear, and the game keeps the pace `fps_limit` sets.
+F7 60-second Tracy capture (SNX_TRACY builds); F11/Alt+Enter fullscreen; Escape quit. A window shows at most one
+image per refresh and drops the rest unless images tear, and the game keeps the pace `fps_limit` sets.
 
 In the game's menu the arrows, Enter and Escape move, select and go back; a gamepad's D-pad or left stick, A and
 B do the same, the on-screen controls' too, and a direction held goes on after a moment.

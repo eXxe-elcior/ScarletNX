@@ -31,6 +31,7 @@
 #include "nx/runtime/platform/log.h"
 #include "nx/runtime/platform/prepare_screen.h"
 #include "nx/runtime/platform/plat.h"
+#include "nx/runtime/platform/tracy.h"
 #include "nx/runtime/platform/ui.h"
 #include "nx/runtime/platform/unattended.h"
 #include <stdio.h>
@@ -145,13 +146,12 @@ static const char* program_path(const char* argv0) {
 
 /* ---- the game's code ---- */
 
-static const SnxModule g_other_version; /* abi 0: a 32-bit module of another version, refused as such below */
-
 static const SnxModule* load_module(const char* path) {
     void *lib, *sym;
     ModuleFn get;
     ArmModuleFn get_arm;
     VariantsFn get_variants;
+    const SnxArmModule* arm;
     const SnxModule* m;
     if (snx_module_static) return snx_module_static();
     if (!snx_is_file(path))
@@ -165,8 +165,16 @@ static const SnxModule* load_module(const char* path) {
         m = get();
     } else if ((sym = plat_dl_sym(lib, "snx_module_arm")) != NULL) {
         memcpy(&get_arm, &sym, sizeof get_arm);
-        m = arm_module(get_arm());
-        if (!m) m = &g_other_version;
+        arm = get_arm();
+        /* its own version, which SNX_ABI's range leaves alone. The path in a line of its own: a fatal's text is what
+           reports are grouped by */
+        if (arm && arm->abi != SNX_ARM_MODULE_ABI) {
+            WARN("game: its code is %s\n", path);
+            fatal("The recompiled code is from another ScarletNX version (32-bit ABI %08x, where this one runs %08x): "
+                  "recompile the game with this one",
+                  (unsigned)arm->abi, (unsigned)SNX_ARM_MODULE_ABI);
+        }
+        m = arm_module(arm);
     } else
         fatal("%s is not a ScarletNX game module", path);
     if (!m) fatal("%s could not be loaded: it describes no game", path);
@@ -421,11 +429,31 @@ static void frontend_loop(void) {
     int frames = 0, stalls = 0;
     while (!g_quit) {
         int shown;
+        SNX_ZONE(z_frontend, "frontend tick");
         video_poll();
         hid_update();
         vi_vsync_tick();
         if (++tick % 60 == 0) ini_poll(0);
         frontend_frame();
+        SNX_ZONE_END(z_frontend);
+#if defined(SNX_TRACY)
+        SNX_PLOT("guest memory MB", (double)used_memory() / (1024.0 * 1024.0));
+        {
+            /* the io plots' bases */
+            static u64 was_read, was_written, last_ns;
+            u64 read = __atomic_load_n(&g_fs_bytes_read, __ATOMIC_RELAXED);
+            u64 written = __atomic_load_n(&g_fs_bytes_written, __ATOMIC_RELAXED);
+            u64 now_ns = plat_ns();
+            double secs = last_ns ? (double)(now_ns - last_ns) / 1e9 : 0.0;
+            if (secs > 0) {
+                SNX_PLOT("io read MB/s", (double)(read - was_read) / 1048576.0 / secs);
+                SNX_PLOT("io write MB/s", (double)(written - was_written) / 1048576.0 / secs);
+            }
+            was_read = read;
+            was_written = written;
+            last_ns = now_ns;
+        }
+#endif
         /* here and not on the GPU thread, where writing the pipeline cache would hold up every channel */
         if (tick % 300 == 0) {
             save_hints();
@@ -455,6 +483,7 @@ static void frontend_loop(void) {
     ini_poll(1); /* the settings the game's menu changed, even over an edit of the file */
     snx_save_before_exit();
     LOG("Exit.\n");
+    snx_tracy_shutdown();
     plat_exit_now(0);
 }
 
@@ -642,9 +671,12 @@ int snx_main(int argc, char** argv) {
     snx_error_sink(log_error_line);
     /* the code before anything is written: a mistyped --game leaves no .ini and no log behind */
     mod = load_module(module);
-    if (mod->abi != SNX_ABI)
-        fatal("The recompiled code is from another ScarletNX version: recompile the game with this one (%s)",
-              module);
+    if (mod->abi != SNX_ABI) {
+        WARN("game: its code is %s\n", module);
+        fatal("The recompiled code is from another ScarletNX version (ABI %u, where this one runs %u): recompile the "
+              "game with this one",
+              (unsigned)mod->abi, (unsigned)SNX_ABI);
+    }
     game_dirs();
     if (g_arm_mod) mem_layout32(g_arm_mod->aspace); /* before anything sizes or reads guest memory */
     if (mod->title_id) g_hle.kernel.title_id = mod->title_id;
@@ -672,6 +704,9 @@ int snx_main(int argc, char** argv) {
     clock_start();
     g_mod = mod; /* from here the log is a file, in the state folder */
     title = mod->title && mod->title[0] ? mod->title : g_exename;
+#if defined(SNX_TRACY)
+    if (g_settings.tracy_profiler) g_opt_tracy_client = 1; /* the .ini's Debug section asks for the client */
+#endif
     /* the header the log summary reads (common/utilities/logscan.c): no folder in it, since players attach the log to
        public reports and the folder names their account */
     LOG("ScarletNX - %s\n", title);
@@ -681,6 +716,9 @@ int snx_main(int argc, char** argv) {
         plat_system_info(sys, sizeof sys);
         LOG("system: %s\n", sys);
     }
+    /* after the header, so the client's own lines do not come before it and a capture that cannot start still leaves
+       a log: it is asked for by a setting, and a run without it is better than no run */
+    if (snx_tracy_init(title)) WARN("tracy: no capture this run; it goes on without one\n");
     say_old_layout();
     /* before the JIT's first load (jit_init, arm.c's blocks, the GPU's macros), and only when asked: GDB stops the
        game to read each one */
