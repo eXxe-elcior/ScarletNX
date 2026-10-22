@@ -27,6 +27,7 @@
 #include "common/utilities/window_icon.h"
 #include "common/utilities/build_info.h"
 #include "gui/recent.h"
+#include "gui/pad_menu.h"
 #include "gui/clean.h"
 #include "gui/settings.h"
 #include "gui/splash.h"
@@ -100,7 +101,21 @@ enum { GUI_GROUP_APP, GUI_GROUP_RECOMPILED, GUI_GROUP_DUMPS, GUI_FOLDER_GROUPS }
 #define GUI_VIEW_ROWS    24    /* a group's rows shown as a view of them */
 #define SNX_GUI_PLAYERS  8     /* Controllers' players, as the runtime's gamepad_p<N>_ keys */
 /* Settings > App > Folders' rows, its last aside: the app's two, then each library's Main, its Extras and Add a folder */
-#define GUI_FOLDER_ROWS  (GUI_PLACES + 1 + GUI_FOLDERS_MAX + 2)
+#define GUI_FOLDER_ROWS (GUI_PLACES + 1 + GUI_FOLDERS_MAX + 2)
+/* the game folders watched on a thread of their own: listing them, a library's with its subfolders, can keep a busy
+   disk a while, the window frozen if the menu's thread waited for it. Once a second the thread hashes what they hold
+   (stamp_dirs); the menu hands it the folders (watch_set) and takes the last hash of those (watch_get) */
+#define GUI_WATCH_DIRS  (GUI_FOLDERS_MAX + 3) /* recompiled/, the player's folders, dumps/, an older version's games/ */
+typedef struct {
+    SDL_Mutex* lock;
+    SDL_Thread* thread;
+    char* dirs[GUI_WATCH_DIRS]; /* as the menu last handed them, NULL none; each one's depth beside it */
+    int depths[GUI_WATCH_DIRS];
+    int count, stop;
+    unsigned set;     /* how many times the folders were handed: a hash of older ones is not taken */
+    unsigned stamped; /* the set the hash is of, 0 none */
+    uint64_t stamp;
+} GuiWatch;
 /* the focused game's runtime JIT cache: none to show, no cache yet, one read, one unreadable */
 enum { GUI_AOT_NONE, GUI_AOT_NO_CACHE, GUI_AOT_CACHE, GUI_AOT_BAD };
 #define GUI_ICONS     96  /* the games' icons kept drawn: a page's rows and the recent ones, with room */
@@ -109,7 +124,25 @@ enum { GUI_AOT_NONE, GUI_AOT_NO_CACHE, GUI_AOT_CACHE, GUI_AOT_BAD };
 typedef struct {
     char* path;
     SDL_Texture* texture;
+    bool loading; /* a dump's, which the driver has not answered for yet: the row shows the loading one */
 } GuiIcon;
+/* the dumps whose icons the driver is asked for (-x --icon), on a thread of its own: reading a dump's Control NCA takes
+   the keys and the disk, which the window's thread waits for neither. Games puts a dump in (dump_icon_ask); the thread
+   asks the driver for each, a dump at a time, into its folder of the cache (dump_icon_dir), and counts the answers,
+   which the menu takes to look at those rows again */
+#define GUI_DUMP_ASKS 128 /* the dumps waiting at most: a page's and more */
+typedef struct {
+    SDL_Mutex* lock;
+    SDL_Condition* wake;
+    SDL_Thread* thread;
+    char* driver; /* the program asked, and the data folder its keys are found by */
+    char* repo;
+    char* dumps[GUI_DUMP_ASKS]; /* each owned, with its folder in the cache beside it */
+    char* dirs[GUI_DUMP_ASKS];
+    int count, stop;
+    unsigned answered; /* how many the driver answered, said or not */
+    bool live;         /* the program's: a thread answers (the tests answer with dump_icons_pass) */
+} GuiDumpIcons;
 /* the App screen's values, as its rows show them, and Folders' (what each row's folder is, past its path) */
 typedef struct {
     char theme[64], text[16], language[64], animations[16], side[16], places[48], moves[32];
@@ -205,6 +238,9 @@ typedef struct App {
     size_t user_jpeg_size;
     SDL_Texture* user_picture; /* drawn user_side pixels square, in the shape it was drawn for */
     GuiIcon icons[GUI_ICONS];  /* the games' icons drawn so far (game_icon), the oldest replaced first */
+    SDL_Texture* icon_loading; /* what a dump's row shows while the driver is asked for its icon */
+    GuiDumpIcons dump_icons;   /* the dumps' icons asked of the driver */
+    unsigned dump_icons_seen;  /* the answers the rows were drawn after */
     size_t icons_next;
     int user_side, user_shape;
     /* the box a click on the user opens (users_open): each user of users.ini, the focused one picked as Settings' user */
@@ -255,6 +291,14 @@ typedef struct App {
     SDL_Gamepad* gamepad;      /* the pad it shows, the first one plugged in, while it is open */
     bool pads_read;            /* SDL's gamepads started for it */
     unsigned pad_pushed;       /* the triggers and the left stick's directions past half way, a bit each */
+    /* the menu's own pads, whose presses are its keys (pad_menu.h), open until a run's game loads; pads_failed: SDL
+       could not start them, for pads_error, not asked again. pad_driven: a pad pressed last, not the keyboard, the
+       mouse or a finger, so the cursor is hidden and a mouse moving less than pointer_travel's GUI_PAD_TRAVEL moves
+       nothing */
+    GuiPads pads;
+    bool pads_failed, pad_driven;
+    char pads_error[256];
+    float pointer_travel;
     /* the Settings' groups: App, then a group per section of the settings, its first row and rows; a row each */
     int groups, group_first[GUI_GROUPS_MAX], group_rows[GUI_GROUPS_MAX];
     GuiThemeKey group_keys[GUI_GROUPS_MAX];
@@ -289,10 +333,11 @@ typedef struct App {
     char* folder_asked; /* a folder picked with folders in it, asked whether their games are listed too */
     char* folders_file; /* where they are kept; NULL keeps none */
     GuiThemeKey folder_keys[GUI_FOLDER_ROWS];
-    char* library_dumps;    /* dumps/ of the data folder, as Folders' row names it while it is open */
-    int folder_off;         /* the game folder GUI_ASK_FOLDER asks about, its index in folders */
-    uint64_t games_stamp;   /* what the game folders held when last counted (games_stamp) */
-    Uint64 games_checked;   /* when they were last looked at */
+    char* library_dumps;  /* dumps/ of the data folder, as Folders' row names it while it is open */
+    int folder_off;       /* the game folder GUI_ASK_FOLDER asks about, its index in folders */
+    uint64_t games_stamp; /* what the game folders held when last listed, as the watcher hashes them */
+    bool games_fresh;     /* listed just now: the watcher's next hash is what the list holds */
+    GuiWatch watch;
     bool recent_all;        /* every recent game shows, not GUI_RECENT_SHOWN and a row for the rest */
     Uint32 picked_folder;   /* the event a folder from the system's picker comes back as */
     SDL_Texture* preview;   /* the editor's: the menu or a run drawn in its theme, at 1x */
@@ -420,6 +465,22 @@ static const char* entry_text(int item) { return ui_menu_texts + ui_menu_items[G
 #define SAY_PAD    SNX_TR_KEYS("Arrows/pad: move, change. Enter/A: select. Del: the .ini's. ESC: back.")
 #define SAY_USERS  SNX_TR_KEYS("Up/Down: user. Left/Right: plays as. Enter: type a nickname. ESC: back.")
 #endif
+/* and what they say while a pad drives the menu (pad_menu.h's keys), on every system: its face's letters as an Xbox
+   pad's and a Switch one's name them, a PlayStation pad's shapes in their place (gui_pad_keys_named) */
+#define SAY_PAD_MENU SNX_TR_KEYS("D-pad: move. A: select. Start: refresh. B: back.")
+#define SAY_PAD_GAMES                                                                                                  \
+    SNX_TR_KEYS("D-pad: select. A: open. Y: recompile. L3: mods folder. LT/RT: page. Start: refresh. B: back.")
+#define SAY_PAD_GAMES_AOT SNX_TR_KEYS("R3: build AOT pack.")
+#define SAY_PAD_KEYS_HOW  SNX_TR_KEYS("A: pick a file. B: back.")
+#define SAY_PAD_EDITOR    SNX_TR_KEYS("D-pad: key, change. A: edit. B: back.")
+#define SAY_PAD_PICKER    SNX_TR_KEYS("D-pad: row, 1. LT/RT: 16. A: keep. B: put back.")
+#define SAY_PAD_SETTINGS  SNX_TR_KEYS("D-pad: setting, change. A: type. X: default. B: back.")
+#define SAY_PAD_GROUPS    SNX_TR_KEYS("D-pad: group. A: open. B: back.")
+#define SAY_PAD_APP       SNX_TR_KEYS("D-pad: row, change. A: change or open. B: back.")
+#define SAY_PAD_FOLDERS   SNX_TR_KEYS("D-pad: row. X: take an Extra off. Start: refresh. B: back.")
+#define SAY_PAD_PLACES    SNX_TR_KEYS("D-pad: folder. A: pick another. X: the default. Start: refresh. B: back.")
+#define SAY_PAD_USERS     SNX_TR_KEYS("D-pad: user, plays as. A: type a nickname. B: back.")
+#define SAY_PAD_TAB       SNX_TR_KEYS("LB/RB: screen.")
 /* a failure of the system's (a file not written, a picker that did not open): in a box over the screen, whole, until
    OK, once in the session; the tips or the note keep it after. Over a run or another question, those alone */
 static void say_failure(App* app, const char* text) {
@@ -994,9 +1055,12 @@ static const char* shown_keys(const App* app, char* out, size_t size);
 static void aot_status_update(App* app);
 /* a screen's keys, Tab's after them */
 #define SAY_TAB SNX_TR_KEYS("Tab: screen. F2: side box.")
+/* Games' foot says the AOT pack's key: there is a cache to build it from, or the pack built is bad */
+static bool aot_said(const App* app) {
+    return app->menu.view == GUI_LOAD_GAMES && (app->aot_state == GUI_AOT_CACHE || app->aot_state == GUI_AOT_BAD);
+}
 static const char* screen_keys(const App* app, const char* keys, char* out, size_t size) {
-    int aot = app->menu.view == GUI_LOAD_GAMES &&
-              (app->aot_state == GUI_AOT_CACHE || app->aot_state == GUI_AOT_BAD);
+    bool aot = aot_said(app);
 #ifdef SDL_PLATFORM_ANDROID
     if (aot) {
         snprintf(out, size, "%s %s", snx_tr(keys), snx_tr(SAY_GAMES_AOT));
@@ -1184,7 +1248,7 @@ static int type_rows(const GuiTheme* theme, int rows, int first, const size_t* t
     return typing;
 }
 static void foot(App* app, const GuiPlace* p, const char* tips, SDL_Color color, const char* keys);
-static int hint_pick(const char* key, int col);
+static int hint_pick(const char* key, int col, bool pad);
 /* a run as a loading screen: the title, the name and the ring; the steps typed down the page, their status last;
    the progress bar and its percentage */
 static void render_steps(App* app) {
@@ -1864,6 +1928,25 @@ static int splash_shown(App* app) {
 static bool folders_row_place(const App* app);
 static const char* shown_keys(const App* app, char* out, size_t size) {
     const char* keys = SAY_MENU_KEYS;
+    if (app->pad_driven && !(app->editing && app->form == GUI_FORM_PAD)) { /* the button map's speaks of pads already */
+        char said[512];
+        if (app->editing)
+            keys = app->editor.picking              ? SAY_PAD_PICKER
+                   : app->form == GUI_FORM_THEME    ? SAY_PAD_EDITOR
+                   : app->form == GUI_FORM_SETTINGS ? SAY_PAD_GROUPS
+                   : app->form == GUI_FORM_APP      ? SAY_PAD_APP
+                   : app->form == GUI_FORM_FOLDERS  ? (folders_row_place(app) ? SAY_PAD_PLACES : SAY_PAD_FOLDERS)
+                   : app->form == GUI_FORM_USERS    ? SAY_PAD_USERS
+                                                    : SAY_PAD_SETTINGS;
+        else
+            keys = app->menu.view == GUI_LOAD_GAMES ? SAY_PAD_GAMES
+                   : pick_screen(app)               ? SAY_PAD_KEYS_HOW
+                                                    : SAY_PAD_MENU;
+        snprintf(said, sizeof said, "%s%s%s %s", snx_tr(keys), aot_said(app) ? " " : "",
+                 aot_said(app) ? snx_tr(SAY_PAD_GAMES_AOT) : "", snx_tr(SAY_PAD_TAB));
+        gui_pad_keys_named(said, app->pads.labels, out, size);
+        return out;
+    }
     if (app->editing)
         keys = app->form == GUI_FORM_PAD        ? SAY_PAD
                : app->editor.picking            ? SAY_PICKER
@@ -2020,7 +2103,7 @@ static int hints(App* app, const char* keys, int width, GuiRect r, int y, int dr
             lit = draw && k && !off && app->hovering && app->hover_y >= (float)cy &&
                   app->hover_y < (float)(cy + cell_h(app)) && app->hover_x >= (float)(x - cell_w(app)) &&
                   app->hover_x < (float)(x + w + cell_w(app)) &&
-                  hint_pick(key, (int)SDL_floorf((app->hover_x - (float)x) / (float)cell_w(app))) >= 0;
+                  hint_pick(key, (int)SDL_floorf((app->hover_x - (float)x) / (float)cell_w(app)), app->pad_driven) >= 0;
             if (lit) /* the whole sentence, as a button under the pointer: inverted */
                 fill_rect(app, gui_rect(x - s, cy, w + 2 * s, cell_h(app)), band ? t->page : t->focus);
             else if (draw && k && !off && t->focus_bar)
@@ -2164,20 +2247,209 @@ static SDL_Texture* picture_texture(App* app, const unsigned char* jpeg, size_t 
 }
 /* the icon of the game whose program is at path, as its row shows it: its icon.jpg drawn once, then kept; NULL for
    a game without one. One that does not draw is said, with its file, and shows none */
+/* the folder in the cache a dump's icon goes in: icons/ of the menu's cache, named by a hash of the dump's path, size
+   and time and of the keys' (prod.keys), so a dump replaced, or keys put in after a dump could not be read, asks again.
+   Owned; NULL when the dump is not there */
+static char* dump_icon_dir(const App* app, const char* dump) {
+    SDL_PathInfo info, keys = {0};
+    uint64_t h = 1469598103934665603ull; /* FNV-1a */
+    const char* c;
+    char *cache, *icons, name[17], *dir;
+    if (!SDL_GetPathInfo(dump, &info) || info.type != SDL_PATHTYPE_FILE) return NULL;
+    for (c = dump; *c; ++c) h = (h ^ (unsigned char)*c) * 1099511628211ull;
+    h = (h ^ info.size) * 1099511628211ull;
+    h = (h ^ (uint64_t)info.modify_time) * 1099511628211ull;
+    if (app->keys_path) SDL_GetPathInfo(app->keys_path, &keys); /* none: zeros */
+    h = (h ^ keys.size) * 1099511628211ull;
+    h = (h ^ (uint64_t)keys.modify_time) * 1099511628211ull;
+    snprintf(name, sizeof name, "%016llx", (unsigned long long)h);
+    cache = menu_folder(app, SNX_USER_CACHE, false);
+    icons = cache ? snx_path_join(cache, "icons") : NULL;
+    dir = icons ? snx_path_join(icons, name) : NULL;
+    free(icons);
+    free(cache);
+    return dir;
+}
+/* one dump asked of the driver: its icon.jpg in dir, else why.txt there with what the driver said */
+static void dump_icon_answer(const GuiDumpIcons* d, const char* dump, const char* dir) {
+    const char* args[] = {d->driver, "--repo", d->repo, "-x", "--icon", "--out", dir, "--", dump, NULL};
+    SDL_PropertiesID how;
+    SDL_Process* run = NULL;
+    char *said = NULL, *why, *icon;
+    size_t size = 0;
+    int status = -1;
+    if (snx_mkdirs(dir)) return;               /* asked again next time: nowhere to answer */
+    if ((how = SDL_CreateProperties()) != 0) { /* its stderr with its stdout: why it has none is an error line */
+        SDL_SetPointerProperty(how, SDL_PROP_PROCESS_CREATE_ARGS_POINTER, (void*)args);
+        SDL_SetNumberProperty(how, SDL_PROP_PROCESS_CREATE_STDIN_NUMBER, SDL_PROCESS_STDIO_NULL);
+        SDL_SetNumberProperty(how, SDL_PROP_PROCESS_CREATE_STDOUT_NUMBER, SDL_PROCESS_STDIO_APP);
+        SDL_SetBooleanProperty(how, SDL_PROP_PROCESS_CREATE_STDERR_TO_STDOUT_BOOLEAN, true);
+        run = SDL_CreateProcessWithProperties(how);
+        SDL_DestroyProperties(how);
+    }
+    if (run) said = (char*)SDL_ReadProcess(run, &size, &status);
+    icon = snx_path_join(dir, "icon.jpg");
+    if (!run || status || !snx_is_file(icon)) {
+        why = snx_path_join(dir, "why.txt");
+        if (!run)
+            snx_write_file(why, SDL_GetError(), strlen(SDL_GetError()));
+        else
+            snx_write_file(why, said ? said : "", said ? strlen(said) : 0);
+        free(why);
+    }
+    free(icon);
+    SDL_free(said);
+    if (run) SDL_DestroyProcess(run);
+}
+/* the dumps asked so far, here: what the thread does, and the tests' look of their own */
+static void dump_icons_pass(GuiDumpIcons* d) {
+    char *dump, *dir;
+    if (!d->lock) return;
+    for (;;) {
+        SDL_LockMutex(d->lock);
+        if (!d->count || __atomic_load_n(&d->stop, __ATOMIC_RELAXED)) {
+            SDL_UnlockMutex(d->lock);
+            return;
+        }
+        dump = d->dumps[0];
+        dir = d->dirs[0];
+        memmove(d->dumps, d->dumps + 1, (size_t)--d->count * sizeof *d->dumps);
+        memmove(d->dirs, d->dirs + 1, (size_t)d->count * sizeof *d->dirs);
+        SDL_UnlockMutex(d->lock);
+        dump_icon_answer(d, dump, dir);
+        free(dump);
+        free(dir);
+        SDL_LockMutex(d->lock);
+        ++d->answered;
+        SDL_UnlockMutex(d->lock);
+    }
+}
+static int SDLCALL dump_icons_run(void* data) {
+    GuiDumpIcons* d = (GuiDumpIcons*)data;
+    while (!__atomic_load_n(&d->stop, __ATOMIC_RELAXED)) {
+        dump_icons_pass(d);
+        SDL_LockMutex(d->lock);
+        if (!d->count && !__atomic_load_n(&d->stop, __ATOMIC_RELAXED)) SDL_WaitCondition(d->wake, d->lock);
+        SDL_UnlockMutex(d->lock);
+    }
+    return 0;
+}
+static char* find_driver(const App* app, int item);
+/* a dump's icon to ask the driver for, once: false when it cannot be asked (no driver, the queue full) */
+static bool dump_icon_ask(App* app, const char* dump, const char* dir) {
+    GuiDumpIcons* d = &app->dump_icons;
+    bool asked = false;
+    int i;
+    if (!d->lock) {
+        char* driver = find_driver(app, GUI_SWITCH);
+        if (!driver || !app->data_dir || !(d->lock = SDL_CreateMutex()) || !(d->wake = SDL_CreateCondition())) {
+            free(driver);
+            return false;
+        }
+        d->driver = driver;
+        d->repo = snx_strdup(app->data_dir);
+    }
+    SDL_LockMutex(d->lock);
+    for (i = 0; i < d->count && strcmp(d->dirs[i], dir); ++i) {}
+    if (i == d->count && d->count < GUI_DUMP_ASKS) {
+        d->dumps[d->count] = snx_strdup(dump);
+        d->dirs[d->count++] = snx_strdup(dir);
+        asked = true;
+        SDL_SignalCondition(d->wake);
+    }
+    SDL_UnlockMutex(d->lock);
+    return asked || i < d->count;
+}
+/* the asker's thread, answering from now on: the program's alone (tests answer with dump_icons_pass) */
+static void dump_icons_start(App* app) {
+    GuiDumpIcons* d = &app->dump_icons;
+    if (d->lock && !d->thread && !(d->thread = SDL_CreateThread(dump_icons_run, "dump icons", d)))
+        snprintf(app->message, sizeof app->message, snx_tr("The dumps' icons are not asked for (%s)"), SDL_GetError());
+}
+static void dump_icons_stop(App* app) {
+    GuiDumpIcons* d = &app->dump_icons;
+    int i;
+    __atomic_store_n(&d->stop, 1, __ATOMIC_RELAXED);
+    if (d->lock) {
+        SDL_LockMutex(d->lock);
+        SDL_SignalCondition(d->wake);
+        SDL_UnlockMutex(d->lock);
+    }
+    if (d->thread) SDL_WaitThread(d->thread, NULL);
+    for (i = 0; i < d->count; ++i) {
+        free(d->dumps[i]);
+        free(d->dirs[i]);
+    }
+    free(d->driver);
+    free(d->repo);
+    if (d->wake) SDL_DestroyCondition(d->wake);
+    if (d->lock) SDL_DestroyMutex(d->lock);
+    *d = (GuiDumpIcons){0};
+}
+/* the icon file of the game or dump at path, owned: a game's own icon.jpg (gui_game_icon); a dump's in its folder of
+   the cache, asked of the driver when it has neither it nor the driver's why, *loading then saying so. NULL while
+   there is none */
+static char* icon_file(App* app, const char* path, bool* loading) {
+    char *dir, *file, *why;
+    const char* leaf = path + strlen(path);
+    *loading = false;
+    while (leaf > path && leaf[-1] != '/' && leaf[-1] != '\\') --leaf;
+    if (!gui_is_dump(leaf)) return gui_game_icon(path);
+    if (!(dir = dump_icon_dir(app, path))) return NULL;
+    file = snx_path_join(dir, "icon.jpg");
+    why = snx_path_join(dir, "why.txt");
+    if (!snx_is_file(file)) {
+        if (!snx_is_file(why) && (*loading = dump_icon_ask(app, path, dir)) && app->dump_icons.live)
+            dump_icons_start(app);
+        free(file);
+        file = NULL;
+    }
+    free(why);
+    free(dir);
+    return file;
+}
+/* what a dump's row shows while its icon is asked for: three dots, grey on either theme's page */
+static SDL_Texture* icon_loading(App* app) {
+    static const int dots[3] = {34, 64, 94};
+    Uint32* pixels;
+    int x, y, i;
+    if (app->icon_loading) return app->icon_loading;
+    if (!(pixels = (Uint32*)calloc((size_t)GUI_ICON_SIDE * GUI_ICON_SIDE, sizeof *pixels))) return NULL;
+    for (i = 0; i < 3; ++i)
+        for (y = 54; y < 74; ++y)
+            for (x = dots[i] - 10; x < dots[i] + 10; ++x)
+                if ((x - dots[i]) * (x - dots[i]) + (y - 64) * (y - 64) <= 100)
+                    pixels[y * GUI_ICON_SIDE + x] = 0xff8a8a8au;
+    app->icon_loading = SDL_CreateTexture(app->renderer, SDL_PIXELFORMAT_ARGB8888, SDL_TEXTUREACCESS_STATIC,
+                                          GUI_ICON_SIDE, GUI_ICON_SIDE);
+    if (app->icon_loading && (!SDL_UpdateTexture(app->icon_loading, NULL, pixels, GUI_ICON_SIDE * 4) ||
+                              !SDL_SetTextureBlendMode(app->icon_loading, SDL_BLENDMODE_BLEND_PREMULTIPLIED))) {
+        SDL_DestroyTexture(app->icon_loading);
+        app->icon_loading = NULL;
+    }
+    free(pixels);
+    return app->icon_loading;
+}
 static SDL_Texture* game_icon(App* app, const char* path) {
     GuiIcon* icon;
     char* file;
     unsigned char* jpeg;
     void* pixels;
     size_t size = 0, i;
+    bool loading;
     for (i = 0; i < GUI_ICONS; ++i)
-        if (app->icons[i].path && !strcmp(app->icons[i].path, path)) return app->icons[i].texture;
+        if (app->icons[i].path && !strcmp(app->icons[i].path, path))
+            return app->icons[i].loading ? icon_loading(app) : app->icons[i].texture;
     icon = &app->icons[app->icons_next];
     app->icons_next = (app->icons_next + 1) % GUI_ICONS;
     free(icon->path);
     SDL_DestroyTexture(icon->texture);
-    *icon = (GuiIcon){snx_strdup(path), NULL};
-    file = gui_game_icon(path);
+    *icon = (GuiIcon){snx_strdup(path), NULL, false};
+    file = icon_file(app, path, &loading);
+    if (loading) {
+        icon->loading = true;
+        return icon_loading(app);
+    }
     jpeg = file ? snx_read_file(file, &size) : NULL;
     pixels = jpeg ? malloc((size_t)GUI_ICON_SIDE * GUI_ICON_SIDE * 4) : NULL;
     if (pixels && snx_splash_picture(jpeg, size, GUI_ICON_SIDE, 0, pixels, GUI_ICON_SIDE * 4))
@@ -2196,13 +2468,23 @@ static SDL_Texture* game_icon(App* app, const char* path) {
     free(file);
     return icon->texture;
 }
+/* the rows without an icon looked at again: the driver answered for a dump */
+static void icons_forget_none(App* app) {
+    size_t i;
+    for (i = 0; i < GUI_ICONS; ++i)
+        if (app->icons[i].path && !app->icons[i].texture) {
+            free(app->icons[i].path);
+            app->icons[i].path = NULL;
+            app->icons[i].loading = false;
+        }
+}
 /* every icon game_icon kept: drawn again from their files when shown, as a game's may have changed */
 static void icons_free(App* app) {
     size_t i;
     for (i = 0; i < GUI_ICONS; ++i) {
         free(app->icons[i].path);
         SDL_DestroyTexture(app->icons[i].texture);
-        app->icons[i] = (GuiIcon){NULL, NULL};
+        app->icons[i] = (GuiIcon){NULL, NULL, false};
     }
     app->icons_next = 0;
 }
@@ -4999,6 +5281,12 @@ static void pad_load_mappings(App* app) {
     free(path);
 }
 static void render(App* app);
+/* two Joy-Cons one pad, or two, as the games take them (gamepad_joycon_pair, 1 when not picked): before SDL's gamepads
+   start, which read it then */
+static void joycon_pairs(App* app) {
+    const char* pair = gui_settings_value(&app->settings, "gamepad_joycon_pair");
+    SDL_SetHint(SDL_HINT_JOYSTICK_HIDAPI_COMBINE_JOY_CONS, pair && !atoi(pair) ? "0" : "1");
+}
 /* the button map of map's row (row: what to come back to), A and B as swap's row says, for player (0: every one) */
 static void open_pad_on(App* app, int row, int map, int swap, int player) {
     leave_editor(app);
@@ -5012,11 +5300,7 @@ static void open_pad_on(App* app, int row, int map, int swap, int player) {
     app->pad.note[0] = 0;
     pad_start(app);
     render(app); /* SDL looks for pads for most of a second: the page shows first, saying so */
-    /* two Joy-Cons one pad, or two, as the games take them (gamepad_joycon_pair, 1 when not picked) */
-    {
-        const char* pair = gui_settings_value(&app->settings, "gamepad_joycon_pair");
-        SDL_SetHint(SDL_HINT_JOYSTICK_HIDAPI_COMBINE_JOY_CONS, pair && !atoi(pair) ? "0" : "1");
-    }
+    joycon_pairs(app);
     app->pads_read = SDL_InitSubSystem(SDL_INIT_GAMEPAD);
     if (!app->pads_read)
         snprintf(app->pad.note, sizeof app->pad.note, "Controllers cannot be read: %s", SDL_GetError());
@@ -6851,7 +7135,6 @@ static void recent_name(App* app, const char* label) {
     if (gui_recent_rename(&app->recent, app->file, named->detail)) recent_changed(app);
 }
 static void list_games(App* app);
-static uint64_t games_stamp(const App* app);
 /* back to the menu from a finished run, which fades in */
 static void leave_run(App* app) {
     app->finished = false;
@@ -7336,6 +7619,7 @@ static int aot_built(const App* app) {
         if (sscanf(app->steps.note[i].text, "AOT pack: %d", &n) == 1) return n;
     return -1;
 }
+static bool watch_get(App* app, uint64_t* stamp);
 static void pump(App* app) {
     keys_left(app);
     text_left(app);
@@ -7433,16 +7717,31 @@ static void pump(App* app) {
     }
     if (app->leaving_ms && now_ms(app) - app->leaving_ms >= app->theme.fade_out_ms) leave_run(app);
     if (app->closing_ms && now_ms(app) - app->closing_ms >= GUI_CLOSING_MS) app->menu.quit = true;
-    /* games put in or taken out of the folders while the menu is open, looked for once a second: Games and its list
-       follow, the list on the file it had */
-    if (!app->menu.running && !app->finished && now_ms(app) - app->games_checked >= 1000) {
-        app->games_checked = now_ms(app);
-        if (games_stamp(app) != app->games_stamp) {
-            app->games_stamp = games_stamp(app);
+    if (app->dump_icons.lock) { /* a dump's icon the driver answered: its row looks again */
+        unsigned answered;
+        SDL_LockMutex(app->dump_icons.lock);
+        answered = app->dump_icons.answered;
+        SDL_UnlockMutex(app->dump_icons.lock);
+        if (answered != app->dump_icons_seen) {
+            app->dump_icons_seen = answered;
+            icons_forget_none(app);
+        }
+    }
+    /* games put in or taken out of the folders while the menu is open, as the watcher's hash of them says: Games and
+       its list follow, the list on the file it had. The first hash after a listing is what the list holds, the same
+       as the one before it or not */
+    uint64_t stamp;
+    if (!app->menu.running && !app->finished && watch_get(app, &stamp) &&
+        (stamp != app->games_stamp || app->games_fresh)) {
+        bool fresh = app->games_fresh;
+        app->games_stamp = stamp;
+        app->games_fresh = false;
+        if (!fresh) {
             recent_as_games(app);
             if (app->menu.view == GUI_LOAD_GAMES) {
                 GuiBrowser was = app->browser;
                 list_games(app);
+                app->games_fresh = false; /* the hash it was listed by is this one, the folders the same */
                 app->browser.page = was.page;
                 app->browser.selected = was.selected;
                 gui_browser_resize(&app->browser, app->browser.page_size);
@@ -8226,20 +8525,21 @@ static size_t games_listed(const App* app) {
     for (i = 0; i < app->games.count; ++i) n += !gui_games_heading(&app->games, i);
     return n;
 }
-/* the names dir holds into h, and with depth those of its folders, down that many levels, hidden ones left alone */
-static uint64_t stamp_dir(uint64_t h, const char* dir, int depth) {
+/* the names dir holds into h, and with depth those of its folders, down that many levels, hidden ones left alone; it
+   ends where it is once *stop is set */
+static uint64_t stamp_dir(uint64_t h, const char* dir, int depth, const int* stop) {
     char** names = NULL;
     size_t count = 0, k;
     const char* c;
     if (!dir || snx_list_dir(dir, &names, &count)) count = (size_t)-1; /* none: not the same as an empty one */
-    for (k = 0; k < count && names; ++k) {
+    for (k = 0; k < count && names && !(stop && __atomic_load_n(stop, __ATOMIC_RELAXED)); ++k) {
         for (c = names[k];; ++c) {
             h = (h ^ (unsigned char)*c) * 1099511628211ull;
             if (!*c) break;
         }
         if (depth > 0 && names[k][0] != '.') {
             char* sub = snx_path_join(dir, names[k]);
-            if (sub && snx_is_dir(sub)) h = stamp_dir(h, sub, depth - 1);
+            if (sub && snx_is_dir(sub)) h = stamp_dir(h, sub, depth - 1, stop);
             free(sub);
         }
     }
@@ -8247,26 +8547,113 @@ static uint64_t stamp_dir(uint64_t h, const char* dir, int depth) {
     if (names) snx_free_strings(names, count);
     return h;
 }
-/* the names recompiled/ and the player's folders hold (a folder kept with its subfolders, theirs too), hashed: a game
-   put in, taken out or renamed changes it, and so does a folder that comes or goes */
-static uint64_t games_stamp(const App* app) {
+/* the names the folders hold (each down its depth), hashed: a game put in, taken out or renamed changes it, and so
+   does a folder that comes or goes */
+static uint64_t stamp_dirs(char* const* dirs, const int* depths, int count, const int* stop) {
     uint64_t h = 1469598103934665603ull; /* FNV-1a */
     int i;
-    char* dumps = app->data_dir ? snx_path_join(app->data_dir, "dumps") : NULL;
-    for (i = -1; i < app->folder_count; ++i)
-        h = stamp_dir(h, i < 0 ? app->games_dir : app->folders[i],
-                      i >= 0 && app->folders_deep[i] ? GUI_FOLDER_DEPTH : 0);
-    h = stamp_dir(h, dumps, GUI_FOLDER_DEPTH);
-    free(dumps);
-    dumps = games_old(app);
-    if (dumps) h = stamp_dir(h, dumps, 0);
-    free(dumps);
+    for (i = 0; i < count; ++i) h = stamp_dir(h, dirs[i], depths[i], stop);
     return h;
+}
+/* the folders Games lists, each owned (NULL none) with its depth: recompiled/, the player's (a folder kept with its
+   subfolders, theirs too), dumps/ and an older version's games/; how many */
+static int watch_dirs(const App* app, char** dirs, int* depths) {
+    int i, n = 0;
+    dirs[n] = app->games_dir ? snx_strdup(app->games_dir) : NULL;
+    depths[n++] = 0;
+    for (i = 0; i < app->folder_count; ++i) {
+        dirs[n] = snx_strdup(app->folders[i]);
+        depths[n++] = app->folders_deep[i] ? GUI_FOLDER_DEPTH : 0;
+    }
+    dirs[n] = app->data_dir ? snx_path_join(app->data_dir, "dumps") : NULL;
+    depths[n++] = GUI_FOLDER_DEPTH;
+    dirs[n] = games_old(app);
+    depths[n++] = 0;
+    return n;
+}
+/* the folders Games lists, handed to the watcher: their hash taken from its next look */
+static void watch_set(App* app) {
+    GuiWatch* w = &app->watch;
+    char* dirs[GUI_WATCH_DIRS];
+    int depths[GUI_WATCH_DIRS], n = watch_dirs(app, dirs, depths), i;
+    if (!w->lock && !(w->lock = SDL_CreateMutex())) {
+        snprintf(app->message, sizeof app->message, snx_tr("Games is not watched for new games (%s): F5 lists them"),
+                 SDL_GetError());
+        for (i = 0; i < n; ++i) free(dirs[i]);
+        return;
+    }
+    SDL_LockMutex(w->lock);
+    for (i = 0; i < w->count; ++i) free(w->dirs[i]);
+    memcpy(w->dirs, dirs, sizeof dirs);
+    memcpy(w->depths, depths, sizeof depths);
+    w->count = n;
+    ++w->set;
+    SDL_UnlockMutex(w->lock);
+}
+/* a look at the folders: their hash, kept unless they were handed again while it was taken */
+static void watch_pass(GuiWatch* w) {
+    char* dirs[GUI_WATCH_DIRS];
+    int depths[GUI_WATCH_DIRS], n, i;
+    unsigned set;
+    uint64_t h;
+    if (!w->lock) return;
+    SDL_LockMutex(w->lock);
+    for (i = n = 0; i < w->count; ++i, ++n) {
+        dirs[n] = w->dirs[i] ? snx_strdup(w->dirs[i]) : NULL;
+        depths[n] = w->depths[i];
+    }
+    set = w->set;
+    SDL_UnlockMutex(w->lock);
+    h = stamp_dirs(dirs, depths, n, &w->stop);
+    for (i = 0; i < n; ++i) free(dirs[i]);
+    SDL_LockMutex(w->lock);
+    if (w->set == set && !__atomic_load_n(&w->stop, __ATOMIC_RELAXED)) {
+        w->stamp = h;
+        w->stamped = set;
+    }
+    SDL_UnlockMutex(w->lock);
+}
+static int SDLCALL watch_run(void* data) {
+    GuiWatch* w = (GuiWatch*)data;
+    int i;
+    while (!__atomic_load_n(&w->stop, __ATOMIC_RELAXED)) {
+        watch_pass(w);
+        for (i = 0; i < 20 && !__atomic_load_n(&w->stop, __ATOMIC_RELAXED); ++i) SDL_Delay(50); /* a second */
+    }
+    return 0;
+}
+/* the last hash of the folders as last handed, when the watcher has one */
+static bool watch_get(App* app, uint64_t* stamp) {
+    GuiWatch* w = &app->watch;
+    bool got;
+    if (!w->lock) return false;
+    SDL_LockMutex(w->lock);
+    got = w->stamped && w->stamped == w->set;
+    *stamp = w->stamp;
+    SDL_UnlockMutex(w->lock);
+    return got;
+}
+/* the watcher's thread, looking from now on; without one Games follows its folders only by F5, said */
+static void watch_start(App* app) {
+    watch_set(app);
+    if (app->watch.lock && !(app->watch.thread = SDL_CreateThread(watch_run, "games", &app->watch)))
+        snprintf(app->message, sizeof app->message, snx_tr("Games is not watched for new games (%s): F5 lists them"),
+                 SDL_GetError());
+}
+static void watch_stop(App* app) {
+    GuiWatch* w = &app->watch;
+    int i;
+    __atomic_store_n(&w->stop, 1, __ATOMIC_RELAXED);
+    if (w->thread) SDL_WaitThread(w->thread, NULL);
+    for (i = 0; i < w->count; ++i) free(w->dirs[i]);
+    if (w->lock) SDL_DestroyMutex(w->lock);
+    *w = (GuiWatch){0};
 }
 static void list_games(App* app) {
     icons_free(app); /* a game made since has one now */
     games_scan(app, &app->games, app->message, sizeof app->message);
-    app->games_stamp = games_stamp(app);
+    app->games_fresh = true;
+    watch_set(app);
     memset(&app->browser, 0, sizeof(app->browser));
     app->browser.count = app->games.count;
     app->browser.head = games_head(app);
@@ -8528,39 +8915,56 @@ static const struct {
     const char* word;
     SDL_Keycode key;
     SDL_Keymod mod;
-} hint_keys[] = {{SNX_TR_KEY("ESC"), SDLK_ESCAPE, 0},
-                 {SNX_TR_KEY("Back"), SDLK_AC_BACK, 0},
-                 {SNX_TR_KEY("Tab"), SDLK_TAB, 0},
-                 {SNX_TR_KEY("Enter"), SDLK_RETURN, 0},
-                 {SNX_TR_KEY("Space"), SDLK_RETURN, 0},
-                 {SNX_TR_KEY("click"), SDLK_RETURN, 0},
-                 {SNX_TR_KEY("Tap"), SDLK_RETURN, 0},
-                 {SNX_TR_KEY("A"), SDLK_RETURN, 0},
-                 {SNX_TR_KEY("Up"), SDLK_UP, 0},
-                 {SNX_TR_KEY("Down"), SDLK_DOWN, 0},
-                 {SNX_TR_KEY("Left"), SDLK_LEFT, 0},
-                 {SNX_TR_KEY("Right"), SDLK_RIGHT, 0},
-                 {SNX_TR_KEY("PgUp"), SDLK_PAGEUP, 0},
-                 {SNX_TR_KEY("PgDn"), SDLK_PAGEDOWN, 0},
-                 {SNX_TR_KEY("PgDown"), SDLK_PAGEDOWN, 0},
-                 {SNX_TR_KEY("Swipe"), SDLK_PAGEDOWN, 0},
-                 {SNX_TR_KEY("Del"), SDLK_DELETE, 0},
-                 {SNX_TR_KEY("R"), SDLK_R, 0},
-                 {SNX_TR_KEY("Recompile"), SDLK_R, 0},
-                 {SNX_TR_KEY("B"), SDLK_B, 0},
-                 {SNX_TR_KEY("AOT pack"), SDLK_B, 0},
-                 {SNX_TR_KEY("M"), SDLK_M, 0},
-                 {SNX_TR_KEY("Ctrl+S"), SDLK_S, SDL_KMOD_CTRL},
-                 {SNX_TR_KEY("Ctrl+V"), SDLK_V, SDL_KMOD_CTRL},
-                 {SNX_TR_KEY("F5"), SDLK_F5, 0},
-                 {SNX_TR_KEY("F2"), SDLK_F2, 0},
-                 {SNX_TR_KEY("Refresh"), SDLK_F5, 0},
-                 {SNX_TR_KEY("Add a folder"), SDLK_UNKNOWN, 0}};
-/* the hint_keys entry of the n bytes at word, -1 for none */
-static int hint_word(const char* word, size_t n) {
+    bool pad; /* a pad's button (pad_menu.h's key), found first while a pad drives the menu and only then: B is ESC */
+} hint_keys[] = {{SNX_TR_KEY("A"), SDLK_RETURN, 0, true},
+                 {SNX_TR_KEY("B"), SDLK_ESCAPE, 0, true},
+                 {SNX_TR_KEY("X"), SDLK_DELETE, 0, true},
+                 {SNX_TR_KEY("Y"), SDLK_R, 0, true},
+                 {SNX_TR_KEY("Cross"), SDLK_RETURN, 0, true},
+                 {SNX_TR_KEY("Circle"), SDLK_ESCAPE, 0, true},
+                 {SNX_TR_KEY("Square"), SDLK_DELETE, 0, true},
+                 {SNX_TR_KEY("Triangle"), SDLK_R, 0, true},
+                 {SNX_TR_KEY("LB"), SDLK_TAB, SDL_KMOD_LSHIFT, true},
+                 {SNX_TR_KEY("RB"), SDLK_TAB, 0, true},
+                 {SNX_TR_KEY("LT"), SDLK_PAGEUP, 0, true},
+                 {SNX_TR_KEY("RT"), SDLK_PAGEDOWN, 0, true},
+                 {SNX_TR_KEY("Start"), SDLK_F5, 0, true},
+                 {SNX_TR_KEY("L3"), SDLK_M, 0, true},
+                 {SNX_TR_KEY("R3"), SDLK_B, 0, true},
+                 {SNX_TR_KEY("ESC"), SDLK_ESCAPE, 0, false},
+                 {SNX_TR_KEY("Back"), SDLK_AC_BACK, 0, false},
+                 {SNX_TR_KEY("Tab"), SDLK_TAB, 0, false},
+                 {SNX_TR_KEY("Enter"), SDLK_RETURN, 0, false},
+                 {SNX_TR_KEY("Space"), SDLK_RETURN, 0, false},
+                 {SNX_TR_KEY("click"), SDLK_RETURN, 0, false},
+                 {SNX_TR_KEY("Tap"), SDLK_RETURN, 0, false},
+                 {SNX_TR_KEY("A"), SDLK_RETURN, 0, false},
+                 {SNX_TR_KEY("Up"), SDLK_UP, 0, false},
+                 {SNX_TR_KEY("Down"), SDLK_DOWN, 0, false},
+                 {SNX_TR_KEY("Left"), SDLK_LEFT, 0, false},
+                 {SNX_TR_KEY("Right"), SDLK_RIGHT, 0, false},
+                 {SNX_TR_KEY("PgUp"), SDLK_PAGEUP, 0, false},
+                 {SNX_TR_KEY("PgDn"), SDLK_PAGEDOWN, 0, false},
+                 {SNX_TR_KEY("PgDown"), SDLK_PAGEDOWN, 0, false},
+                 {SNX_TR_KEY("Swipe"), SDLK_PAGEDOWN, 0, false},
+                 {SNX_TR_KEY("Del"), SDLK_DELETE, 0, false},
+                 {SNX_TR_KEY("R"), SDLK_R, 0, false},
+                 {SNX_TR_KEY("Recompile"), SDLK_R, 0, false},
+                 {SNX_TR_KEY("B"), SDLK_B, 0, false},
+                 {SNX_TR_KEY("AOT pack"), SDLK_B, 0, false},
+                 {SNX_TR_KEY("M"), SDLK_M, 0, false},
+                 {SNX_TR_KEY("Ctrl+S"), SDLK_S, SDL_KMOD_CTRL, false},
+                 {SNX_TR_KEY("Ctrl+V"), SDLK_V, SDL_KMOD_CTRL, false},
+                 {SNX_TR_KEY("F5"), SDLK_F5, 0, false},
+                 {SNX_TR_KEY("F2"), SDLK_F2, 0, false},
+                 {SNX_TR_KEY("Refresh"), SDLK_F5, 0, false},
+                 {SNX_TR_KEY("Add a folder"), SDLK_UNKNOWN, 0, false}};
+/* the hint_keys entry of the n bytes at word, a pad's buttons' only when pad (a pad drives the menu), -1 for none */
+static int hint_word(const char* word, size_t n, bool pad) {
     int i;
     for (i = 0; i < (int)SDL_arraysize(hint_keys); ++i) {
         const char* shown = snx_tr(hint_keys[i].word);
+        if (hint_keys[i].pad && !pad) continue;
         if ((strlen(hint_keys[i].word) == n && !strncmp(hint_keys[i].word, word, n)) ||
             (strlen(shown) == n && !strncmp(shown, word, n)))
             return i;
@@ -8577,13 +8981,13 @@ static int text_cols(const char* s, size_t n) {
 /* the hint_keys entry a click or a tap col columns into the foot's sentence of key (hints()) presses, -1 for none: the
    word of key it is on, the slash after a word its own and the margin before the first's; the sentence's text, and the
    margin after it, what every word does when they all do one thing */
-static int hint_pick(const char* key, int col) {
+static int hint_pick(const char* key, int col, bool pad) {
     const char *word = key, *end;
     int k = gui_text_cols(key), pick = -1, first = 1, w;
     for (;; word = end + 1) {
         end = strchr(word, '/');
         if (!end) end = word + strlen(word);
-        w = hint_word(word, (size_t)(end - word));
+        w = hint_word(word, (size_t)(end - word), pad);
         if (col < k && col <= text_cols(key, (size_t)(end - key))) {
             pick = w;
             break;
@@ -8600,7 +9004,7 @@ static int hint_pick(const char* key, int col) {
 }
 /* the key it picks pressed, as on the keyboard; whether there was one */
 static bool hint_press(App* app, const char* key, int col) {
-    int pick = hint_pick(key, col);
+    int pick = hint_pick(key, col, app->pad_driven);
     SDL_Event e;
     if (pick < 0) return false;
     if (hint_keys[pick].key == SDLK_UNKNOWN) { /* Add a folder: on Folders to the focused row's library */
@@ -8948,7 +9352,86 @@ static bool files_key(App* app, SDL_Keycode code) {
         default: return false;
     }
 }
+#define GUI_PAD_TRAVEL 8.0f /* the pixels a mouse moves before it takes the menu back from a pad */
+/* the pages that read the pads themselves: the button map, and a Controller row waiting for a press */
+static bool pads_own(const App* app) { return app->device_listen || (app->editing && app->form == GUI_FORM_PAD); }
+/* a pad pressed last, or the keyboard, the mouse or a finger: the cursor shows for the mouse alone */
+static void pad_drive(App* app, bool pad) {
+    if (pad == app->pad_driven) return;
+    app->pad_driven = pad;
+    app->pointer_travel = 0;
+    if (pad) {
+        app->hovering = false;
+        SDL_HideCursor();
+    } else
+        SDL_ShowCursor();
+}
+/* which of them e is, a key or the mouse moving before it is taken: false, or true for a mouse moving too little to
+   take the menu back from a pad, which then moves nothing. A click, a wheel or a finger lifted takes it back after
+   (pointer_leaves), so it presses what the foot showed under it */
+static bool input_seen(App* app, const SDL_Event* e) {
+    switch (e->type) {
+        case SDL_EVENT_GAMEPAD_BUTTON_DOWN: pad_drive(app, true); break;
+        case SDL_EVENT_KEY_DOWN:
+            if (e->key.which != GUI_PAD_KEYBOARD) pad_drive(app, false);
+            break;
+        case SDL_EVENT_MOUSE_MOTION:
+            if (!app->pad_driven) break;
+            app->pointer_travel += SDL_fabsf(e->motion.xrel) + SDL_fabsf(e->motion.yrel);
+            if (app->pointer_travel < GUI_PAD_TRAVEL) return true;
+            pad_drive(app, false);
+            break;
+        default: break;
+    }
+    return false;
+}
+/* a pad's event: the key it presses taken as the keyboard's, but by the pages that read the pads themselves, which
+   take the event as it is; whether it was taken here */
+static bool pads_event(App* app, const SDL_Event* e) {
+    SDL_Event key;
+    bool pressed = gui_pads_event(&app->pads, e, now_ms(app), &key);
+    if (pressed) pad_drive(app, true); /* a stick or a trigger too */
+    if (!pressed || pads_own(app)) return false;
+    event(app, &key);
+    return true;
+}
+/* SDL could not start the menu's pads: why, from SDL */
+static void pads_fail(App* app) {
+    app->pads_failed = true;
+    snprintf(app->pads_error, sizeof app->pads_error, snx_tr("Controllers cannot be read: %s"), SDL_GetError());
+}
+/* the menu's pads open until a run's game loads (its LAUNCH), as the game may want them: a pad stops a recompile
+   too. The first time once the menu shows, as SDL may take most of a second looking for them */
+static void pads_follow(App* app) {
+    if (app->menu.running && gui_steps_last(&app->steps, "LAUNCH")) {
+        gui_pads_stop(&app->pads);
+        return;
+    }
+    if (!app->pads.started && !app->pads_failed) {
+        joycon_pairs(app);
+        if (gui_pads_start(&app->pads))
+            pad_load_mappings(app);
+        else
+            pads_fail(app);
+    }
+    if (app->pads_failed) say_failure(app, app->pads_error); /* each frame until the box can show it, then once */
+}
+/* the arrow or the page a pad holds pressed again */
+static void pads_repeat(App* app) {
+    SDL_Event key;
+    if (!pads_own(app) && gui_pads_repeat(&app->pads, now_ms(app), &key)) event(app, &key);
+}
+static bool pointer_leaves(const SDL_Event* e) {
+    return e->type == SDL_EVENT_MOUSE_BUTTON_DOWN || e->type == SDL_EVENT_MOUSE_WHEEL ||
+           e->type == SDL_EVENT_FINGER_UP || e->type == SDL_EVENT_PEN_UP;
+}
+static void event_take(App* app, const SDL_Event* e);
 static void event(App* app, const SDL_Event* e) {
+    if (input_seen(app, e) || pads_event(app, e)) return;
+    event_take(app, e);
+    if (pointer_leaves(e)) pad_drive(app, false);
+}
+static void event_take(App* app, const SDL_Event* e) {
     GuiKey key;
     /* the window closed: asked first while a run goes, unless it asks already; else the screen of what is kept */
     if (e->type == SDL_EVENT_QUIT || e->type == SDL_EVENT_WINDOW_CLOSE_REQUESTED) {
@@ -9320,6 +9803,9 @@ static void forget(App* app) {
     gui_android_ran(NULL); /* the run goes with the menu */
 #endif
     gui_process_destroy(app->process);
+    watch_stop(app);
+    dump_icons_stop(app);
+    SDL_DestroyTexture(app->icon_loading);
     space_stop(app);
     space_end(&app->left_space, &app->left_counter);
     settings_forget(app);
@@ -9373,6 +9859,7 @@ static void forget(App* app) {
 }
 static void cleanup(App* app) {
     forget(app);
+    gui_pads_stop(&app->pads);
     SDL_Quit();
 }
 /* the settings, its picks and its game folders in a file each */
@@ -9460,8 +9947,10 @@ int snx_gui_main(const char* self) {
     }
     open_files(&app); /* here, not in initialize(), so the tests keep their own */
     setup_start(&app);
-    app.games_stamp = games_stamp(&app);
-    space_start(&app); /* the footer's disk */
+    app.games_fresh = true;
+    watch_start(&app);
+    app.dump_icons.live = true; /* the dumps' icons asked on a thread of their own */
+    space_start(&app);          /* the footer's disk */
     left_behind(&app);
     app.left_shown = app.lefts > 0;
     splash_start(&app);
@@ -9472,11 +9961,13 @@ int snx_gui_main(const char* self) {
         if (app.hidden && !app.menu.running && SDL_WaitEvent(&e)) event(&app, &e);
 #endif
         while (SDL_PollEvent(&e)) event(&app, &e);
+        pads_repeat(&app);
         pump(&app);
 #ifdef SDL_PLATFORM_ANDROID
         if (!app.hidden)
 #endif
             render(&app);
+        pads_follow(&app);
         SDL_Delay(16);
     }
     cleanup(&app);
