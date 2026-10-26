@@ -81,6 +81,13 @@ static int nn_account_IAccountServiceForApplication_GetProfile(SvcObj* self, con
     *profile = acc_for_user(nn_account_profile_IProfile_new_data(g_hle.acc.users, g_hle.acc.user_next, "acc profiles and managers"), uid);
     R_SUCCEED();
 }
+/* both games and applets may register a user, as Eden's ProfileManager::CanSystemRegisterUser answers */
+static int nn_account_IAccountServiceForApplication_IsUserRegistrationRequestPermitted(SvcObj* self, u64 pid,
+                                                                                      u8* permitted) {
+    (void)self, (void)pid;
+    *permitted = 1;
+    R_SUCCEED();
+}
 /* with one user, that user, chosen without asking; with more, none, and the game asks the user selector (am.c),
    which answers the user the game plays as */
 static int nn_account_IAccountServiceForApplication_TrySelectUserWithoutInteractionDeprecated(
@@ -116,6 +123,12 @@ static int nn_account_IAccountServiceForApplication_ListOpenContextStoredUsers(S
 static int nn_account_IAccountServiceForApplication_ListQualifiedUsers(SvcObj* self, IpcBuf users) {
     (void)self;
     acc_list_all(users);
+    R_SUCCEED();
+}
+/* the game's own control.nacp says whether switching users is locked (Eden reads the same NACP field) */
+static int nn_account_IAccountServiceForApplication_IsUserAccountSwitchLocked(SvcObj* self, u8* locked) {
+    (void)self;
+    *locked = am_user_account_switch_lock() ? 1 : 0;
     R_SUCCEED();
 }
 
@@ -168,7 +181,7 @@ static void acc_picture_write(void* closure, void* data, int size) {
 /* the picture's size, drawing it the first time; 0, said once, when it cannot be drawn */
 static u32 acc_picture(void) {
     u32 size;
-    pm_lock(&g_hle.acc.pic.lk);
+    pm_lock(&g_host.acc.pic_lk);
     if (!g_hle.acc.pic.made) {
         g_hle.acc.pic.made = 1;
         if (snx_splash_jpeg("wimsy-fuddles", SNX_ACC_PICTURE_SIDE, SNX_ACC_PICTURE_QUALITY, acc_picture_write, NULL) ||
@@ -178,7 +191,7 @@ static u32 acc_picture(void) {
         }
     }
     size = g_hle.acc.pic.size;
-    pm_unlock(&g_hle.acc.pic.lk);
+    pm_unlock(&g_host.acc.pic_lk);
     return size;
 }
 /* GetImageSize tells the size LoadImage writes, so a game reserves what it gets: the user's own picture
@@ -203,6 +216,16 @@ static int nn_account_baas_IManagerForApplication_GetAccountId(SvcObj* self, nn_
     const AccUser* u = (const AccUser*)self->data;
     *id = u->uid[0] ^ u->uid[1];
     R_SUCCEED();
+}
+static int nn_account_baas_IManagerForApplication_GetNintendoAccountUserResourceCacheForApplication(SvcObj* self,
+                                                                                                   IpcBuf base,
+                                                                                                   IpcBuf extra,
+                                                                                                   u64* id) {
+    memset(GP(base.addr), 0, (size_t)base.size);
+    memset(GP(extra.addr), 0, (size_t)extra.size);
+    /* the online account's id (`NintendoAccountId`), which a console keeps apart from the network service account's:
+       the same one here, as there is no account behind either */
+    return nn_account_baas_IManagerForApplication_GetAccountId(self, id);
 }
 static int nn_account_baas_IManagerForApplication_EnsureIdTokenCacheAsync(SvcObj* self, SvcObj** context) {
     (void)self;

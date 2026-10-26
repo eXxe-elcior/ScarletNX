@@ -6,7 +6,7 @@
 
 Discord: https://discord.gg/tRTRXXbyjp (my god why don't we just use IRC like good people?)
 
-A GPLv3 static ARM64 to x86 recompiler with a Switch translation layer for Linux, Windows, FreeBSD and Android.
+A GPLv3 static ARM64 to x86 recompiler with a Switch, GBA and GNU/Linux ABI translation layer for Solaris, Linux, Windows, FreeBSD and Android.
 
 ## Quick start
 
@@ -25,7 +25,7 @@ and [ScarletNX-android-universal.apk](https://github.com/scarletnx/nightly/relea
 Games need a Vulkan 1.3 driver.
 
 Keys and games must be dumped from your own console. Started with no arguments, the program opens the
-[launcher](docs/GUI.md). **Setup device keys** installs your `prod.keys`. For NSPs, also put `title.keys` in
+[launcher](docs/GUI.md). **Install Keys** installs your `prod.keys`. For NSPs, also put `title.keys` in
 `~/.switch` (`%USERPROFILE%\.switch` on Windows). **Load Switch NSP/XCI/NRO** then picks a dump, extracts and
 recompiles it and starts the game, which the **Games** tab lists from then on. See [Usage](docs/USAGE.md) for the
 command line and [Folders](docs/USAGE.md#folders) for where games, saves and settings go.
@@ -43,9 +43,12 @@ build/gnuabi/scarletnx-gnuabi -L /path/to/aarch64-sysroot ./test_aarch64
 It runs static and dynamically linked programs, which start other processes, talk
 through pipes and read and write files through a sysroot, as QEMU's `-L` gives one
 (`linux/` of the data folder by default). See [Linux ABI execution and QEMU validation](docs/GNUABI.md)
-for the sysroot, the JIT and AOT modes, supported syscalls, and current limits. The NX executable is
-also installed as `scarletnx-switch`, and on Linux and macOS as `scarletnx-3ds` and `scarletnx-gnuabi`, the one
-program running the driver its name says.
+for the sysroot, the JIT and AOT modes, supported syscalls, and current limits. Every driver a build has is part
+of one program, `scarletnx`, which runs the driver its name says. On Linux and macOS `scarletnx-switch`,
+`scarletnx-3ds`, `scarletnx-vita`, `scarletnx-gnuabi` and `scarletnx-agb` are links to it. On Windows, which has no
+links, the driver's name goes first instead (`scarletnx.exe scarletnx-3ds Game.cia`), as the launcher runs them.
+Game Boy Advance ROMs run under the `scarletnx-agb` system type,
+on the emulated AGB board being built under `src/agb/` (licensed under MPL-2.0), see [AGB board](docs/AGB.md).
 
 The recompiler is also a library on its own, `libscarletnx-recompiler`: a program hands
 it ARM64 or AArch32 code in memory and runs the result in its own process with its own
@@ -93,8 +96,11 @@ Enter or hover and click, then choose drag-and-drop or the paginated `games/` br
 The GUI shows live driver/game
 output and combined CPU/RAM usage. See [GUI launcher](docs/GUI.md).
 
-The experimental `scarletnx-3ds` driver and **Load 3DS CIA** menu entry support
-decrypted application CIA extraction (`scarletnx-3ds -x game.cia`) and an independent
+The experimental `scarletnx-3ds` driver and **Load 3DS game** menu entry support
+encrypted or decrypted application CIAs (`scarletnx-3ds -x game.cia`), cartridge
+images (`game.cci`, `game.3ds`), bare NCCHs (`game.cxi`), a bundle or a z3ds
+compressed game of any of them, an update partition
+played as the update, and an independent
 page-based memory controller. It runs the extracted titles through an experimental
 **extract -> offline AOT -> native run** pipeline on 64-bit Linux and Windows, using an
 explicit ARM11/checked-memory profile without changing shared A57 defaults.
@@ -102,6 +108,11 @@ The homebrew SuperTux draws its title and loading screens with a software port o
 Azahar's PICA pipeline and plays its music through a port of Azahar's HLE DSP.
 It is not playable yet: there is no input, the bottom screen is not shown, and parts of the OS are missing.
 See the [3DS port](docs/3DS.md) for limits, build instructions and the parity roadmap.
+
+The experimental `scarletnx-vita` driver and **Load Vita VPK** menu entry run PS Vita homebrew VPKs through the same
+**extract -> offline AOT -> native run** pipeline, compiling code it missed at run time. It draws sceGxm's scenes
+on Vulkan with a port of Vita3K's shader translator. The Lua Vita Tester draws its screen, reads input and plays sound.
+See the [Vita driver](docs/VITA.md) for what it covers.
 
 For more detailed information please see: [Build + run](./docs/BUILD.md). For the Android app (arm64 and x86_64),
 see [Android](./docs/ANDROID.md). macOS and iOS build in CI. An iPhone prepares and runs a game by itself, and no game
@@ -112,9 +123,10 @@ runs on macOS yet: see [macOS and iOS](./docs/APPLE.md). Every document: [docs](
 - yuzu, Suyu, Torzu, Ryujinx, [Ryubing](https://git.ryujinx.app/ryubing/ryujinx) (Ryujinx's continuation), [Citron](https://git.citron-emu.org/citron/emulator) and [Eden](https://git.eden-emu.dev/eden-emu/eden).
 - [Atmosphère](https://github.com/Atmosphere-NX/Atmosphere)
 - LibHac.
-- MZ Labs for SwitchRecomp, which we started from. Its code has since been replaced by our own.
 - [NeXium](https://nexium-emu.org/) for research and development.
 - [Switchbrew](https://switchbrew.org) for research.
 - [Azahar](https://github.com/azahar-emu/azahar) and Citra, for all of the 3DS emulation.
+- [Vita3K](https://github.com/Vita3K/Vita3K), for the PS Vita's GXM and shader translation, and [vita-headers](https://github.com/vitasdk/vita-headers) for its NIDs.
+- [mGBA](https://github.com/mgba-emu/mgba) as a direct reference for the AGB board.
 
 Wimsy, the mascot and the runtime's icon (`dist/wimsy.svg`) was drawn by Liz.

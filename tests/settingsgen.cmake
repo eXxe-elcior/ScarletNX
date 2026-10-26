@@ -50,6 +50,17 @@ setting Plain
     key plain
     int 0 1
     default 0
+setting Both
+    key both
+    int 0 1
+    default 1
+    recompile
+setting Two hosts
+    key two_hosts
+    int 0 9
+    default 1
+    default-if HOST_A 2
+    default-if HOST_B 3
 setting ${long_name}
     key long
     text 4
@@ -84,6 +95,25 @@ if(NOT errors MATCHES "^[^\n]*settings.txt:[0-9]+: @NoSuchOption is no pass of t
 endif()
 file(READ "${WORK}/out/settings_llvm.c" llvm)
 file(READ "${WORK}/out/snx_settings.h" header)
+# a setting with two default-ifs: the first that holds, else its default, for g_settings and the table's row
+file(READ "${WORK}/out/settings.c" values)
+foreach(what INIT DEF)
+    if(what STREQUAL INIT)
+        set(text "${values}")
+        set(a 2)
+        set(b 3)
+        set(c 1)
+    else()
+        file(READ "${WORK}/out/settings_test.c" text)
+        set(a "\"2\"")
+        set(b "\"3\"")
+        set(c "\"1\"")
+    endif()
+    string(FIND "${text}" "#if defined(HOST_A)\n#define SETTING_${what}_two_hosts ${a}\n#elif defined(HOST_B)\n#define SETTING_${what}_two_hosts ${b}\n#else\n#define SETTING_${what}_two_hosts ${c}\n#endif" at)
+    if(at LESS 0)
+        message(FATAL_ERROR "SETTING_${what}_two_hosts is not HOST_A's, else HOST_B's, else the default:\n${text}")
+    endif()
+endforeach()
 # each setter found, with its argument cast to the type the header declares, and the setting its @ID names
 foreach(line "LLVMPassBuilderOptionsSetLoopVectorization(options, (LLVMBool)s->loop_vectorization)"
              "LLVMPassBuilderOptionsSetSLPVectorization(options, (LLVMBool)s->llvm_slp_vectorization)"
@@ -132,6 +162,17 @@ foreach(row "{\"llvm_inliner_threshold\", NULL, \"How large a function the inlin
         message(FATAL_ERROR "settings_launch.c lacks the row ${row}:\n${launch}")
     endif()
 endforeach()
+# a game's setting the recompile takes too: its row in the game's table and in the recompiler's file's own
+foreach(file launch runtime)
+    string(FIND "${${file}}" "{\"both\", \"1\", NULL, INI_INT, 0, &g_settings.both, 0, 1, NULL, \"Both\"" at)
+    if(at LESS 0)
+        message(FATAL_ERROR "the ${file} file lacks the row of both:\n${${file}}")
+    endif()
+endforeach()
+string(FIND "${launch}" "const IniOpt g_recompile_game_ini[] = {\n    {\"both\"" at)
+if(at LESS 0)
+    message(FATAL_ERROR "settings_launch.c has no g_recompile_game_ini with both:\n${launch}")
+endif()
 # the long ones, whole: the member of the 1100-letter name (its words joined by _), the long setter's key and name
 string(REPEAT "abcdefghij_" 110 long_member)
 string(REGEX REPLACE "_$" "" long_member "${long_member}")

@@ -22,6 +22,7 @@ void vk_wait_submit(u64);
 void vk_compute_wait(u64);
 void vk_gfx_image_land(void);
 void vk_gfx_image_put_aside(void);
+void vk_rt_publish_linear(void);
 int vk_gfx_image_in_flight(int unsubmitted);
 u64 vk_compute_put_aside(void);
 int vk_buf_pending_any(void);
@@ -54,7 +55,11 @@ static u64 next_compute, next_graphics = 1, waited_compute, waited_graphics;
 static int pending, unsubmitted, landing_probe, other_pending;
 static u32 completed[128];
 static u8 memory[0x8000];
+/* the guest address space is that memory: vk_write_changed refuses to compare bytes inside it */
+u8* g_mem = memory;
+u64 g_as_size = sizeof memory;
 static u64 mapping = 4096;
+static int writeback_direct;
 void pm_lock(PMutex* m) { (void)m; }
 void pm_unlock(PMutex* m) { (void)m; }
 void pc_init(PCond* c) { (void)c; }
@@ -137,9 +142,8 @@ int gmem_write(u64 address, const void* data, u64 size) {
     return 1;
 }
 u8* gmem_ptr(u64 address, u64 size) {
-    (void)address;
     (void)size;
-    return NULL;
+    return writeback_direct ? memory + gmmu_translate(address) : NULL;
 }
 int gmem_read(u64 address, void* data, u64 size) {
     vk_release_need(address, size);
@@ -174,6 +178,7 @@ void vk_compute_wait(u64 gate) {
 }
 void vk_gfx_image_land(void) {}
 void vk_gfx_image_put_aside(void) {}
+void vk_rt_publish_linear(void) {}
 int vk_gfx_image_in_flight(int unsubmitted) {
     (void)unsubmitted;
     return 0;
@@ -244,6 +249,44 @@ void vk_query_pred_drop(u32 slot) {
 u64 vk_last_submit(void) { return next_graphics; }
 u64 vk_submit_number(void) { return next_graphics + 1; }
 
+/* Compare both mapping paths against the byte merge rule, including chunk
+ * boundaries, dense writes, unchanged output and intervening CPU writes.
+ */
+static void check_writeback_merge(void)
+{
+	u8 original[4099], result[4099], current[4099], expected[4099];
+	u32 state = 0x734fd21u;
+	const u32 lengths[] = {0, 1, 7, 8, 9, 1023, 1024, 1025, 2049, 4099};
+
+	mapping = 4096;
+	for (int direct = 0; direct < 2; direct++) {
+		writeback_direct = direct;
+		for (u32 pass = 0; pass < 32; pass++) {
+			for (u32 i = 0; i < sizeof original; i++) {
+				state = state * 1664525u + 1013904223u;
+				original[i] = (u8)(state >> 24);
+				result[i] = pass == 0 || (state & 3) ? original[i] : (u8)(original[i] ^ 0x5a);
+				current[i] = state & 8 ? original[i] : (u8)(original[i] ^ 0xa5);
+				if (pass == 1) result[i] = (u8)(original[i] ^ 0xff);
+				expected[i] = result[i] != original[i] && current[i] == original[i]
+					      ? result[i] : current[i];
+			}
+			for (u32 k = 0; k < sizeof lengths / sizeof *lengths; k++) {
+				u32 n = lengths[k];
+
+				memcpy(memory + mapping, current, sizeof current);
+				vk_lock();
+				vk_write_changed(0x31000, result, original, n);
+				vk_unlock();
+				assert(!memcmp(memory + mapping, expected, n));
+				assert(!memcmp(memory + mapping + n, current + n, sizeof current - n));
+				assert(!vk_result_landing());
+			}
+		}
+	}
+	writeback_direct = 0;
+}
+
 int main(void) {
     pending = 1;
     next_compute = 9;
@@ -265,8 +308,12 @@ int main(void) {
     assert(memory[4096] == 13 && memory[1] == 0);
     pending = 0;
     value = 17;
-    vk_release_write(0x10000, &value, 1); /* immediate writes hold the mapping lock */
-    assert(memory[1] == 17 && payload_writes == 4);
+    /* with no work before it, the release waits only for the stream to stop (the commands after it read guest memory
+       first), then goes at once, holding the mapping lock */
+    vk_release_write(0x10000, &value, 1);
+    assert(memory[1] == 0 && payload_writes == 3 && g_rhead == g_rtail + 1);
+    vk_release_submit();
+    assert(memory[1] == 17 && payload_writes == 4 && g_rhead == g_rtail);
     pending = 1;
     vk_release_incr(5);
     vk_release_retire(5);
@@ -377,5 +424,6 @@ int main(void) {
     vk_release_drain();
     assert(!g_rix[home].word && !g_rix[(home + 1) & (RIX_N - 1)].word && count_queued(0x37ab4) == -1);
     assert(lock_depth == 0 && events_signaled == 3 && !events_due); /* payload writes signal nothing */
+	check_writeback_merge();
     return 0;
 }

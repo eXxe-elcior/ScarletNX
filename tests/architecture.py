@@ -14,8 +14,10 @@ BOUNDARIES = {
     'nx': {'nx', 'common'},
     'gnuabi': {'gnuabi', 'common'},
     '3ds': {'3ds', 'common'},
-    # scarletnx's main where it is also the other drivers (SNX_MULTICALL): their entries, by the name it runs under
-    'multicall': {'multicall', 'nx', 'gnuabi', '3ds', 'common'},
+    'vita': {'vita', 'common'},
+    'agb': {'agb', 'common'},
+    # scarletnx's main, every driver the build has: their entries, by the name it runs under
+    'multicall': {'multicall', 'nx', 'gnuabi', '3ds', 'vita', 'agb', 'gui', 'common'},
 }
 INCLUDE = re.compile(r'^\s*#\s*include\s*(["<])([^">]+)[">]', re.MULTILINE)
 
@@ -88,13 +90,44 @@ def check_graph(graph):
     for owner, forbidden in (
         (
             'scarletnx-common',
-            ('scarletnx-nx', 'scarletnx-gnuabi', 'scarletnx-3ds', 'snx_ctr_board', 'snx_ctr_memory', 'snx_ctr_loader'),
+            (
+                'scarletnx-nx',
+                'scarletnx-gnuabi',
+                'scarletnx-3ds',
+                'scarletnx-agb',
+                'snx_ctr_board',
+                'snx_ctr_memory',
+                'snx_ctr_loader',
+            ),
         ),
-        ('scarletnx-nx', ('scarletnx-gnuabi', 'scarletnx-3ds', 'snx_ctr_board', 'snx_ctr_memory', 'snx_ctr_loader')),
-        ('scarletnx-gnuabi', ('scarletnx-nx', 'scarletnx-3ds', 'snx_ctr_board', 'snx_ctr_memory', 'snx_ctr_loader')),
-        ('scarletnx-3ds', ('scarletnx-nx', 'scarletnx-gnuabi', 'snx_driver', 'snx_nx_module')),
-        ('snx_ctr_program', ('scarletnx-nx', 'scarletnx-gnuabi', 'snx_driver', 'snx_nx_module')),
-        ('snx_gnuabi_program', ('scarletnx-nx', 'scarletnx-3ds', 'snx_ctr_board', 'snx_ctr_memory', 'snx_ctr_loader')),
+        (
+            'scarletnx-nx',
+            ('scarletnx-gnuabi', 'scarletnx-3ds', 'scarletnx-agb', 'snx_ctr_board', 'snx_ctr_memory', 'snx_ctr_loader'),
+        ),
+        (
+            'scarletnx-gnuabi',
+            ('scarletnx-nx', 'scarletnx-3ds', 'scarletnx-agb', 'snx_ctr_board', 'snx_ctr_memory', 'snx_ctr_loader'),
+        ),
+        ('scarletnx-3ds', ('scarletnx-nx', 'scarletnx-gnuabi', 'scarletnx-agb', 'snx_driver', 'snx_nx_module')),
+        (
+            'scarletnx-agb',
+            (
+                'scarletnx-nx',
+                'scarletnx-gnuabi',
+                'scarletnx-3ds',
+                'snx_ctr_board',
+                'snx_ctr_memory',
+                'snx_ctr_loader',
+                'snx_driver',
+                'snx_nx_module',
+            ),
+        ),
+        ('snx_ctr_program', ('scarletnx-nx', 'scarletnx-gnuabi', 'scarletnx-agb', 'snx_driver', 'snx_nx_module')),
+        ('snx_agb_program', ('scarletnx-nx', 'scarletnx-gnuabi', 'scarletnx-3ds', 'snx_driver', 'snx_nx_module')),
+        (
+            'snx_switch_program',
+            ('scarletnx-gnuabi', 'scarletnx-3ds', 'scarletnx-agb', 'snx_ctr_board', 'snx_ctr_memory', 'snx_ctr_loader'),
+        ),
         ('snx_ctr_board', ('scarletnx-nx', 'scarletnx-gnuabi')),
         ('snx_ctr_memory', ('scarletnx-nx', 'scarletnx-gnuabi')),
         ('snx_ctr_loader', ('scarletnx-nx', 'scarletnx-gnuabi', 'snx_driver', 'snx_nx_module')),
@@ -110,7 +143,7 @@ def check_graph(graph):
         for target in forbidden:
             if target in dependencies:
                 errors.append(f'{owner} transitively links forbidden target {target}')
-        if owner in ('scarletnx-common', 'scarletnx-gnuabi', 'snx_gnuabi_program'):
+        if owner in ('scarletnx-common', 'scarletnx-gnuabi', 'scarletnx-agb'):
             for target in dependencies:
                 if re.search(
                     r'(?:^|[-_:])(gpu|maxwell|vulkan|volk|glslang|sdl3|ffmpeg|spirv)(?:$|[-_:])', target, re.IGNORECASE
@@ -267,7 +300,7 @@ def check_target_sources(repo, build):
                 'scarletnx-common': 'common',
                 'scarletnx-nx': 'nx',
                 'scarletnx-gnuabi': 'gnuabi',
-                'scarletnx-gnuabi-run': 'gnuabi',
+                'scarletnx-agb': 'agb',
             }.get(entry['name'])
             target = json.loads((reply / entry['jsonFile']).read_text(encoding='utf-8'))
             directory = (repo / target.get('paths', {}).get('source', '')).resolve()

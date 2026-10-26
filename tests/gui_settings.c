@@ -20,17 +20,18 @@ static const char list[] =
     "Display\tdocked\t1\tint\t0\t1\t1 = TV mode\t\t0=0|1=1\n"
     "Display\tfullscreen\t0\tint\t0\t1\t1 = start in fullscreen\t\t0=0|1=1\r\n"
     "Display\tlanguage\t1\tint\t-2.14748e+09\t2.14748e+09\tGame language: 0 Japanese\t\t\n"
-    "Graphics\tresolution\t1\tfloat\t0.25\t4\tInternal 3D resolution\t\t\n"
+    "Graphics\tresolution\t1\tfloat\t0.25\t16\tInternal 3D resolution\t\t\n"
     "Graphics\tanisotropy\t0\tint\t0\t16\tTexture filtering at an angle\t\t"
     "0=0|1=1|2=2|3=3|4=4|5=5|6=6|7=7|8=8|9=9|10=10|11=11|12=12|13=13|14=14|15=15|16=16\n"
-    "Graphics\told\t0\tint\t0\t1\tAn older runtime's line\n"
+    "Graphics\told\t0\ttext\t0\t1\tAn older runtime's line\n"
     "Graphics\tbroken\t0\tint\t0\t1\tA value without its word\t\t0|1=On\n"
     "settings: not a setting\n"
     "On-screen controls\tcontrols\t0\tint\t0\t1\tThe on-screen controls\tShow controls\t0=Off|1=On\n"
-    "On-screen controls\ttouch\t2\tint\t0\t2\tThe game's touch screen\tTouch screen\t0=Off|1=Fingers|2=Mouse too\n"
+    "On-screen controls\ttouch\t2\tint\t0\t2\tThe game's touch screen\tTouch screen\t0=Off|1=Fingers|2=Fingers and mouse\n"
     "On-screen controls/Buttons\tcontrols_a_shown\t\tint\t0\t1\tA control drawn\tA\t0=Hidden|1=Shown\n"
     "On-screen controls/Buttons\tcontrols_b_shown\t\tint\t0\t1\tA control drawn\tB\t0=Hidden|1=Shown\n"
     "Controllers\tgamepad_rumble\t100\tint\t0\t100\tHow strongly\tVibration\t0=Off|50=50%|100=100%\n"
+    "Debug\tslp_vectorizer\t0\tint\t0\t1\tLLVM's SLP vectorizer\tSLP vectorizer\t0=Off|1=On\n"
     "Debug\tlog\t1\tint\t0\t2\tLog detail\t\t0=0|1=1|2=2";
 
 /* a row by its .ini key, or by the name it shows */
@@ -57,6 +58,11 @@ static const char* shown(const GuiSettings* s, const char* name) {
     gui_theme_get(s->values, key(s, name), value, sizeof value);
     return value;
 }
+/* the resolution row set to in, and what it keeps: the rounding, clamping and leading zeros a typed value takes */
+static void res(GuiSettings* s, const char* in, const char* want) {
+    assert(gui_settings_set(s, "resolution", in));
+    assert(!strcmp(gui_settings_value(s, "resolution"), want));
+}
 /* as the Settings screen shows it */
 static const char* on_screen(const GuiSettings* s, const char* name) {
     static char value[96];
@@ -76,35 +82,48 @@ int main(int argc, char** argv) {
        order, the other line left out; a page's row and its All before its settings */
     int tracy = at(&s, "tracy_capture") >= 0; /* the row a runtime without SNX_TRACY does not list */
     int opt = 3 + tracy;                      /* the optimization level's row, after it */
-    assert(s.own > 5 && s.count == s.own + 15 + tracy && !strcmp(s.keys[0].key, "gdbstub"));
-    assert(!tracy || at(&s, "tracy_capture") == 3); /* after Extract game container, before the optimization level */
+    assert(s.own > 5 && s.count == s.own + 16 && !strcmp(s.keys[0].key, "GDB stub"));
+    assert(!tracy || at(&s, "tracy_capture") == 3); /* after Extract dump, before the optimization level */
     assert(!strcmp(s.keys[0].section, "Launch") && !strcmp(s.keys[0].about, "Enables gdbstub on port 1234") &&
            words(&s.keys[0]) == 2 && !strcmp(s.values[0].key, "gdbstub"));
     /* shown by its name, kept by its key */
     assert(!strcmp(s.keys[1].section, "Launch") && !strcmp(s.keys[1].key, "Extract to tmpfs") &&
            !strcmp(s.values[1].key, "tmpfs") && words(&s.keys[1]) == 2 && strstr(s.keys[1].about, "RomFS"));
-    assert(!strcmp(s.keys[2].section, "Launch") && !strcmp(s.keys[2].key, "Extract game container") &&
+    assert(!strcmp(s.keys[2].section, "Launch") && !strcmp(s.keys[2].key, "Extract dump") &&
            !strcmp(s.values[2].key, "extract") && words(&s.keys[2]) == 2 && strstr(s.keys[2].about, "dump"));
     assert(!tracy || (!strcmp(s.keys[3].section, "Launch") && !strcmp(s.values[3].key, "tracy_capture") &&
                       words(&s.keys[3]) == 2 && strstr(s.keys[3].about, "PATH")));
     assert(!gui_settings_extract(&s)); /* off: a dump read in place */
     /* the recompiler's: none passed until picked, then --key=value; the optimization level takes 0 to 3 and z, the
-       AOT threads a number (0 the cores), the unit cache limit a number of GB (0 none), and LLVM Internals is a page of
-       its own */
+       AOT threads a number (0 the cores), the unit size a number of instructions, the unit cache limit a number of GB
+       (0 none), and LLVM Internals is a page of its own */
     assert(!strcmp(s.keys[opt].section, "Launch") && !strcmp(s.keys[opt].key, "Optimization level") &&
-           !strcmp(s.values[opt].key, "opt") && words(&s.keys[opt]) == 6 && !gui_settings_recompile(&s, options));
+           !strcmp(s.values[opt].key, "opt") && words(&s.keys[opt]) == 7 && !gui_settings_recompile(&s, options));
     assert(gui_settings_set(&s, "opt", "z") && gui_settings_recompile(&s, options) == 1 && !strcmp(options[0], "--opt=z"));
-    assert(!gui_settings_set(&s, "opt", "s") && gui_settings_set(&s, "aot_threads", "4"));
-    assert(gui_settings_recompile(&s, options) == 2 && !strcmp(options[1], "--aot_threads=4"));
-    assert(!strcmp(s.keys[opt + 2].section, "Launch") && !strcmp(s.keys[opt + 2].key, "Unit cache limit") &&
-           !strcmp(s.values[opt + 2].key, "unit_cache_gb") && strstr(s.keys[opt + 2].about, "0 = no limit"));
-    assert(!strcmp(s.values[opt + 2].def, "0") && strstr(s.keys[opt + 2].about, "a tenth of its disk free")); /* no limit */
+    assert(!gui_settings_set(&s, "opt", "q") && gui_settings_set(&s, "opt", "s") &&
+           gui_settings_set(&s, "aot_threads", "4"));
+    assert(gui_settings_recompile(&s, options) == 2 && !strcmp(options[0], "--opt=s") &&
+           !strcmp(options[1], "--aot_threads=4"));
+    assert(!strcmp(s.keys[opt + 2].section, "Launch") && !strcmp(s.keys[opt + 2].key, "Unit size") &&
+           !strcmp(s.values[opt + 2].key, "unit_instructions") && !strcmp(s.values[opt + 2].def, "90000"));
+    assert(gui_settings_set(&s, "unit_instructions", "20000") && gui_settings_recompile(&s, options) == 3 &&
+           !strcmp(options[2], "--unit_instructions=20000") && gui_settings_set(&s, "unit_instructions", ""));
+    assert(!strcmp(s.keys[opt + 3].section, "Launch") && !strcmp(s.keys[opt + 3].key, "Unit cache limit") &&
+           !strcmp(s.values[opt + 3].key, "unit_cache_gb") && strstr(s.keys[opt + 3].about, "0 = no limit"));
+    assert(!strcmp(s.values[opt + 3].def, "0") &&
+           strstr(s.keys[opt + 3].about, "a tenth of its disk free")); /* no limit */
     assert(gui_settings_set(&s, "unit_cache_gb", "50") && gui_settings_recompile(&s, options) == 3 &&
            !strcmp(options[2], "--unit_cache_gb=50") && gui_settings_set(&s, "unit_cache_gb", ""));
-    assert(!strcmp(s.keys[opt + 3].section, "Launch") && s.values[opt + 3].kind == GUI_SETTING_PAGE &&
-           !strcmp(s.keys[opt + 3].key, "LLVM Internals"));
+    assert(!strcmp(s.keys[opt + 4].section, "Launch") && s.values[opt + 4].kind == GUI_SETTING_PAGE &&
+           !strcmp(s.keys[opt + 4].key, "LLVM Internals"));
     assert(gui_settings_set(&s, "opt", ".ini") && gui_settings_set(&s, "aot_threads", "") &&
            !gui_settings_recompile(&s, options));
+    /* a game's setting alone, as R's recompile takes Debug's SLP vectorizer: once picked, and never a launcher's own */
+    assert(!gui_settings_one(&s, "slp_vectorizer", options) && gui_settings_set(&s, "slp_vectorizer", "1"));
+    assert(gui_settings_one(&s, "slp_vectorizer", options) == 1 && !strcmp(options[0], "--slp_vectorizer=1"));
+    assert(gui_settings_set(&s, "opt", "z") && !gui_settings_one(&s, "opt", options) &&
+           gui_settings_set(&s, "opt", ".ini"));
+    assert(gui_settings_set(&s, "slp_vectorizer", ".ini") && !gui_settings_one(&s, "slp_vectorizer", options));
     assert(!strcmp(s.keys[s.own].section, "Display") && !strcmp(s.keys[s.own].key, "docked"));
     assert(!strcmp(s.keys[s.own].about, "1 = TV mode") && !strcmp(key(&s, "fullscreen")->about, "1 = start in fullscreen"));
     assert(!strcmp(s.keys[s.count - 1].key, "log") && !strcmp(s.keys[s.count - 1].about, "Log detail"));
@@ -112,9 +131,48 @@ int main(int argc, char** argv) {
        typed, an older runtime's and one with a value missing its word among them */
     assert(!strcmp(key(&s, "controls")->key, "Show controls") && key(&s, "controls")->type == GUI_KEY_WORD);
     assert(words(key(&s, "touch")) == 4 && !strcmp(key(&s, "touch")->key, "Touch screen"));
-    assert(!strcmp(key(&s, "touch")->words[0], ".ini") && !strcmp(key(&s, "touch")->words[3], "Mouse too"));
+    assert(!strcmp(key(&s, "touch")->words[0], ".ini") && !strcmp(key(&s, "touch")->words[3], "Fingers and mouse"));
     assert(words(key(&s, "anisotropy")) == 18 && !strcmp(key(&s, "anisotropy")->words[17], "16"));
     assert(key(&s, "language")->type == GUI_KEY_TEXT && key(&s, "resolution")->type == GUI_KEY_TEXT);
+    /* a number's row takes any value of its range and the fraction a scale needs, the closest value in range past
+       either end, and refuses what is not a number, as 3x or high were, where it keeps what it had */
+    assert(key(&s, "language")->numeric && key(&s, "language")->whole && key(&s, "resolution")->numeric &&
+           !key(&s, "resolution")->whole);
+    assert(key(&s, "resolution")->lo == 0.25 && key(&s, "resolution")->hi == 16);
+    assert(!strcmp(key(&s, "resolution")->def, "1"));
+    /* within the range as typed, at most two decimals; past an end, the closest value in it */
+    res(&s, "0.1", "0.25");
+    res(&s, "0.24", "0.25");
+    res(&s, "0.25", "0.25");
+    res(&s, "0.3", "0.3");
+    res(&s, "0.5", "0.5");
+    res(&s, "1.61", "1.61");
+    res(&s, "8.2", "8.2");
+    res(&s, "16", "16");
+    res(&s, "2.223", "2.22");
+    res(&s, "3.333", "3.33");
+    res(&s, "1.60", "1.6");
+    res(&s, "2.0", "2");
+    res(&s, "00.25", "0.25");
+    res(&s, "01.60", "1.6");
+    res(&s, ".25", "0.25");
+    res(&s, "007", "7");
+    res(&s, "0.05", "0.25");
+    res(&s, "0.09", "0.25");
+    res(&s, "16.01", "16");
+    res(&s, "20", "16");
+    res(&s, "999", "16");
+    assert(gui_settings_set(&s, "language", "007") && !strcmp(gui_settings_value(&s, "language"), "7") &&
+           gui_settings_set(&s, "language", ""));
+    assert(!gui_settings_set(&s, "resolution", "3x") && !gui_settings_set(&s, "resolution", "1e1") &&
+           !gui_settings_set(&s, "resolution", "high"));
+    assert(!strcmp(gui_settings_value(&s, "resolution"), "16"));
+    assert(!gui_settings_set(&s, "language", "3.5") && gui_settings_set(&s, "language", "3.0") &&
+           !strcmp(gui_settings_value(&s, "language"), "3") && gui_settings_set(&s, "language", ""));
+    /* the scale goes to a run as it was picked, any scale within the row's range */
+    assert(gui_settings_set(&s, "resolution", "1.22") && gui_settings_options(&s, 0, options) == 1 &&
+           !strcmp(options[0], "--resolution=1.22"));
+    assert(gui_settings_set(&s, "resolution", "") && !gui_settings_value(&s, "resolution"));
     assert(key(&s, "old")->type == GUI_KEY_TEXT && key(&s, "broken")->type == GUI_KEY_TEXT);
     assert(!strcmp(shown(&s, "touch"), ".ini") && !strcmp(shown(&s, "log"), ".ini"));
     /* the page: its row in its section opens the rows after its All, which steps them */
@@ -132,7 +190,7 @@ int main(int argc, char** argv) {
     assert(!gui_settings_value(&s, "touch") && !gui_settings_value(&s, "language") && !gui_settings_value(&s, "x"));
     assert(gui_settings_set(&s, "touch", "1") && !strcmp(gui_settings_value(&s, "touch"), "1"));
     assert(!strcmp(shown(&s, "touch"), "Fingers"));
-    assert(!gui_settings_set(&s, "touch", "3") && !gui_settings_set(&s, "touch", "Mouse too"));
+    assert(!gui_settings_set(&s, "touch", "3") && !gui_settings_set(&s, "touch", "Fingers and mouse"));
     assert(!strcmp(gui_settings_value(&s, "touch"), "1") && !gui_settings_set(&s, "Touch screen", "2"));
     /* on the screen: a pick as it is; a row not picked the runtime's default in its words, a text as it is, an empty
        one bare, then [default]; an All while none of its rows is; the launcher's own and a page's as they are */
@@ -180,6 +238,60 @@ int main(int argc, char** argv) {
     assert(!gui_settings_value(&s, "fullscreen"));
     gui_editor_key(&form, GUI_LEFT);
     assert(!strcmp(gui_settings_value(&s, "fullscreen"), "1"));
+    /* the resolution typed, not stepped: 1.61 taken as any scale, a third decimal and a letter left out, and 3x's
+       digits are all that reach the row; a value past the range clamps to the closest in it */
+    form.row = at(&s, "resolution");
+    gui_editor_key(&form, GUI_RIGHT);
+    assert(strstr(form.note, "0.25") && strstr(form.note, "16") && strstr(form.note, "two decimals"));
+    gui_editor_key(&form, GUI_SELECT);
+    gui_editor_type(&form, "2");
+    gui_editor_type(&form, ".");
+    gui_editor_type(&form, "223");
+    gui_editor_type(&form, "x");
+    assert(!strcmp(form.text, "2.22") && strstr(form.note, "two decimals"));
+    gui_editor_key(&form, GUI_SELECT);
+    assert(!strcmp(gui_settings_value(&s, "resolution"), "2.22"));
+    gui_editor_key(&form, GUI_SELECT); /* typing it again, now only the digits are left */
+    gui_editor_type(&form, "e");
+    assert(!strcmp(form.text, "2.22"));
+    gui_editor_key(&form, GUI_CANCEL);
+    gui_editor_key(&form, GUI_SELECT);
+    while (form.text[0]) gui_editor_erase(&form);
+    gui_editor_type(&form, "20");
+    gui_editor_key(&form, GUI_SELECT);
+    assert(!strcmp(gui_settings_value(&s, "resolution"), "16") && strstr(form.note, "Closest value in range: 16"));
+    gui_editor_key(&form, GUI_SELECT); /* emptied, Select shows the row's default, which is the value in use */
+    while (form.text[0]) gui_editor_erase(&form);
+    gui_editor_key(&form, GUI_SELECT);
+    assert(!strcmp(gui_settings_value(&s, "resolution"), "1") && !form.note[0]); /* the foot's usual help then */
+    { /* 0, however it is typed, is the setting's default 1 as well, and says nothing */
+        static const char* const nought[] = {".", "0.", ".0", "0"};
+        size_t i;
+        for (i = 0; i < sizeof nought / sizeof *nought; ++i) {
+            gui_editor_key(&form, GUI_SELECT);
+            while (form.text[0]) gui_editor_erase(&form);
+            gui_editor_type(&form, nought[i]);
+            gui_editor_key(&form, GUI_SELECT);
+            assert(!strcmp(gui_settings_value(&s, "resolution"), "1") && !form.note[0]);
+        }
+    }
+    gui_editor_key(&form, GUI_SELECT); /* three digits at most, the point not counted */
+    while (form.text[0]) gui_editor_erase(&form);
+    gui_editor_type(&form, "123456789");
+    assert(!strcmp(form.text, "123")); /* three digits in all, 0.25 and 1.61 too */
+    gui_editor_key(&form, GUI_CANCEL);
+    assert(gui_settings_set(&s, "resolution", ""));
+    gui_editor_key(&form, GUI_SELECT); /* 0.25 and 1.61 fit; 2.0 is the whole number 2 on Enter */
+    gui_editor_type(&form, "0.25");
+    assert(!strcmp(form.text, "0.25"));
+    while (form.text[0]) gui_editor_erase(&form);
+    gui_editor_type(&form, "00.01"); /* the leading zero does not use up the three digits */
+    assert(!strcmp(form.text, "0.01"));
+    while (form.text[0]) gui_editor_erase(&form);
+    gui_editor_type(&form, "2.0");
+    gui_editor_key(&form, GUI_SELECT);
+    assert(!strcmp(gui_settings_value(&s, "resolution"), "2") && !form.note[0]);
+    assert(gui_settings_set(&s, "resolution", ""));
     gui_editor_stop(&form);
 
     /* a run's options: --key=value for each pick in the list's order; the launcher's own with launch */
@@ -337,6 +449,48 @@ int main(int argc, char** argv) {
         free(path);
         free(dir);
     }
+    /* a resolution forced into the settings file as nothing, or no number, is no pick: the game's own .ini keeps its
+       default 1, which the row shows as it is; a value in range is the pick a run gets */
+    {
+        char *dir = snx_temp_dir(NULL), *path = snx_path_join(dir, "settings.ini");
+        static const char* const bad[] = {"", "0", "e", "3x", "high", "nan", "0.01x"};
+        size_t i;
+        for (i = 0; i < sizeof bad / sizeof *bad; ++i) {
+            char* text = snx_format("[Graphics]\nresolution=%s\n", bad[i]);
+            assert(text && !snx_write_file(path, text, strlen(text)));
+            free(text);
+            gui_settings_free(&s);
+            assert(!gui_settings_read(&s, list) && gui_settings_set(&s, "fullscreen", "0"));
+            gui_settings_mark(&s);
+            gui_settings_load(&s, path);
+            assert(!gui_settings_value(&s, "resolution"));
+            assert(!strcmp(on_screen(&s, "resolution"), "1 [default]"));
+            {
+                size_t n = gui_settings_options(&s, 0, options), j;
+                for (j = 0; j < n; ++j) assert(strncmp(options[j], "--resolution=", 13));
+            }
+        }
+        {
+            char* text = snx_format("[Graphics]\nresolution=8.2\n");
+            assert(text && !snx_write_file(path, text, strlen(text)));
+            free(text);
+            gui_settings_free(&s);
+            assert(!gui_settings_read(&s, list) && gui_settings_set(&s, "fullscreen", "0"));
+            gui_settings_mark(&s);
+            gui_settings_load(&s, path);
+            assert(!strcmp(gui_settings_value(&s, "resolution"), "8.2"));
+            {
+                size_t n = gui_settings_options(&s, 0, options), j;
+                int found = 0;
+                for (j = 0; j < n; ++j) found += !strcmp(options[j], "--resolution=8.2");
+                assert(found == 1);
+            }
+        }
+        assert(!snx_remove_tree(dir));
+        free(path);
+        free(dir);
+        assert(!gui_settings_read(&s, list));
+    }
     gui_settings_free(&s);
 
     /* the runtime's own list: every line a row, and a page's two; the game's menu's settings named and worded as it
@@ -361,9 +515,10 @@ int main(int argc, char** argv) {
         assert(words(key(&s, "gamepad_p1_swap_ab")) == 4 && !strcmp(key(&s, "gamepad_p8_swap_ab")->words[1], "As All"));
         assert(key(&s, "gamepad_p3_device")->type == GUI_KEY_TEXT &&
                !strcmp(key(&s, "gamepad_p3_device")->section, "Controllers/Player"));
-        assert(!strcmp(s.keys[s.own].section, "Display") && !strcmp(s.keys[s.count - 1].section, "Debug"));
+        assert(!strcmp(s.keys[s.own].section, "Game") && !strcmp(s.keys[s.count - 1].section, "Debug"));
         assert(words(key(&s, "fullscreen")) == 3 && words(key(&s, "touch")) == 4 && words(key(&s, "controls")) == 3);
-        assert(!strcmp(key(&s, "controls")->key, "Show controls") && !strcmp(key(&s, "touch")->words[3], "Mouse too"));
+        assert(!strcmp(key(&s, "controls")->key, "Show controls") &&
+               !strcmp(key(&s, "touch")->words[3], "Fingers and mouse"));
         assert(!strcmp(key(&s, "gamepad_rumble")->words[1], "Off") && !key(&s, "controls_a"));
         assert(gui_settings_set(&s, "fullscreen", "0") && gui_settings_set(&s, "touch", "1"));
         assert(gui_settings_set(&s, "controls", "0") && key(&s, "resolution")->type == GUI_KEY_TEXT);
@@ -371,6 +526,32 @@ int main(int argc, char** argv) {
         assert(page > 0 && s.values[page].count == 1 + 17 && !strcmp(s.keys[page + 2].key, "L"));
         gui_settings_free(&s);
         free(output);
+    }
+    /* the Debug settings a run of a game takes off their default: its .ini's, a pick over it, a text by its key alone,
+       the GDB stub; another section's never */
+    {
+        static const char debug[] = "Display\tfullscreen\t0\tint\t0\t1\tWhole screen\tFullscreen\t0=Off|1=On\n"
+                                    "Debug\tlog\t1\tint\t0\t2\tLog detail\t\t0=0|1=1|2=2\n"
+                                    "Debug\tvk_budget_mb\t0\tint\t0\t2147483647\tBudget\tVulkan memory budget\t\n"
+                                    "Debug\trenderdoc\t\ttext\t0\t0\tCaptures\tRenderDoc captures\t";
+        static const char file[] =
+            "[Display]\nfullscreen=1\n[Debug]\nlog=1\nvk_budget_mb=512\nrenderdoc=/home/someone/caps\n";
+        char *dir = snx_temp_dir(NULL), *ini = snx_path_join(dir, "game.ini"), out[256];
+        assert(!gui_settings_read(&s, debug));
+        assert(gui_settings_debug(&s, NULL, 1, out, sizeof out) == 0 && !out[0]);
+        assert(!snx_write_file(ini, file, strlen(file)));
+        assert(gui_settings_debug(&s, ini, 0, out, sizeof out) == 2 && !strcmp(out, "vk_budget_mb=512, renderdoc"));
+        assert(gui_settings_set(&s, "log", "2") && gui_settings_set(&s, "vk_budget_mb", "0"));
+        assert(gui_settings_debug(&s, ini, 0, out, sizeof out) == 2); /* the file's alone: the picks left out */
+        assert(gui_settings_debug(&s, ini, 1, out, sizeof out) == 2 && !strcmp(out, "log=2, renderdoc"));
+        assert(gui_settings_set(&s, "gdbstub", "on"));
+        assert(gui_settings_debug(&s, NULL, 1, out, sizeof out) == 2 && !strcmp(out, "log=2, gdbstub"));
+        assert(gui_settings_debug(&s, ini, 1, out, 8) == 3 && !strcmp(out, "log=2, ")); /* cut, every one counted */
+        assert(gui_settings_debug(&s, "/nonexistent/game.ini", 0, out, sizeof out) == 0);
+        gui_settings_free(&s);
+        assert(!snx_remove_tree(dir));
+        free(ini);
+        free(dir);
     }
     puts("GUI settings: the runtime's list, picks and a run's options passed");
     return 0;

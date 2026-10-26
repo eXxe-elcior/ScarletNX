@@ -67,8 +67,18 @@ SNX_RECOMPILER_API unsigned snx_recompiler_abi(void);
 SNX_RECOMPILER_API const char* snx_recompiler_error(const struct snx_recompiler* r);
 /* The -O letter the generated code is optimized at: '0', '1', '2' (the default), '3', 's' or 'z' */
 SNX_RECOMPILER_API int snx_recompiler_set_optimization(struct snx_recompiler* r, char opt);
+/* The A64 features of the guest's CPU (FEAT_* of the Arm ARM): an encoding that needs one the target lacks raises an
+   undefined instruction, as on a CPU without it. SNX_RECOMPILER_A64_SWITCH, the default, is the Switch's Cortex-A57
+   (Armv8.0 with CRC32 and the Cryptographic Extension); SNX_RECOMPILER_A64_MAX has every feature the decoder knows,
+   though an instruction the backend has no code for yet still raises an undefined instruction (docs/LIBRARY.md).
+   Modules made afterwards take it. 0, or -1 for an unknown target */
+#define SNX_RECOMPILER_A64_SWITCH 0
+#define SNX_RECOMPILER_A64_MAX    1
+SNX_RECOMPILER_API int snx_recompiler_set_a64_target(struct snx_recompiler* r, int target);
 /* Code units compiled at once, on host threads; 0, the default, uses one per processor */
 SNX_RECOMPILER_API void snx_recompiler_set_jobs(struct snx_recompiler* r, unsigned jobs);
+/* Route calls between recompiled functions through CPU.disp so code invalidation can retire callees safely */
+SNX_RECOMPILER_API void snx_recompiler_set_hook_direct_calls(struct snx_recompiler* r, int enabled);
 /* Progress lines on stdout, as the scarletnx command prints them; off by default */
 SNX_RECOMPILER_API void snx_recompiler_set_verbose(struct snx_recompiler* r, int verbose);
 /* A folder the generated code's text (LLVM IR as .ll) is saved in, for inspection; NULL (the
@@ -76,8 +86,9 @@ SNX_RECOMPILER_API void snx_recompiler_set_verbose(struct snx_recompiler* r, int
 SNX_RECOMPILER_API int snx_recompiler_set_keep_ir(struct snx_recompiler* r, const char* folder);
 /* A folder of linked modules (LLVM), made if missing, by a hash of everything a module is made from: the code and its
    addresses, the entries, the settings, SNX_ABI and the host CPU. A module found there is loaded instead of compiled,
-   and one compiled is saved there; NULL (the default) keeps none. The string is copied. 0, or -1 when the folder
-   can't be made */
+   and one compiled is saved there. The units its lazy JIT compiles are kept in library-jit.cache in the folder, and
+   loaded again when their code is the same: modules and processes may share it. NULL (the default) keeps neither. The
+   string is copied. 0, or -1 when the folder can't be made */
 SNX_RECOMPILER_API int snx_recompiler_set_cache(struct snx_recompiler* r, const char* folder);
 
 /* ---- A64 ---- */
@@ -152,6 +163,12 @@ SNX_RECOMPILER_API GuestFn snx_recompiled_function(const struct snx_recompiled* 
    there and runs it. NULL restores the module's JIT. A caller with its own RtAPI.miss and dispatch table (gnuabi)
    doesn't need it */
 SNX_RECOMPILER_API void snx_recompiled_set_fallback(struct snx_recompiled* m, GuestFn fallback);
+/* Retire functions overlapping guest code [addr, addr+size) and invalidate matching lazy JIT units. Native code stays
+   loaded for running threads. With snx_recompiler_set_hook_direct_calls, dispatch entries are cleared and the optional
+   callback receives each retired [start, end) span. Returns the number of retired functions */
+typedef void (*snx_recompiled_invalidate_callback)(void* context, uint64_t start, uint64_t end);
+SNX_RECOMPILER_API size_t snx_recompiled_invalidate(struct snx_recompiled* m, uint64_t addr, uint64_t size,
+                                                    snx_recompiled_invalidate_callback callback, void* context);
 /* Calls the guest function at pc (snx_recompiled_lookup) and returns when that host function returns: at the guest
    function's RET, with cpu->pc its return address, or after rt->undef or rt->brk */
 SNX_RECOMPILER_API void snx_recompiled_call(struct snx_recompiled* m, CPU* cpu, uint64_t pc);

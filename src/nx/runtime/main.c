@@ -5,6 +5,7 @@
    then the frontend's loop at the display's rate until the run ends, saving what outlives it */
 #include "nx/runtime/main.h"
 #include "common/cpu/recompiler/llvm/gdb_jit.h"
+#include "common/cpu/recompiler/llvm/ir.h"
 #include "common/utilities/build_info.h"
 #include "common/utilities/common.h"
 #include "common/utilities/ini_lines.h"
@@ -25,9 +26,12 @@
 #include "nx/runtime/gdbstub.h"
 #include "nx/runtime/loader.h"
 #include "nx/runtime/options.h"
+#include "nx/runtime/pause.h"
+#include "nx/runtime/state.h"
 #include "nx/runtime/rtapi.h"
 #include "nx/runtime/startup.h"
 #include "nx/runtime/platform/backend.h"
+#include "nx/runtime/platform/hud.h"
 #include "nx/runtime/platform/log.h"
 #include "nx/runtime/platform/prepare_screen.h"
 #include "nx/runtime/platform/plat.h"
@@ -165,29 +169,35 @@ static const char* program_path(const char* argv0) {
 
 #ifdef MODULE_PACK
 /* The pack's objects loaded into an arena of the JIT loader's, after the runtime library this app embeds (the pack has
-   none: its host had none for this machine). The arena holds the pack with room to spare, since the objects' sections
-   take their alignment and a GOT. The module's descriptor is its one export. A debugger the arena needs is asked for
-   by the loader, which says what to enable when there is none */
+   none: its host had none for this machine). Each of the arena's regions is what the two loads take of it
+   (snx_code_need), not a share of twice the file: a pack whose code passes five eighths of that fits, and an arena
+   whose every page is prepared (ios_arena's debugger) costs the memory the code uses. The module's descriptor is its
+   one export. A debugger the arena needs is asked for by the loader, which says what to enable when there is none */
 static const SnxModule* load_pack(const char* path) {
     SnxLinkInput rtlib, *inputs;
     SnxCodeLoader* loader;
     const char* names[1];
     SnxU64 address = 0;
     ModuleFn get;
-    size_t size = 0, count = 0, reserve;
+    size_t size = 0, count = 0, need[3], rtlib_need[3], k;
     unsigned char* data = (unsigned char*)snx_read_file(path, &size);
     char error[1024];
     if (!data) fatal("%s could not be read", path);
     inputs = snx_objects_unpack(data, size, "game code", &count);
     if (!inputs) fatal("%s is not a pack of recompiled code: recompile the game with --target ios", path);
-    /* at least 64 MiB, and twice the objects' size up to the 2 GiB an arena holds */
-    reserve = size < ((size_t)1 << 25) ? ((size_t)1 << 26) : size < ((size_t)1 << 30) ? size * 2 : ((size_t)1 << 31);
-    loader = snx_code_loader_new(reserve, error, sizeof(error));
-    if (!loader) fatal("The game's code cannot be loaded: %s", error);
     memset(&rtlib, 0, sizeof(rtlib));
     rtlib.data = snx_rtlib_object;
     rtlib.size = snx_rtlib_object_size;
     rtlib.name = "rtlib";
+    if (snx_code_need(&rtlib, 1, rtlib_need, error, sizeof(error)) ||
+        snx_code_need(inputs, count, need, error, sizeof(error)))
+        fatal("The game's code cannot be loaded: %s", error);
+    for (k = 0; k < 3; ++k) need[k] += rtlib_need[k];
+    LOG("game: a code arena of %.1f MiB of code, %.1f MiB of read-only data and %.1f MiB of data for its %.1f MB of "
+        "objects\n",
+        (double)need[0] / 1048576.0, (double)need[1] / 1048576.0, (double)need[2] / 1048576.0, (double)size / 1e6);
+    loader = snx_code_loader_new_regions(need, error, sizeof(error));
+    if (!loader) fatal("The game's code cannot be loaded: %s", error);
     names[0] = "snx_module";
     if (snx_code_load(loader, &rtlib, 1, NULL, 0, NULL, error, sizeof(error)) ||
         snx_code_load(loader, inputs, count, names, 1, &address, error, sizeof(error)))
@@ -218,7 +228,7 @@ static const SnxModule* load_module(const char* path) {
     if (snx_module_static) return snx_module_static();
     if (!snx_is_file(path))
         fatal("Cannot find the recompiled code: %s. A copy of the runtime runs the game it is named after, with "
-              "that code beside it, or --game=PATH names the game (--game=games/Game)",
+              "that code beside it, or --game=PATH names the game (--game=recompiled/Game)",
               path);
 #ifdef MODULE_PACK
     m = load_pack(path);
@@ -282,6 +292,7 @@ static void kind_dir(char* out, size_t cap, int kind, const char* what, const ch
     char *moved, *full;
     if (recorded && snx_is_dir(recorded)) {
         snprintf(out, cap, "%s/", recorded);
+        snx_path_native(out);
         return;
     }
     snprintf(out, cap, "%s", g_exedir);
@@ -291,8 +302,10 @@ static void kind_dir(char* out, size_t cap, int kind, const char* what, const ch
         if (moved && strcmp(moved, here)) {
             if (snx_mkdirs(moved))
                 WARN("%s cannot be created, so the game's %s stay beside it\n", moved, what);
-            else
+            else {
                 snprintf(out, cap, "%s/", moved);
+                snx_path_native(out);
+            }
         }
         free(moved);
     }
@@ -490,21 +503,36 @@ static void write_threads(u64 second) {
     fclose(f);
 }
 
+/* the host threads blocked on a mutex or waiting on a condition variable: the caller as an offset from pm_lock and the
+   mutex as one from pm_wait_base, which the runtime's symbols name (nm, addr2line). The watchdog's own report of a
+   deadlock, where no thread notes what it waits for in game terms */
+static void report_lock_waits(void) {
+    PmWait w[64];
+    int n = pm_waits(w, 64), i;
+    for (i = 0; i < n; i++)
+        WARN("  host thread %llu %s mutex base%+lld, called from pm_lock%+lld\n", (unsigned long long)w[i].tid,
+             w[i].cond ? "waits on a condition with" : "waits for", (long long)((intptr_t)w[i].m - (intptr_t)pm_wait_base()),
+             (long long)((intptr_t)w[i].at - (intptr_t)pm_lock));
+}
 static void frontend_loop(void) {
     const u64 period = 1000000000u / VI_REFRESH_HZ;
     u64 tick = 0, next = plat_ns(), now, changed = next, rate_at = next;
     int frames = 0, stalls = 0, rate_frames = 0;
     while (!g_quit) {
-        int shown;
+        int shown, paused;
         SNX_ZONE(z_frontend, "frontend tick");
         video_poll();
-        hid_update();
-        vi_vsync_tick();
+        /* the game's input and its display's vsync are guest work, which a pause holds back with the rest */
+        paused = game_paused();
+        if (!paused) {
+            hid_update();
+            vi_vsync_tick();
+        }
         if (++tick % 60 == 0) ini_poll(0);
         frontend_frame();
         SNX_ZONE_END(z_frontend);
 #if defined(SNX_TRACY)
-        SNX_PLOT("guest memory MB", (double)used_memory() / (1024.0 * 1024.0));
+        SNX_PLOT("guest memory", used_memory());
         {
             /* the io plots' bases */
             static u64 was_read, was_written, last_ns;
@@ -521,6 +549,8 @@ static void frontend_loop(void) {
             last_ns = now_ns;
         }
 #endif
+        pause_unattended();
+        state_poll();
         /* here and not on the GPU thread, where writing the pipeline cache would hold up every channel */
         if (tick % 300 == 0) {
             save_hints();
@@ -543,7 +573,7 @@ static void frontend_loop(void) {
             }
 #endif
         }
-        if (shown != frames) {
+        if (shown != frames || paused) { /* a paused game shows nothing new, and isn't stalled */
             frames = shown;
             changed = now;
         } else if (now - changed >= STALL_NS && stalls < 4) {
@@ -553,6 +583,7 @@ static void frontend_loop(void) {
                  (unsigned long long)(STALL_NS / 1000000000u), frames, (unsigned long long)g_gpu_submits);
             kernel_dump_threads();
             gpu_report_stall();
+            report_lock_waits();
         }
         /* paced at the display's rate, from a schedule: one far behind (a stop in the debugger) starts again */
         next += period;
@@ -724,32 +755,93 @@ static int open_menu(const char* argv0) {
     return status;
 }
 
+/* Key paths belong to the runtime as well as the driver: an unextracted game opens its dump again at startup. */
+static int runtime_key_options(int* argc, char** argv, char** keys, char** title_keys) {
+    int read = 1, write = 1;
+    while (read < *argc && strcmp(argv[read], "--")) {
+        const char *arg = argv[read], *value = NULL;
+        char** slot = NULL;
+        if (!strcmp(arg, "--keys")) slot = keys;
+        else if (!strcmp(arg, "--title-keys")) slot = title_keys;
+        else if (!strncmp(arg, "--keys=", 7)) { slot = keys; value = arg + 7; }
+        else if (!strncmp(arg, "--title-keys=", 13)) { slot = title_keys; value = arg + 13; }
+        if (!slot) {
+            argv[write++] = argv[read++];
+            continue;
+        }
+        if (!value) {
+            if (read + 1 >= *argc || !argv[read + 1][0] || argv[read + 1][0] == '-')
+                return snx_error("%s requires a file", arg);
+            value = argv[++read];
+        } else if (!value[0])
+            return snx_error("%s requires a file", arg);
+        {
+            char* path = snx_absolute(value);
+            if (!path || !snx_is_file(path)) {
+                int result = snx_error("%s is not a file: %s", !path ? "cannot resolve key path" : arg,
+                                       path ? path : value);
+                free(path);
+                return result;
+            }
+            free(*slot);
+            *slot = path;
+        }
+        ++read;
+    }
+    while (read < *argc) argv[write++] = argv[read++];
+    argv[write] = NULL;
+    *argc = write;
+    return 0;
+}
+
 int snx_main(int argc, char** argv) {
     char module[sizeof g_exedir + sizeof g_exename + 16], ini[sizeof g_confdir + sizeof g_exename + 8];
     char base[sizeof g_exename];
+    char *keys = NULL, *title_keys = NULL;
     const char *game, *title;
     const SnxModule* mod;
     int status, i;
     hle_init(); /* before anything, the options included, touches g_hle */
+    /* The driver's dump-play options also belong to the runtime when it reads the dump in place. */
+    status = runtime_key_options(&argc, argv, &keys, &title_keys);
+    if (status) {
+        status = 2;
+        goto done;
+    }
     status = snx_startup_options(argc, argv);
-    if (status) return status;
+    if (status) goto done;
     if (argc == 2 && !strcmp(argv[1], "--settings")) {
         ini_list(g_ini_sections, g_ini_sections_count);
-        return 0;
+        status = 0;
+        goto done;
     }
     if (argc == 2 && !strcmp(argv[1], "--settings=recompile")) {
         ini_list(g_launch_sections, g_launch_sections_count);
-        return 0;
+        status = 0;
+        goto done;
     }
-    if (g_opt_gdb && snx_gdb_start(g_opt_gdb_stop, SNX_GDB_PORT)) return 2; /* before any other thread */
+    if (g_opt_gdb && snx_gdb_start(g_opt_gdb_stop, SNX_GDB_PORT)) {
+        status = 2;
+        goto done; /* before any other thread */
+    }
+    if (argc == 2 && !strncmp(argv[1], "--settings=", 11)) {
+        fprintf(stderr, "scarletnx: %s: not --settings (the game's) or --settings=recompile\n", argv[1]);
+        status = 2;
+        goto done;
+    }
     game = game_option(argc, argv);
     refuse_dumps(argc, argv, game);
     name_game(game ? game : program_path(argv[0]));
     snprintf(module, sizeof module, "%s%s%s", g_exedir, g_exename, MODULE_SUFFIX);
-    if (argc == 1 && !snx_module_static && snx_menu && snx_launcher_name(g_exename) && !snx_is_file(module))
-        return open_menu(argv[0]);
+    if (argc == 1 && !snx_module_static && snx_menu && snx_launcher_name(g_exename) && !snx_is_file(module)) {
+        status = open_menu(argv[0]);
+        goto done;
+    }
     /* the game's errors in its log, where a fatal's "the line before" is: a game's process on Android has no stderr */
     snx_error_sink(log_error_line);
+    /* the guest's address space before the game's code, which would take a share of a small one: a pack's arena with its
+       write alias leaves an iOS app's 13 GiB or so no run of the 5 GiB the guest needs */
+    mem_reserve();
     /* the code before anything is written: a mistyped --game leaves no .ini and no log behind */
     mod = load_module(module);
     if (mod->abi != SNX_ABI) {
@@ -797,6 +889,11 @@ int snx_main(int argc, char** argv) {
         plat_system_info(sys, sizeof sys);
         LOG("system: %s\n", sys);
     }
+    {
+        char list[HUD_DEBUG_MAX];
+        if (options_debug(INI_CHANGED_DEFAULT, list, sizeof list))
+            LOG("debug: %s; shown at the top of the picture while the game runs\n", list);
+    }
     /* after the header, so the client's own lines do not come before it and a capture that cannot start still leaves
        a log: it is asked for by a setting, and a run without it is better than no run */
     if (snx_tracy_init(title)) WARN("tracy: no capture this run; it goes on without one\n");
@@ -809,12 +906,22 @@ int snx_main(int argc, char** argv) {
             "attached\n");
     }
     if (g_addon) LOG("game: the update of the game in %s, with its settings and saves\n", base);
+    snx_ir_slp_vectorizer(g_settings.slp_vectorizer); /* before the JIT's first compile too */
+    snx_ir_fpsr_flags(g_settings.fpsr_flags);
+    snx_ir_volatile_memory(g_settings.volatile_load_stores);
 
-    fs_init(); /* the npdm is read through it, and mem_init's layout comes before */
+    fs_init(keys, title_keys); /* the npdm is read through it, and mem_init's layout comes before */
+    free(keys);
+    free(title_keys);
+    keys = title_keys = NULL;
 #ifdef MODULE_PACK
     g_settings.log_level = 2; /* a phone's log is the only way to see what a run did: everything, until it is steadier */
 #endif
     mem_init();
+    if (g_settings.memory_fit) { /* before the game allocates: what the process holds is the runtime's alone */
+        SnxU64 available = 0, footprint = snx_footprint();
+        mem_fit(snx_memory_available(&available) && footprint, available, footprint);
+    }
     kernel_init();
     dispatch_init();
     if (g_arm_mod) arm_dispatch_init();
@@ -858,5 +965,9 @@ int snx_main(int argc, char** argv) {
         kernel_run_main(mod->mods[0].base + mod->mods[0].text_off, mod->main_stack, (int)mod->main_prio,
                         (int)mod->main_core);
     frontend_loop();
-    return 0;
+    status = 0;
+done:
+    free(keys);
+    free(title_keys);
+    return status;
 }

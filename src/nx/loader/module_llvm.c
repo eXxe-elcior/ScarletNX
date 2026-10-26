@@ -10,6 +10,7 @@
 #include "nx/loader/module_abi.h"
 #include "nx/loader/unit_cache.h"
 #include "common/cpu/recompiler/llvm/rtlib_object.h"
+#include "snx_settings.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -25,6 +26,9 @@ typedef struct {
     unsigned char* object;
     size_t size;
     int reused; /* the object came from the unit cache */
+    /* a pack's unit the unit cache holds whole: its key, which the pack's write reads the object back by (object NULL
+       until then). Empty for one in memory */
+    char key[65];
 } Unit;
 
 typedef struct {
@@ -66,6 +70,32 @@ static int save_ir(SnxIr* ir, const char* dir, const char* name) {
     return rc;
 }
 
+/* The pack's write (snx_objects_pack_write) of inputs, units[0] the first-th of them: each unit's object read back
+   from the unit cache when it is there, freed once written */
+typedef struct {
+    Unit* units;
+    size_t first, count;
+    const SnxUnitCache* cache;
+} PackUnits;
+static unsigned char* read_unit(void* arg, size_t index, size_t* size, char* why, size_t why_size) {
+    const PackUnits* p = (const PackUnits*)arg;
+    unsigned char* object;
+    char reason[640];
+    if (index < p->first || index - p->first >= p->count || !p->units[index - p->first].key[0]) {
+        snprintf(why, why_size, "input %zu is no unit the unit cache holds", index);
+        return NULL;
+    }
+    object = snx_unit_cache_read(p->cache, p->units[index - p->first].key, size, reason, sizeof reason);
+    if (!object) snprintf(why, why_size, "code_%03zu: %s", index - p->first, reason);
+    return object;
+}
+static void written_unit(void* arg, size_t index) {
+    PackUnits* p = (PackUnits*)arg;
+    if (index < p->first || index - p->first >= p->count) return;
+    free(p->units[index - p->first].object);
+    p->units[index - p->first].object = NULL;
+}
+
 static SnxIr* new_ir(const SnxLlvmBuild* build, const char* name, char* error, size_t error_size) {
     return build->triple ? snx_ir_new_target(name, build->opt, build->triple, error, error_size)
                          : snx_ir_new(name, build->opt, error, error_size);
@@ -82,14 +112,22 @@ static int compile_unit(Queue* q, size_t index, char* error, size_t error_size) 
     ir = new_ir(q->build, name, error, error_size);
     if (!ir) return -1;
     snx_ir_tune(ir, q->build->tuning);
+    snx_ir_stale_checks(ir);
     for (i = u->first; i < u->last; ++i) snx_ir_emit(ir, q->codegen, &q->codegen->functions[i]);
     rc = q->build->keep_ir && save_ir(ir, q->build->keep_ir, name);
     if (rc) snprintf(error, error_size, "cannot save the IR of %s", name);
     if (!rc && q->cache)
-        rc = snx_unit_cache_object(q->cache, ir, &u->object, &u->size, &u->reused, error, error_size);
+        rc = snx_unit_cache_object(q->cache, ir, &u->object, &u->size, &u->reused, q->build->triple ? u->key : NULL,
+                                   error, error_size);
     else if (!rc)
         rc = snx_ir_object(ir, q->build->opt, &u->object, &u->size, error, error_size);
     snx_ir_free(ir);
+    /* a pack is written a record at a time: an object the cache holds is read back then, not kept in memory with every
+       other unit's until the last is compiled */
+    if (!rc && u->key[0]) {
+        free(u->object);
+        u->object = NULL;
+    }
     return rc;
 }
 
@@ -100,6 +138,11 @@ static void worker(Queue* q) {
         size_t i;
         int rc;
         lock(q);
+        if (snx_abort_requested() && !q->failed) {
+            q->failed = 1;
+            snprintf(q->error, sizeof(q->error), "aborted by the player, %zu of %zu code units compiled", q->done,
+                     q->count);
+        }
         if (q->failed || q->next == q->count) {
             unlock(q);
             return;
@@ -271,7 +314,8 @@ static int emit_module(SnxIr* ir, const SnxCodegen* codegen, const SnxCodegenOpt
                        int wrappers, size_t* wrapped, size_t* entry_count, char* error, size_t error_size) {
     SnxModuleEntry* entries;
     size_t count, arraysize, i, nfns = codegen->function_count ? codegen->function_count : 1;
-    LLVMValueRef *values, fns, ent_off, ent_fn, ent_addr, ent_ptr, mods, mod, fn, loop_i, phi_values[2];
+    LLVMValueRef *values, fns, fn_lo, fn_len, stale, ent_off, ent_fn, ent_addr, ent_ptr, mods, mod, fn, loop_i,
+        phi_values[2];
     LLVMTypeRef info, t_fns, t_u32s, t_addrs, t_ptrs;
     LLVMBasicBlockRef start, head, body, done, phi_blocks[2];
     SnxU64 lo = ~(SnxU64)0, hi = 0;
@@ -295,6 +339,32 @@ static int emit_module(SnxIr* ir, const SnxCodegen* codegen, const SnxCodegenOpt
     if (!codegen->function_count) values[0] = LLVMConstNull(ir->t_ptr);
     t_fns = LLVMArrayType(ir->t_ptr, (unsigned)nfns);
     fns = global(ir, t_fns, "FNS", LLVMConstArray(ir->t_ptr, values, (unsigned)nfns), 1);
+    /* static const u64 FN_LO[]; static const u32 FN_LEN[]: the guest code each function was compiled from, from its
+       lowest instruction to the end of its highest (SNX_ABI 14: what a line the guest changes makes stale) */
+    for (i = 0; i < nfns; ++i) {
+        const SnxFunction* f = i < codegen->function_count ? &codegen->functions[i] : NULL;
+        values[i] = ir_i64(ir, f && f->count ? snx_function_address(f, 0) : 0);
+    }
+    fn_lo = global(ir, LLVMArrayType(ir->t_i64, (unsigned)nfns), "FN_LO",
+                   LLVMConstArray(ir->t_i64, values, (unsigned)nfns), 1);
+    for (i = 0; i < nfns; ++i) {
+        const SnxFunction* f = i < codegen->function_count ? &codegen->functions[i] : NULL;
+        SnxU64 first = f && f->count ? snx_function_address(f, 0) : 0;
+        SnxU64 end = f && f->count ? snx_function_address(f, f->count - 1) + 4 : 0;
+        if (end - first > 0xFFFFFFFFu) {
+            free(values);
+            free(entries);
+            snprintf(error, error_size, "a function's code spans more than the module ABI's 32-bit length");
+            return -1;
+        }
+        values[i] = ir_i32(ir, (SnxU32)(end - first));
+    }
+    fn_len = global(ir, LLVMArrayType(ir->t_i32, (unsigned)nfns), "FN_LEN",
+                    LLVMConstArray(ir->t_i32, values, (unsigned)nfns), 1);
+    /* u8 snx_stale[]: the byte each function reads first (ir_codegen.c's stale_check), the runtime's to set */
+    stale = LLVMAddGlobal(ir->mod, LLVMArrayType(ir->t_i8, (unsigned)nfns), SNX_IR_STALE);
+    LLVMSetInitializer(stale, LLVMConstNull(LLVMArrayType(ir->t_i8, (unsigned)nfns)));
+    LLVMSetVisibility(stale, LLVMHiddenVisibility);
     /* static const u32 ENT_OFF[], ENT_FN[] */
     t_u32s = LLVMArrayType(ir->t_i32, (unsigned)arraysize);
     for (i = 0; i < arraysize; ++i)
@@ -382,6 +452,11 @@ static int emit_module(SnxIr* ir, const SnxCodegen* codegen, const SnxCodegenOpt
     field(ir, mod, offsetof(SnxModule, main_stack), ir_i32(ir, (SnxU32)npdm->stack));
     field(ir, mod, offsetof(SnxModule, main_prio), ir_i32(ir, npdm->prio));
     field(ir, mod, offsetof(SnxModule, main_core), ir_i32(ir, npdm->core));
+    field(ir, mod, offsetof(SnxModule, nfns), ir_i32(ir, (SnxU32)codegen->function_count));
+    field(ir, mod, offsetof(SnxModule, fn), fns);
+    field(ir, mod, offsetof(SnxModule, fn_lo), fn_lo);
+    field(ir, mod, offsetof(SnxModule, fn_len), fn_len);
+    field(ir, mod, offsetof(SnxModule, stale), stale);
     LLVMBuildRet(ir->b, mod);
     free(entries);
     *entry_count = count;
@@ -412,8 +487,7 @@ static void report_units(const Queue* q, const SnxLlvmBuild* build, int quiet) {
                build->unit_cache);
     if (!build->unit_cache_limit) return;
     if (snx_unit_cache_trim(build->unit_cache, build->unit_cache_limit, &trim, error, sizeof error))
-        snx_error("unit cache: %s: its size is left over the limit of %.1f MB", error,
-                  (double)build->unit_cache_limit / 1000000.0);
+        snx_error("unit cache: %s: not cut to its %.1f MB limit", error, (double)build->unit_cache_limit / 1000000.0);
     else if (trim.removed && !quiet)
         printf("unit cache: %zu files held %.1f MB, over the limit of %.1f MB: the %zu oldest removed (%.1f MB), %.1f "
                "MB left\n",
@@ -439,14 +513,14 @@ int snx_build_module_llvm(SnxProgram* loaded, const SnxCodegenOptions* options, 
     memset(&codegen, 0, sizeof(codegen));
     memset(&q, 0, sizeof(q));
     memset(&linked, 0, sizeof(linked));
-    if (!loaded->module_count) return snx_error("No modules to generate");
+    if (!loaded->module_count) return snx_error("no modules to generate");
     if (snx_ir_init(error, sizeof(error))) return snx_error("%s", error);
     if (options->jit_cache && build->triple) {
-        snx_error("JIT cache: a module for another machine (--target) takes none: its units are this host's");
+        snx_error("--jit-cache cannot go with --target %s: a JIT cache is this host's", build->triple);
         goto done;
     }
     if (options->jit_cache) {
-        char* key = snx_jit_cache_key(build->opt, options->hook_direct_calls, 1);
+        char* key = snx_jit_cache_key(build->opt, options->hook_direct_calls, 1, 0); /* the Switch */
         if (!key) {
             snx_error("LLVM backend: cannot make the JIT cache key");
             goto done;
@@ -462,10 +536,11 @@ int snx_build_module_llvm(SnxProgram* loaded, const SnxCodegenOptions* options, 
     if (!options->interp_only &&
         snx_nx_codegen_analyze(&codegen, loaded, options->hints, options->hint_count, options->quiet))
         goto done;
+    if (build->found) *build->found = codegen.instruction_count;
     codegen.direct_svc = 1; /* the runtime's RtAPI.svcs (svc.c's g_svc64) */
     codegen.hook_direct_calls = options->hook_direct_calls;
     /* chunks of whole functions, as module.c splits the C */
-    limit = options->chunk_instrs ? options->chunk_instrs : SNX_CHUNK_INSTRUCTIONS;
+    limit = options->chunk_instrs ? options->chunk_instrs : (size_t)g_settings.unit_size;
     q.units = (Unit*)snx_alloc((codegen.function_count + 1) * sizeof(*q.units));
     memset(q.units, 0, (codegen.function_count + 1) * sizeof(*q.units));
     for (first = 0; first < codegen.function_count; first = last) {
@@ -560,21 +635,39 @@ int snx_build_module_llvm(SnxProgram* loaded, const SnxCodegenOptions* options, 
     }
     exports[0] = "snx_module";
     if (variant_count) exports[export_count++] = "snx_variants";
+    tmp = snx_format("%s.tmp", build->output);
     if (build->triple) {
-        linked.data = snx_objects_pack(inputs, n, &linked.size);
-        if (!linked.data) {
-            snx_error("Packing failed: out of memory");
+        /* the pack to its file a record at a time, the code generator's tables gone first: a game of hundreds of
+           thousands of functions has them, its objects and a copy of them as one pack in memory otherwise */
+        PackUnits pack;
+        char reason[256];
+        pack.units = q.units;
+        pack.first = n - q.count - cache_count;
+        pack.count = q.count;
+        pack.cache = unit_cache;
+        snx_codegen_free(&codegen);
+        if (snx_objects_pack_write(inputs, n, tmp, &linked.size, read_unit, written_unit, &pack, error,
+                                   sizeof(error))) {
+            snx_error("packing failed: %s", error);
+            if (snx_is_file(tmp)) snx_remove_tree(tmp);
             goto done;
         }
-    } else if (snx_link(inputs, n, exports, export_count, base_name(build->output), &linked, error, sizeof(error))) {
-        snx_error("Linking failed: %s", error);
-        goto done;
-    }
-    tmp = snx_format("%s.tmp", build->output);
-    if (snx_write_file(tmp, linked.data, linked.size) || snx_replace(tmp, build->output)) {
-        snx_error("Linking failed: cannot write %s", build->output);
-        if (snx_is_file(tmp)) snx_remove_tree(tmp);
-        goto done;
+        if (snx_replace(tmp, build->output)) {
+            snx_error("packing failed: cannot rename %s to %s: %s", tmp, build->output,
+                      snx_os_error(reason, sizeof reason));
+            snx_remove_tree(tmp);
+            goto done;
+        }
+    } else {
+        if (snx_link(inputs, n, exports, export_count, base_name(build->output), &linked, error, sizeof(error))) {
+            snx_error("linking failed: %s", error);
+            goto done;
+        }
+        if (snx_write_file(tmp, linked.data, linked.size) || snx_replace(tmp, build->output)) {
+            snx_error("linking failed: cannot write %s", build->output);
+            if (snx_is_file(tmp)) snx_remove_tree(tmp);
+            goto done;
+        }
     }
     if (!options->quiet) {
         printf("LLVM module: %.1f MB, %lu entries\n", (double)linked.size / 1000000.0, (unsigned long)entry_count);

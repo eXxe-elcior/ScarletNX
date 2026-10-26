@@ -2,6 +2,7 @@
    Copyright 2026 the ScarletNX contributors */
 #include "3ds/aot/ctr_module.h"
 #include "common/utilities/common.h"
+#include <stddef.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -60,6 +61,16 @@ bool snx_ctr_native_open(const char* path, const SnxCtrImage* image, SnxCtrNativ
     }
     return true;
 }
+static int descriptor_fields(const unsigned char* record, const void* image) {
+    SnxCtrModule fields;
+    memcpy(&fields, record, offsetof(SnxCtrModule, arm_blocks));
+    return snx_ctr_module_fields(&fields, image);
+}
+bool snx_ctr_module_current(const char* path, const SnxCtrImage* image) {
+    const uint64_t magic = SNX_CTR_MODULE_MAGIC;
+    return path && image &&
+           snx_file_has_record(path, &magic, sizeof magic, offsetof(SnxCtrModule, arm_blocks), descriptor_fields, image);
+}
 char* snx_ctr_game_file(const char* directory, const char* suffix) {
     /* resolved, so "." and a trailing separator name the folder they are */
     char* folder = snx_absolute(directory);
@@ -68,7 +79,8 @@ char* snx_ctr_game_file(const char* directory, const char* suffix) {
     size_t n = strlen(folder), cut;
     while (n > 1 && (folder[n - 1] == '/' || folder[n - 1] == '\\')) folder[--n] = 0;
     for (cut = n; cut && folder[cut - 1] != '/' && folder[cut - 1] != '\\'; --cut) continue;
-    char* file = snx_format("%s/%s%s", folder, folder + cut, suffix);
+    char file[SNX_PATH_SIZE];
+    int cut_short = snx_path_format(file, sizeof file, "%s/%s%s", folder, folder + cut, suffix);
     free(folder);
-    return file;
+    return cut_short ? NULL : snx_strdup(file);
 }

@@ -24,6 +24,8 @@ static u32 g_vk_owner; /* the thread holding it (plat_tid), 0 when none: a trap'
 void vk_lock(void) {
     if (!t_vkdepth++) {
         if (!pm_trylock(&g_vklock)) { /* held: the GPU thread says so for the stall report */
+            /* Only a contended acquisition gets a zone. */
+            SNX_ZONE(z_wait, "vk lock wait");
             gpu_wait_note("vk_lock, which another thread holds", 0);
             pm_lock(&g_vklock);
             gpu_wait_note(NULL, 0);
@@ -72,11 +74,13 @@ int vk_ok_(VkResult r, const char* what, const char* file, int line) {
     return 0;
 }
 
+u32 g_vk_validation_messages;
 static VKAPI_ATTR VkBool32 VKAPI_CALL debug_cb(VkDebugUtilsMessageSeverityFlagBitsEXT sev,
                                                VkDebugUtilsMessageTypeFlagsEXT type,
                                                const VkDebugUtilsMessengerCallbackDataEXT* d, void* user) {
     (void)type;
     (void)user;
+    g_vk_validation_messages++;
     if (sev & VK_DEBUG_UTILS_MESSAGE_SEVERITY_ERROR_BIT_EXT)
         WARN("vulkan validation: %s\n", d->pMessage);
     else
@@ -284,8 +288,7 @@ static int create_device(void) {
     g_vk_flush_denorm = p12.shaderDenormFlushToZeroFloat32 &&
                         p12.denormBehaviorIndependence != VK_SHADER_FLOAT_CONTROLS_INDEPENDENCE_NONE &&
                         p12.driverID != VK_DRIVER_ID_QUALCOMM_PROPRIETARY;
-    if (!g_vk_flush_denorm)
-        WARN("vulkan: FP32 denormal flush mode unavailable; graphics shaders use per-instruction FTZ fallback\n");
+    /* without it, vk_pipeline_init measures whether the device flushes by itself (vk_ftz_native) */
     if (!g_vk_preserve_infnan) WARN("vulkan: FP32 signed-zero/Inf/NaN preservation unavailable on this GPU\n");
 
     /* compute gets a queue of its own: of a compute-only family, or else a second one of the graphics family */
@@ -317,10 +320,21 @@ static int create_device(void) {
     WANT(depthBounds);
     WANT(wideLines);
     WANT(largePoints);
+    WANT(multiViewport);
     WANT(samplerAnisotropy);
     WANT(occlusionQueryPrecise); /* samples-passed counts (query.c) are exact */
     WANT(sampleRateShading);
-    WANT(textureCompressionBC);
+    /* BCn, ASTC and ETC2 sampled as they are (format.c) where the settings ask for it and the device has them, else
+       decoded on the GPU as they are uploaded */
+    if (g_settings.native_bc) WANT(textureCompressionBC);
+    if (g_settings.native_astc) WANT(textureCompressionASTC_LDR);
+    if (g_settings.native_etc2) WANT(textureCompressionETC2);
+    if (g_settings.native_bc && !want->textureCompressionBC)
+        WARN("vulkan: the GPU can't sample BCn textures: they are decoded on the GPU as they are loaded\n");
+    if (g_settings.native_astc && !want->textureCompressionASTC_LDR)
+        WARN("vulkan: native ASTC textures were asked for, but the GPU can't sample ASTC: they are decoded to RGBA8\n");
+    if (g_settings.native_etc2 && !want->textureCompressionETC2)
+        WARN("vulkan: native ETC2 textures were asked for, but the GPU can't sample ETC2: they are decoded\n");
     WANT(vertexPipelineStoresAndAtomics);
     WANT(fragmentStoresAndAtomics);
     WANT(shaderImageGatherExtended);
@@ -352,10 +366,12 @@ static int create_device(void) {
     g_shader_geometry = want->geometryShader != 0;
     g_shader_tessellation = want->tessellationShader != 0;
     const char** ext = g_vk.dev_ext;
+    int has_pipeline_robustness = 0, has_robustness2 = 0;
     int has_budget = 0;
     u32 next = 0;
     int has_shader_clock = 0, has_feedback_dynamic = 0, has_cond = 0, has_provoking = 0, video_exts = 0;
-    int has_portability = 0;
+    int has_portability = 0, has_reconvergence = 0;
+    int has_calibrated = 0;
     if (!g_opt_headless) ext[next++] = VK_KHR_SWAPCHAIN_EXTENSION_NAME;
     {
         u32 n = 0;
@@ -367,6 +383,7 @@ static int create_device(void) {
             if (!strcmp(e[i].extensionName, VK_EXT_TRANSFORM_FEEDBACK_EXTENSION_NAME)) g_vk.has_xfb = 1;
             if (!strcmp(e[i].extensionName, VK_EXT_CUSTOM_BORDER_COLOR_EXTENSION_NAME)) g_vk.has_border_color = 1;
             if (!strcmp(e[i].extensionName, VK_KHR_SHADER_CLOCK_EXTENSION_NAME)) has_shader_clock = 1;
+            if (!strcmp(e[i].extensionName, VK_KHR_SHADER_MAXIMAL_RECONVERGENCE_EXTENSION_NAME)) has_reconvergence = 1;
             if (!strcmp(e[i].extensionName, VK_EXT_ATTACHMENT_FEEDBACK_LOOP_LAYOUT_EXTENSION_NAME))
                 g_vk.has_feedback = 1;
             if (!strcmp(e[i].extensionName, VK_EXT_ATTACHMENT_FEEDBACK_LOOP_DYNAMIC_STATE_EXTENSION_NAME))
@@ -375,9 +392,13 @@ static int create_device(void) {
                 g_vk.has_local_read = 1;
             if (!strcmp(e[i].extensionName, VK_EXT_CONDITIONAL_RENDERING_EXTENSION_NAME)) has_cond = 1;
             if (!strcmp(e[i].extensionName, VK_EXT_PROVOKING_VERTEX_EXTENSION_NAME)) has_provoking = 1;
+            if (!strcmp(e[i].extensionName, VK_EXT_PIPELINE_ROBUSTNESS_EXTENSION_NAME)) has_pipeline_robustness = 1;
+            if (!strcmp(e[i].extensionName, VK_EXT_ROBUSTNESS_2_EXTENSION_NAME)) has_robustness2 = 1;
             /* the driver's budget for each heap, the other processes' use taken out, for VMA: without it VMA took
                80% of a heap's size as its budget, blind to what the desktop and other programs hold */
             if (!strcmp(e[i].extensionName, VK_EXT_MEMORY_BUDGET_EXTENSION_NAME)) has_budget = 1;
+            /* the GPU's clock next to the client's, for the profiler's GPU track (gpuprof.c's calibration) */
+            if (!strcmp(e[i].extensionName, VK_EXT_CALIBRATED_TIMESTAMPS_EXTENSION_NAME)) has_calibrated = 1;
             /* a portability driver's subset must be enabled when it has one (MoltenVK) */
             if (!strcmp(e[i].extensionName, "VK_KHR_portability_subset")) {
                 ext[next++] = "VK_KHR_portability_subset";
@@ -391,6 +412,21 @@ static int create_device(void) {
         free(e);
     }
     if (has_budget) ext[next++] = VK_EXT_MEMORY_BUDGET_EXTENSION_NAME;
+    /* the extension only with a host time domain among the calibrateable ones: CLOCK_MONOTONIC_RAW is the clock
+       the Tracy client keeps its own time in, so the two domains' pair maps the GPU's timestamps onto it */
+    if (has_calibrated) {
+        u32 nd = 0;
+        if (VK_OK(vkGetPhysicalDeviceCalibrateableTimeDomainsEXT(g_vk.phys, &nd, NULL)) && nd) {
+            VkTimeDomainEXT* dom = malloc(sizeof *dom * nd);
+            if (dom) {
+                if (VK_OK(vkGetPhysicalDeviceCalibrateableTimeDomainsEXT(g_vk.phys, &nd, dom)))
+                    for (u32 i = 0; i < nd; i++)
+                        if (dom[i] == VK_TIME_DOMAIN_CLOCK_MONOTONIC_RAW_EXT) g_vk.has_calibrated_host = 1;
+                free(dom);
+            }
+        }
+        if (g_vk.has_calibrated_host) ext[next++] = VK_EXT_CALIBRATED_TIMESTAMPS_EXTENSION_NAME;
+    }
     g_vk.video_family = g_settings.vulkan_video_decode && video_exts == 3 ? video_decode_family() : ~0u;
     if (g_vk.video_family != ~0u) {
         ext[next++] = VK_KHR_VIDEO_QUEUE_EXTENSION_NAME;
@@ -408,6 +444,12 @@ static int create_device(void) {
         .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_TRANSFORM_FEEDBACK_FEATURES_EXT};
     VkPhysicalDeviceShaderClockFeaturesKHR qclock = {.sType =
                                                          VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_CLOCK_FEATURES_KHR};
+    VkPhysicalDeviceShaderMaximalReconvergenceFeaturesKHR qreconv = {
+        .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_MAXIMAL_RECONVERGENCE_FEATURES_KHR};
+    VkPhysicalDevicePipelineRobustnessFeaturesEXT qpipeline = {
+        .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PIPELINE_ROBUSTNESS_FEATURES_EXT};
+    VkPhysicalDeviceRobustness2FeaturesEXT qrobust = {
+        .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ROBUSTNESS_2_FEATURES_EXT};
     VkPhysicalDeviceVulkan12Features q12 = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES};
     VkPhysicalDeviceVulkan11Features q11 = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_FEATURES,
                                             .pNext = &q12};
@@ -461,8 +503,19 @@ static int create_device(void) {
         *tail = &qport;
         tail = &qport.pNext;
     }
+    if (has_reconvergence) {
+        *tail = &qreconv;
+        tail = &qreconv.pNext;
+    }
+    if (has_pipeline_robustness && has_robustness2) {
+        *tail = &qpipeline;
+        tail = &qpipeline.pNext;
+        *tail = &qrobust;
+        tail = &qrobust.pNext;
+    }
     if (has_shader_clock) *tail = &qclock;
     vkGetPhysicalDeviceFeatures2(g_vk.phys, &f2);
+    g_vk.has_vertex_robustness2 = qpipeline.pipelineRobustness && qrobust.robustBufferAccess2;
     g_vk.has_cond_render = has_cond && qcond.conditionalRendering;
     g_vk.has_provoking_last = has_provoking && qprov.provokingVertexLast;
     /* the dynamic state and the barriers within a pass only serve feedback loops */
@@ -470,6 +523,7 @@ static int create_device(void) {
     g_vk.has_feedback_dynamic =
         g_vk.has_feedback && has_feedback_dynamic && qloop_dyn.attachmentFeedbackLoopDynamicState;
     g_vk.has_local_read = g_vk.has_feedback && g_vk.has_local_read && qlocal.dynamicRenderingLocalRead;
+    g_shader_maximal_reconvergence = has_reconvergence && qreconv.shaderMaximalReconvergence;
     g_shader_clock_scopes =
         has_shader_clock ? (qclock.shaderSubgroupClock ? 1 : 0) | (qclock.shaderDeviceClock ? 2 : 0) : 0;
     g_vk.has_divisor = g_vk.has_divisor && fdiv.vertexAttributeInstanceRateDivisor;
@@ -503,6 +557,7 @@ static int create_device(void) {
     g_shader_texture_arrays = q12.shaderSampledImageArrayNonUniformIndexing != 0;
     g_shader_float16 = q12.shaderFloat16 != 0;
     g_shader_output_layer = q12.shaderOutputLayer != 0; /* ShaderLayer: a vertex or tessellation program's layer */
+    g_shader_viewport_index = have.multiViewport ? 2 | (q12.shaderOutputViewportIndex ? 1 : 0) : 0;
     VkPhysicalDeviceVulkan13Features f13 = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES,
                                             .pNext = &f12,
                                             .synchronization2 = VK_TRUE,
@@ -543,6 +598,14 @@ static int create_device(void) {
     if (g_shader_clock_scopes) {
         chain = &fclock;
         ext[next++] = VK_KHR_SHADER_CLOCK_EXTENSION_NAME;
+    }
+    VkPhysicalDeviceShaderMaximalReconvergenceFeaturesKHR freconv = {
+        .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_MAXIMAL_RECONVERGENCE_FEATURES_KHR,
+        .pNext = chain,
+        .shaderMaximalReconvergence = VK_TRUE};
+    if (g_shader_maximal_reconvergence) {
+        chain = &freconv;
+        ext[next++] = VK_KHR_SHADER_MAXIMAL_RECONVERGENCE_EXTENSION_NAME;
     }
     PortabilityFeatures fport = qport;
     fport.pNext = chain;
@@ -589,6 +652,15 @@ static int create_device(void) {
         chain = &fprov;
         ext[next++] = VK_EXT_PROVOKING_VERTEX_EXTENSION_NAME;
     }
+    VkPhysicalDevicePipelineRobustnessFeaturesEXT fpipeline = {
+        .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PIPELINE_ROBUSTNESS_FEATURES_EXT,
+        .pNext = chain,
+        .pipelineRobustness = VK_TRUE};
+    if (g_vk.has_vertex_robustness2) {
+        chain = &fpipeline;
+        ext[next++] = VK_EXT_PIPELINE_ROBUSTNESS_EXTENSION_NAME;
+        ext[next++] = VK_EXT_ROBUSTNESS_2_EXTENSION_NAME;
+    }
     u32 nq = g_vk.compute_family == g_vk.gfx_family ? 1 : 2;
     if (g_vk.video_family != ~0u)
         qci[nq++] = (VkDeviceQueueCreateInfo){.sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO,
@@ -614,6 +686,7 @@ static int create_device(void) {
     g_vk.feat2 = (VkPhysicalDeviceFeatures2){
         .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, .pNext = &g_vk.feat11, .features = g_vk.feat};
     volkLoadDevice(g_vk.dev);
+    pm_lock_announce(&g_vklock, "vulkan"); /* the device's calls, every thread's */
     vkGetDeviceQueue(g_vk.dev, g_vk.gfx_family, 0, &g_vk.gfx);
     vkGetDeviceQueue(g_vk.dev, g_vk.compute_family, second ? 1 : 0, &g_vk.compute);
     VmaVulkanFunctions vf = {.vkGetInstanceProcAddr = vkGetInstanceProcAddr,

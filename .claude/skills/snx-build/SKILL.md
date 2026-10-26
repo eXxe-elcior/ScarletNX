@@ -101,9 +101,11 @@ build/scarletnx -r work/<Game>             # runtime and game module, both with 
 ```
 
 `scarletnx -r` uses the LLVM backend, the only one. Its objects aren't
-cached: each recompile builds every unit again. A change to `a64_templates.inc`
-needs the matching change in `src/common/cpu/recompiler/llvm/ir_*.c` (`snx-test-llvm-differential` finds the
-difference).
+cached: each recompile builds every unit again. A change to the decoder's profile
+(`src/common/cpu/aarch64/decode/a64.profile`) or to an emitter (`src/common/cpu/recompiler/llvm/ir_int.c`,
+`ir_ldst.c`, `ir_fpu.c`, `ir_vec*.c`, ported from QEMU) is checked against `qemu-aarch64` by
+`llvm_qemu_differential` (`ctest -R llvm_qemu_differential`; the binary's `--sweep` takes more words and states). A
+difference not listed in `tests/llvm_qemu_expected.txt` fails it, and so does a listed one that is gone.
 
 ## Adding or bumping a third-party package
 
@@ -128,7 +130,7 @@ packages. Inside an AppImage argv[0] points into its mount: anything that finds 
 through `g_exedir`, which `main.c` takes from `$APPIMAGE`.
 
 `cmake --install` puts the license files in `share/licenses/scarletnx`: `LICENSE`, then a folder per library or
-ported code built into the runtime or the driver (those with no license file of their own, like DejaVu Sans and
+ported code built into the runtime or the driver (those with no license file of their own, like Noto Sans and
 Ryujinx's default Miis, from `dist/licenses/`). The AppImage copies that folder and adds the licenses of
 the Arch packages it bundles, with their list in `share/licenses/bundled-packages.txt`, and the CI artifacts are the
 install tree. A new package means a new `install(...)` line for its license in `CMakeLists.txt`.

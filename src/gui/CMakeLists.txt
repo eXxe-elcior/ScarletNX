@@ -26,33 +26,33 @@ function(snx_gui_languages target folder out)
         COMMENT "The menu's languages from ${folder}" VERBATIM)
     add_library(${target} STATIC "${out}")
 endfunction()
-snx_gui_languages(snx_gui_languages "${PROJECT_SOURCE_DIR}/po" "${CMAKE_BINARY_DIR}/generated/gui_languages.c")
+snx_gui_languages(snx_gui_languages "${PROJECT_SOURCE_DIR}/po" "${PROJECT_BINARY_DIR}/generated/gui_languages.c")
 # The letters past the VGA font's CP437: GNU Unifont's, the Latin ones (latin.h) kept in unifont-latin.hex and the wide
 # ones the languages show (wide.h) in unifont-wide.hex
-add_custom_command(OUTPUT "${CMAKE_BINARY_DIR}/generated/gui_glyphs.c"
+add_custom_command(OUTPUT "${PROJECT_BINARY_DIR}/generated/gui_glyphs.c"
     COMMAND "${Python3_EXECUTABLE}" "${PROJECT_SOURCE_DIR}/scripts/build-glyphs.py"
-            --out "${CMAKE_BINARY_DIR}/generated/gui_glyphs.c"
+            --out "${PROJECT_BINARY_DIR}/generated/gui_glyphs.c"
     DEPENDS "${PROJECT_SOURCE_DIR}/scripts/build-glyphs.py" "${CMAKE_CURRENT_SOURCE_DIR}/unifont-latin.hex"
             "${CMAKE_CURRENT_SOURCE_DIR}/unifont-wide.hex"
     COMMENT "The menu's Latin and wide glyphs" VERBATIM)
 # the launcher's scenes, generated from ui.txt by tools/uigen: gui/ui.h and gui/ui.c, whose drawing and callbacks
 # main.c defines, so they go into what compiles main.c
 include("${PROJECT_SOURCE_DIR}/cmake/ui.cmake")
-add_custom_command(OUTPUT "${CMAKE_BINARY_DIR}/generated/gui/ui.h" "${CMAKE_BINARY_DIR}/generated/gui/ui.c"
-    COMMAND "${CMAKE_COMMAND}" -E make_directory "${CMAKE_BINARY_DIR}/generated/gui"
-    COMMAND snx-uigen --out "${CMAKE_BINARY_DIR}/generated" "${CMAKE_CURRENT_SOURCE_DIR}/ui.txt"
+add_custom_command(OUTPUT "${PROJECT_BINARY_DIR}/generated/gui/ui.h" "${PROJECT_BINARY_DIR}/generated/gui/ui.c"
+    COMMAND "${CMAKE_COMMAND}" -E make_directory "${PROJECT_BINARY_DIR}/generated/gui"
+    COMMAND snx-uigen --out "${PROJECT_BINARY_DIR}/generated" "${CMAKE_CURRENT_SOURCE_DIR}/ui.txt"
     DEPENDS snx-uigen "${CMAKE_CURRENT_SOURCE_DIR}/ui.txt"
     COMMENT "Generating the launcher's scenes from src/gui/ui.txt" VERBATIM)
-add_library(snx_gui_ui OBJECT "${CMAKE_BINARY_DIR}/generated/gui/ui.c")
-target_include_directories(snx_gui_ui PUBLIC "${CMAKE_BINARY_DIR}/generated")
+add_library(snx_gui_ui OBJECT "${PROJECT_BINARY_DIR}/generated/gui/ui.c")
+target_include_directories(snx_gui_ui PUBLIC "${PROJECT_BINARY_DIR}/generated")
 target_link_libraries(snx_gui_ui PRIVATE SDL3::SDL3) # its platform macros and keycodes
 set_target_properties(snx_gui_ui PROPERTIES C_STANDARD 11 C_STANDARD_REQUIRED ON)
 target_compile_options(snx_gui_ui PRIVATE -Wall -Wextra -Werror=missing-prototypes)
 add_library(snx_gui_support STATIC aot.c model.c browser.c steps.c theme.c recent.c editor.c settings.c place.c clean.c
-            latin.c wide.c ${gui_process}
-            "${CMAKE_BINARY_DIR}/generated/gui_themes.c" "${CMAKE_BINARY_DIR}/generated/gui_glyphs.c")
+            queue.c latin.c wide.c log.c ${gui_process}
+            "${PROJECT_BINARY_DIR}/generated/gui_themes.c" "${PROJECT_BINARY_DIR}/generated/gui_glyphs.c")
 target_link_libraries(snx_gui_support PUBLIC scarletnx-common snx_setup snx_i18n snx_settings)
-target_include_directories(snx_gui_support PRIVATE "${CMAKE_BINARY_DIR}/generated")
+target_include_directories(snx_gui_support PRIVATE "${PROJECT_BINARY_DIR}/generated")
 set_target_properties(snx_gui_support PROPERTIES C_STANDARD 11 C_STANDARD_REQUIRED ON)
 target_compile_options(snx_gui_support PRIVATE -Wall -Wextra -Werror=missing-prototypes)
 if(WIN32)
@@ -116,9 +116,9 @@ if(APPLE)
     set_target_properties(scarletnx-gui PROPERTIES LINKER_LANGUAGE CXX)
 endif()
 set_target_properties(scarletnx-gui PROPERTIES C_STANDARD 11 C_STANDARD_REQUIRED ON
-    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}")
+    RUNTIME_OUTPUT_DIRECTORY "${PROJECT_BINARY_DIR}")
 target_compile_options(scarletnx-gui PRIVATE -Wall -Wextra -Werror=missing-prototypes)
-target_compile_definitions(scarletnx-gui PRIVATE SNX_SOURCE_DIR="${CMAKE_SOURCE_DIR}" SNX_BUILD_DIR="${CMAKE_BINARY_DIR}")
+target_compile_definitions(scarletnx-gui PRIVATE SNX_SOURCE_DIR="${PROJECT_SOURCE_DIR}" SNX_BUILD_DIR="${PROJECT_BINARY_DIR}")
 target_link_libraries(scarletnx-gui PUBLIC snx_gui_support PRIVATE snx_gui_ui scarletnx-common SDL3::SDL3
                       snx_window_icon snx_build_info snx_pad_sdl snx_gui_pad snx_splash snx_gui_languages snx_demangle)
 if(WIN32 AND NOT SNX_BUILD_NX)
@@ -137,16 +137,13 @@ install(FILES FONT-NOTICE.txt MUSL-NOTICE.txt DESTINATION ${CMAKE_INSTALL_DATADI
 # looks for them
 file(GLOB_RECURSE gui_themes RELATIVE "${CMAKE_CURRENT_SOURCE_DIR}" CONFIGURE_DEPENDS themes/*/theme.ini)
 foreach(theme IN LISTS gui_themes)
-    configure_file(${theme} "${CMAKE_BINARY_DIR}/${theme}" COPYONLY)
+    configure_file(${theme} "${PROJECT_BINARY_DIR}/${theme}" COPYONLY)
 endforeach()
 install(DIRECTORY themes DESTINATION ${CMAKE_INSTALL_DATADIR}/scarletnx)
 if(BUILD_TESTING)
     add_executable(snx-test-gui-model "${PROJECT_SOURCE_DIR}/tests/gui_model.c")
     target_link_libraries(snx-test-gui-model PRIVATE snx_gui_support)
     add_test(NAME gui_model COMMAND snx-test-gui-model)
-    add_executable(snx-test-gui-place "${PROJECT_SOURCE_DIR}/tests/gui_place.c")
-    target_link_libraries(snx-test-gui-place PRIVATE snx_gui_support)
-    add_test(NAME gui_place COMMAND snx-test-gui-place)
     # what tools/uigen makes of tests/ui_test.txt, built and run: layouts, drawing, hit tests, actions, hotkeys
     set(gui_ui_test "${CMAKE_CURRENT_BINARY_DIR}/uitest")
     add_custom_command(OUTPUT "${gui_ui_test}/gui/ui.h" "${gui_ui_test}/gui/ui.c"
@@ -164,6 +161,9 @@ if(BUILD_TESTING)
     add_executable(snx-test-gui-recent "${PROJECT_SOURCE_DIR}/tests/gui_recent.c")
     target_link_libraries(snx-test-gui-recent PRIVATE snx_gui_support scarletnx-common)
     add_test(NAME gui_recent COMMAND snx-test-gui-recent)
+    add_executable(snx-test-gui-queue "${PROJECT_SOURCE_DIR}/tests/gui_queue.c")
+    target_link_libraries(snx-test-gui-queue PRIVATE snx_gui_support)
+    add_test(NAME gui_queue COMMAND snx-test-gui-queue)
     add_executable(snx-test-gui-pad "${PROJECT_SOURCE_DIR}/tests/gui_pad.c")
     target_link_libraries(snx-test-gui-pad PRIVATE snx_gui_pad)
     add_test(NAME gui_pad COMMAND snx-test-gui-pad)
@@ -174,7 +174,7 @@ if(BUILD_TESTING)
     target_link_libraries(snx-test-gui-theme PRIVATE snx_gui_support scarletnx-common)
     target_compile_definitions(snx-test-gui-theme PRIVATE SNX_GUI_THEMES_DIR="${CMAKE_CURRENT_SOURCE_DIR}/themes")
     target_compile_definitions(snx-test-gui-theme PRIVATE SNX_GUI_DOCS="${PROJECT_SOURCE_DIR}/docs/GUI.md")
-    target_include_directories(snx-test-gui-theme PRIVATE "${CMAKE_BINARY_DIR}/generated")
+    target_include_directories(snx-test-gui-theme PRIVATE "${PROJECT_BINARY_DIR}/generated")
     add_test(NAME gui_theme COMMAND snx-test-gui-theme)
     add_executable(snx-test-gui-theme-write "${PROJECT_SOURCE_DIR}/tests/gui_theme_write.c")
     target_link_libraries(snx-test-gui-theme-write PRIVATE snx_gui_support scarletnx-common)
@@ -208,6 +208,12 @@ if(BUILD_TESTING)
     # once, in order
     add_test(NAME gui_glyphs_kept COMMAND "${Python3_EXECUTABLE}" "${PROJECT_SOURCE_DIR}/scripts/build-glyphs.py" --check)
     add_test(NAME gui_glyphs_script COMMAND "${Python3_EXECUTABLE}" "${PROJECT_SOURCE_DIR}/tests/glyphs_test.py")
+    add_executable(snx-test-gui-log "${PROJECT_SOURCE_DIR}/tests/gui_log.c")
+    target_link_libraries(snx-test-gui-log PRIVATE snx_gui_support scarletnx-common)
+    add_test(NAME gui_log COMMAND snx-test-gui-log)
+    # cmake/gui_icons.cmake compiles icons.hex, and refuses a glyph missing, blank or out of its place by its icon
+    add_test(NAME gui_icons COMMAND "${CMAKE_COMMAND}" "-DSOURCE=${PROJECT_SOURCE_DIR}"
+             "-DWORK=${CMAKE_CURRENT_BINARY_DIR}/gui-icons-test" -P "${PROJECT_SOURCE_DIR}/tests/gui_icons.cmake")
     add_executable(snx-test-gui-process "${PROJECT_SOURCE_DIR}/tests/gui_process.c")
     target_link_libraries(snx-test-gui-process PRIVATE snx_gui_support scarletnx-common)
     add_test(NAME gui_process_tree COMMAND snx-test-gui-process)
@@ -222,7 +228,9 @@ if(BUILD_TESTING)
     endif()
     # a language of its own (tests/po), not the menu's: the screens' checks hold whatever po/ has
     snx_gui_languages(snx_gui_languages_test "${PROJECT_SOURCE_DIR}/tests/po"
-                      "${CMAKE_BINARY_DIR}/generated/gui_languages_test.c")
+                      "${PROJECT_BINARY_DIR}/generated/gui_languages_test.c")
+    # ui.txt read back: its phones' rows a finger's, as main.c's GUI_FINGER_ROW
+    target_compile_definitions(snx-test-gui-sdl PRIVATE SNX_GUI_UI_TXT="${PROJECT_SOURCE_DIR}/src/gui/ui.txt")
     target_link_libraries(snx-test-gui-sdl PRIVATE snx_gui_support snx_gui_ui scarletnx-common SDL3::SDL3
                           snx_window_icon snx_build_info snx_pad_sdl snx_gui_pad snx_splash snx_gui_languages_test snx_demangle)
     if(APPLE) # it compiles main.c itself, which calls the frontend (apple.m and its Swift), as scarletnx-gui links it
@@ -230,6 +238,9 @@ if(BUILD_TESTING)
         target_link_libraries(snx-test-gui-sdl PRIVATE snx_apple_frontend "-framework Foundation")
         set_target_properties(snx-test-gui-sdl PROPERTIES LINKER_LANGUAGE CXX)
     endif()
+    # the runtime's sections and pages, each of which has an icon in the Settings
+    target_compile_definitions(snx-test-gui-sdl PRIVATE
+                               SNX_GUI_SETTINGS_TXT="${PROJECT_SOURCE_DIR}/src/nx/runtime/settings.txt")
     # TODO: fix this
     if (NOT APPLE)
         add_test(NAME gui_sdl_events COMMAND snx-test-gui-sdl)

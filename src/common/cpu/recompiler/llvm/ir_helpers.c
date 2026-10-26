@@ -12,7 +12,7 @@ static void helper_attribute(SnxIr* ir, LLVMValueRef function, LLVMAttributeInde
 
 /* ---- cpu.h's inline helpers ----
    Each mirrors its C body. They are internal and always inlined, as SNX_INLINE asks, so a constant argument
-   (a condition, a shift type, an access size) folds away as it does in the templates' C compiled with a constant word. */
+   (a condition, a shift type, an access size) folds away. */
 
 typedef struct {
     LLVMBasicBlockRef block;
@@ -750,21 +750,25 @@ LLVMValueRef ir_helper(SnxIr* ir, int id) {
         case SNX_IR_LDX:
             p[0] = ptr, p[1] = ptr, p[2] = i64, p[3] = i32;
             BEGIN("ldx", i64, 4);
+            ir_noregs(ir, function); /* the exclusive monitor alone */
             build_ldx(ir, function);
             break;
         case SNX_IR_STX:
             p[0] = ptr, p[1] = ptr, p[2] = i64, p[3] = i32, p[4] = i64;
             BEGIN("stx", i32, 5);
+            ir_noregs(ir, function); /* the exclusive monitor alone */
             build_stx(ir, function);
             break;
         case SNX_IR_LDXP:
             p[0] = ptr, p[1] = ptr, p[2] = i64, p[3] = i32, p[4] = ptr, p[5] = ptr;
             BEGIN("ldxp", ir->t_void, 6);
+            ir_noregs(ir, function); /* the exclusive monitor alone */
             build_ldxp(ir, function);
             break;
         case SNX_IR_STXP:
             p[0] = ptr, p[1] = ptr, p[2] = i64, p[3] = i32, p[4] = i64, p[5] = i64;
             BEGIN("stxp", i32, 6);
+            ir_noregs(ir, function); /* the exclusive monitor alone */
             build_stxp(ir, function);
             break;
         case SNX_IR_LOOKUP:

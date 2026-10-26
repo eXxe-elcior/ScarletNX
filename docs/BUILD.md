@@ -12,6 +12,7 @@
   * [FreeBSD](#freebsd)
   * [Configure and build](#configure-and-build)
   * [SDL3 troubleshooting](#sdl3-troubleshooting)
+* [macOS](#macos)
 * [Windows / PowerShell](#windows--powershell)
 * [Windows / MSYS2 CLANG64](#windows--msys2-clang64)
 * [Rebuild, deploy, cache](#rebuild-deploy-cache)
@@ -27,6 +28,8 @@ Run from checkout root. [Extract/AOT/run](USAGE.md) · [Tests/diagnostics](DEVEL
   NASM on x86-64, Perl, Python 3 (the menu's languages), Git, pkg-config and `patch`.
   Use a system SDL3 development package, or X11/Wayland and audio development libraries for the bundled
   SDL3 build.
+- **macOS:** Apple silicon, macOS 13 or newer, Xcode (its Clang and SDKs), CMake ≥3.25, Ninja, Python 3 and Git.
+  LLVM's libraries come from `scripts/apple-llvm.sh` or Homebrew ([steps](#macos)).
 - **Windows:** Win10/11 x64. CI builds in MSYS2's CLANG64 environment, which has LLVM's development files
   ([steps](#windows--msys2-clang64)). Bootstrap stages SHA-256-checked llvm-mingw/Clang, CMake, Ninja,
   NASM, Strawberry Perl and w64devkit in `deps/tools`. llvm-mingw has no LLVM libraries, so that route also needs a
@@ -113,11 +116,15 @@ sudo pacman -Syu --needed base-devel git cmake ninja clang llvm nasm perl pkgcon
 
 ### FreeBSD
 
-FreeBSD provides Clang in the base system. Install the remaining tools and the SDL3 package:
+FreeBSD provides Clang in the base system. Install the remaining tools, the SDL3 package, and libusb, which SDL's
+HIDAPI loads at run time to read controllers (an Xbox pad is only read that way):
 
 ```sh
-sudo pkg install git cmake ninja gmake nasm perl5 pkgconf python3 sdl3 llvm
+sudo pkg install git cmake ninja gmake nasm perl5 pkgconf python3 sdl3 llvm libusb
 ```
+
+The build uses that `sdl3` package by default (`SNX_SYSTEM_SDL3`, see [SDL3 troubleshooting](#sdl3-troubleshooting));
+pass `-DSNX_SYSTEM_SDL3=OFF` for CPM's pinned SDL3 source build instead.
 
 ### Configure and build
 
@@ -132,6 +139,11 @@ cmake --preset default -B build && cmake --build build
 On all platforms, CPM first looks for a compatible SDL3 development package (3.4.18 or newer) through
 `SDL3Config.cmake`. If none is found, CPM downloads and builds the SHA-256-pinned SDL3. The fallback is static, so no separate SDL3 runtime
 installation is needed. It still needs your platform's window-system development libraries.
+
+- `SNX_SYSTEM_SDL3=ON` (the default on FreeBSD) takes the system's package from `find_package` whatever its version,
+  needing only 3.4.16, the version every SDL call in the tree is in, and never downloads. FreeBSD's ports `sdl3`
+  (3.4.16) is older than the pin, so without it CPM's version check builds SDL3 from source. `SNX_SYSTEM_SDL3=OFF`
+  keeps the pinned build everywhere.
 
 - An old checkout showing `Could not find a package configuration file provided by SDL3` needs either
   the SDL3 **development** package or this updated fallback. Pull the latest checkout and configure again.
@@ -152,7 +164,9 @@ installation is needed. It still needs your platform's window-system development
   an SDL mapping in `gamecontrollerdb.txt`, as described in [USAGE](USAGE.md). If no joystick appears on Linux,
   check whether `/dev/input/event*` is readable and whether udev marks its event node `ID_INPUT_JOYSTICK=1`.
   The supplied `dist/72-scarletnx-input.rules` grants seat access to recognized joystick event nodes and to the
-  hidraw nodes of the console's controllers. Other HIDAPI controllers may need their vendor's own udev rule. If
+  hidraw nodes of the console's controllers. Other HIDAPI controllers may need their vendor's own udev rule. On
+  FreeBSD the gamepad comes from HIDAPI over libusb or `/dev/uhid*`, never from `/dev/input/event*`: a pad `xb360gp(4)`,
+  `hgame(4)` or `webcamd` claimed is invisible to SDL. See [USAGE](USAGE.md) for the access rules and the packages. If
   the gamepad opens but sends no input, compare the log's controller name and GUID with its mapping and test its
   event node with `evtest`.
 
@@ -164,6 +178,55 @@ cmake --preset default -B build && cmake --build build
 
 If that directory was configured with a different compiler or generator, use a new build directory
 (for example `-B build/clang`) rather than mixing the old cache with the new toolchain.
+
+## macOS
+
+Apple silicon only, with Xcode's Clang. The preset is `macos`, and the Linux presets and `default` do not apply.
+Install Xcode, then the build tools:
+
+```sh
+xcode-select --install
+brew install cmake ninja
+```
+
+1. **LLVM's libraries**, once (about 10 minutes on an M1). The script builds the AArch64 code generator alone,
+   which is the one the recompiler uses:
+
+   ```sh
+   scripts/apple-llvm.sh macos ~/apple-llvm/macos
+   ```
+
+   Homebrew's LLVM also works (`brew install llvm`). Pass `-DSNX_LLVM_CONFIG="$(brew --prefix llvm)/bin/llvm-config"`
+   to the configure step below in place of `-DLLVM_DIR`.
+
+2. **Configure and build:**
+
+   ```sh
+   cmake --preset macos -DLLVM_DIR=$HOME/apple-llvm/macos/lib/cmake/llvm
+   cmake --build --preset macos
+   # -> build/macos/{scarletnx,snx-shaderc}
+   ```
+
+   `build/macos/scarletnx` runs from the terminal as on Linux ([USAGE](USAGE.md)). It loads the system's Vulkan
+   loader, so it needs Homebrew's `molten-vk` and `vulkan-loader`.
+
+3. **The app** (optional), for a double-clickable `ScarletNX.app` that carries its own MoltenVK:
+
+   ```sh
+   cmake build/macos -DSNX_MOLTENVK=<moltenvk>
+   cpack --config build/macos/CPackConfig.cmake -B out   # out/ScarletNX-macos-arm64.zip
+   ```
+
+   `<moltenvk>` is the extracted `MoltenVK-macos.tar` of the
+   [Ryujinx MoltenVK release](https://github.com/V380-Ori/Ryujinx.MoltenVK/releases) that
+   `.github/workflows/build.yml` pins (`MOLTENVK_RELEASE`, with its SHA-256). **Do not leave it out.** Without it the
+   app has no MoltenVK, and on a Mac without Homebrew's it stops at startup with
+   `SDL could not open a Vulkan window: Failed to load Vulkan Portability library`.
+
+CI's `macOS and iOS (arm64)` job builds the app on every push, and its zip, `ScarletNX-macos-arm64-<commit>.zip`,
+already has MoltenVK. The app is signed ad hoc, so a downloaded copy may need *Open* from the Finder's menu the first
+time (`xattr -cr ScarletNX.app` clears the quarantine). More on the frontend, the data folder, iOS and what is missing
+in [macOS and iOS](APPLE.md).
 
 ## Windows / PowerShell
 
@@ -260,6 +323,7 @@ matching `Game_code.so/.dll`, in the data folder's `recompiled/` ([USAGE](USAGE.
 CPM uses [pinned sources](../cmake/dependencies.cmake) and a shared `.cache/cpm` cache. Archive downloads are
 checked by SHA-256. Offline configuration needs the matching sources already in the cache. Cached sources stay unmodified: FFmpeg's patch goes on a copy in the build tree.
 With tests on (`BUILD_TESTING`, the default) and the runtime, libvpx's VP9 test vectors download there too ([tests](../tests/CMakeLists.txt)).
+The Switch runtime's shared font stand-ins download only when it is built ([SHARED_FONTS.md](SHARED_FONTS.md)).
 Override via CMake/env `CPM_SOURCE_CACHE`. SDL3 uses CPM's system-package discovery with a pinned static
 source fallback. Use `-DCPM_DOWNLOAD_SDL3=ON` to request the bundled source build.
 
@@ -299,6 +363,8 @@ cmake --preset default -B build -DSNX_FFMPEG_ASM=OFF && cmake --build build
 - `-DSNX_TOOLS_ONLY=ON`: build the extraction/recompilation driver without the runtime, see below (default OFF).
 - `-DSNX_RECOMPILER_SHARED=ON`, `-DSNX_RECOMPILER_INSTALL=ON`: also build the recompiler as a shared library, and
   install the library, see [LIBRARY.md](LIBRARY.md) (defaults OFF and the value of `SNX_TOOLS_ONLY`).
+- `-DSNX_BUILD_TESTING=OFF`: leave the tests out whatever `BUILD_TESTING` says. ON by default when ScarletNX is the
+  top-level project, OFF when another project adds it with CPM or `add_subdirectory` ([LIBRARY.md](LIBRARY.md)).
 
 Test options, read when `BUILD_TESTING` is on (CTest's default), all OFF by default:
 
@@ -368,7 +434,7 @@ Extraction needs nothing beside the driver: hactool runs inside it. Recompilatio
 running full runtime; the tools-only build creates one in its checkout's `build/native-recomp`, or accepts
 `--runtime FILE`. A build tree's programs work in the same data folder as an installed copy's: the user's
 (`~/.local/share/scarletnx`, `%APPDATA%\scarletnx` on Windows), and on Linux the XDG config, state and cache folders
-hold its settings, logs and caches ([USAGE](USAGE.md#folders)). `--repo DIR` before the command names another data
+hold its settings, logs and caches ([USAGE](USAGE.md#folders)). `--data DIR` before the command names another data
 folder, `--build-dir DIR` another build tree.
 The menu (`SNX_BUILD_GUI`) needs Python 3 to build its languages (`scripts/build-languages.py`,
 [GUI](GUI.md#languages)). Python ≥3.12 is optional for `tools/*.py` diagnostics.
@@ -401,9 +467,13 @@ takes the version in `LLVM_VERSION` (CI gives it the container's, whose `opt` pr
 and with `SNX_SYSROOT` set it cross-builds for another architecture. `SNX_A64_DISASM=OFF` leaves out `scarletnx
 --mcp`'s A64 disassembler, which is for working on the runtime.
 
-`scarletnx-3ds` and `scarletnx-gnuabi` are names of `scarletnx` on Linux and macOS (`SNX_MULTICALL`,
-`src/multicall`), links beside it as `scarletnx-switch` is: one program carries LLVM, SDL and the code the drivers
-share once. Windows, whose zips keep no links, has three programs, as Android and iOS do.
+`scarletnx` is every driver the build has (`src/multicall`): each driver is a library with no `main` of its own,
+and the program, whichever drivers are on (`SNX_BUILD_NX` among them), runs the one its name says, so LLVM, SDL and
+the code the drivers share are in it once. `scarletnx-switch`, `scarletnx-3ds`, `scarletnx-vita`, `scarletnx-gnuabi`
+and `scarletnx-agb` are links to it on Linux and macOS, made in the build folder and installed. Windows, whose zips
+keep no links, installs `scarletnx.exe` alone, which takes a driver's name as its first argument
+(`scarletnx.exe scarletnx-3ds ...`, how the launcher runs them); its build folder has hard links of those names, for
+the tests. Android's and iOS's apps start the program their own way.
 
 [Nightly AppImages](https://github.com/scarletnx/nightly/releases/latest), x86_64 and aarch64 · [Launch](USAGE.md).
 

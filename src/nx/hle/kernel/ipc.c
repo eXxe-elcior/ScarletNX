@@ -8,6 +8,7 @@
 #include "nx/hle/kernel/kernel_int.h"
 #include "nx/hle/hle.h"
 #include "nx/runtime/options.h"
+#include "nx/runtime/platform/tracy.h"
 #include <assert.h>
 
 #define SFCI                 0x49434653u /* the CmifInHeader's magic */
@@ -89,7 +90,7 @@ SvcObj* svcobj_new_data(const char* name, int (*dispatch)(SvcObj*, IpcCtx*), voi
                         u32* next, const char* what) {
     SvcObj* o;
     assert(!base || size >= sizeof(u32));
-    pm_lock(&g_hle.ipc.lk);
+    pm_lock(&g_host.ipc.lk);
     o = (SvcObj*)POOL_TAKE(g_hle.ipc.svcobjs, g_hle.ipc.svcobj_next, "service objects");
     o->name = name;
     o->dispatch = dispatch;
@@ -101,7 +102,7 @@ SvcObj* svcobj_new_data(const char* name, int (*dispatch)(SvcObj*, IpcCtx*), voi
         o->datasize = (u32)size;
         memcpy(o->data, &id, sizeof id);
     }
-    pm_unlock(&g_hle.ipc.lk);
+    pm_unlock(&g_host.ipc.lk);
     return o;
 }
 SvcObj* svcobj_new(const char* name, int (*dispatch)(SvcObj*, IpcCtx*)) {
@@ -113,89 +114,87 @@ void svcobj_ref(SvcObj* o) {
 void svcobj_unref(SvcObj* o) {
     if (!o || __atomic_sub_fetch(&o->refs, 1, __ATOMIC_ACQ_REL)) return;
     if (o->destroy) o->destroy(o); /* outside the lock: it may let go of other objects */
-    pm_lock(&g_hle.ipc.lk);
+    pm_lock(&g_host.ipc.lk);
     if (o->data) pool_put(o->data, o->datasize);
     POOL_PUT(o);
-    pm_unlock(&g_hle.ipc.lk);
+    pm_unlock(&g_host.ipc.lk);
 }
 
 /* ============================================================ domains */
 static Domain* domain_new(SvcObj* root) {
     Domain* d;
-    pm_lock(&g_hle.ipc.lk);
+    pm_lock(&g_host.ipc.lk);
     d = (Domain*)POOL_TAKE(g_hle.ipc.domains, g_hle.ipc.domain_next, "domains");
     d->obj[0] = root;
     d->n = 1;
     d->refs = 1;
-    pm_unlock(&g_hle.ipc.lk);
+    pm_unlock(&g_host.ipc.lk);
     return d;
 }
 static void domain_unref(Domain* d) {
     int i;
     if (!d || __atomic_sub_fetch(&d->refs, 1, __ATOMIC_ACQ_REL)) return;
     for (i = 0; i < d->n; i++) svcobj_unref(d->obj[i]); /* nothing else reaches the domain now */
-    pm_lock(&g_hle.ipc.lk);
+    pm_lock(&g_host.ipc.lk);
     POOL_PUT(d);
-    pm_unlock(&g_hle.ipc.lk);
+    pm_unlock(&g_host.ipc.lk);
 }
 /* object id, with a reference to drop, or NULL */
 static SvcObj* domain_get(Domain* d, u32 id) {
     SvcObj* o = NULL;
     if (!d) return NULL;
-    pm_lock(&g_hle.ipc.lk);
+    pm_lock(&g_host.ipc.lk);
     if (id && id <= (u32)d->n) {
         o = d->obj[id - 1];
         svcobj_ref(o);
     }
-    pm_unlock(&g_hle.ipc.lk);
+    pm_unlock(&g_host.ipc.lk);
     return o;
 }
 /* o joins the domain with its reference: its id */
 static u32 domain_add(Domain* d, SvcObj* o) {
     int i;
-    pm_lock(&g_hle.ipc.lk);
+    pm_lock(&g_host.ipc.lk);
     for (i = 0; i < d->n && d->obj[i]; i++) {}
     assert(i < DOMAIN_OBJECTS);
     if (i == DOMAIN_OBJECTS) fatal("More than %d objects in a domain", DOMAIN_OBJECTS); /* NDEBUG builds */
     if (i == d->n) d->n++;
     d->obj[i] = o;
-    pm_unlock(&g_hle.ipc.lk);
+    pm_unlock(&g_host.ipc.lk);
     return (u32)i + 1;
 }
 /* object id leaves the domain: its reference, for the caller to drop outside the lock, or NULL */
 static SvcObj* domain_take(Domain* d, u32 id) {
     SvcObj* o = NULL;
-    pm_lock(&g_hle.ipc.lk);
+    pm_lock(&g_host.ipc.lk);
     if (id && id <= (u32)d->n) {
         o = d->obj[id - 1];
         d->obj[id - 1] = NULL;
     }
-    pm_unlock(&g_hle.ipc.lk);
+    pm_unlock(&g_host.ipc.lk);
     return o;
 }
 
 /* ============================================================ sessions */
-static void session_destroy(KObj* o) {
+void ksession_destroy(KObj* o) {
     KSession* s = (KSession*)o;
     svcobj_unref(s->obj);
     domain_unref(s->domain);
-    free(o->waiters);
-    pm_lock(&g_hle.ipc.lk);
+    pm_lock(&g_host.ipc.lk);
     POOL_PUT(s);
-    pm_unlock(&g_hle.ipc.lk);
+    pm_unlock(&g_host.ipc.lk);
 }
 /* a session to obj and domain, whose references it takes: its handle (0 when the table is full) */
 static u32 session_make(SvcObj* obj, Domain* d) {
     KSession* s;
     u32 h;
-    pm_lock(&g_hle.ipc.lk);
+    pm_lock(&g_host.ipc.lk);
     s = (KSession*)POOL_TAKE(g_hle.ipc.sessions, g_hle.ipc.session_next, "sessions");
     s->o.type = KO_SESSION;
-    s->o.destroy = session_destroy;
-    s->o.name = obj ? obj->name : "session";
+    kobj_set_name(&s->o, obj ? obj->name : "session");
     s->obj = obj;
     s->domain = d;
-    pm_unlock(&g_hle.ipc.lk);
+    pm_unlock(&g_host.ipc.lk);
     kobj_ref(&s->o); /* so a full handle table destroys it here */
     h = h_new(&s->o);
     kobj_unref(&s->o);
@@ -476,6 +475,7 @@ static void respond(IpcCtx* c) {
 /* the request goes to o's dispatcher, and its result into the reply */
 static void serve(IpcCtx* c, SvcObj* o, u32 seq) {
     u32 in[2];
+    SNX_ZONE_TV(z_ipc, "ipc", c->cmd, "%s cmd %u", o->name, c->cmd);
     ipc_in(c, 0, &in[0], 4);
     ipc_in(c, 4, &in[1], 4);
     snx_le32_array(in, 2);
@@ -563,9 +563,11 @@ u32 ipc_handle(u32 handle, u64 msg_addr, u64 msg_size) {
     Hipc h;
     u32 seq = ring_claim();
     KSession* s = (KSession*)h_get_ref(handle, KO_SESSION);
+    KThread* t = kthread_cur();
     Domain* d;
     const char* name;
     u32 rc = 0;
+    if (t && s) t->req_session = kobj_id(&s->o);
     if (!s) {
         ring_set(seq, IPC_REC_NOT_SESSION, NULL, 0, handle, NULL, R_BADHANDLE, NULL);
         WARN_LIMIT(8, "ipc: a request on handle %x, which isn't a session: InvalidHandle\n", handle);
@@ -617,29 +619,41 @@ u32 ipc_handle(u32 handle, u64 msg_addr, u64 msg_size) {
         else
             answer(&c, RC_UNKNOWNCOMMAND, seq, name, "command");
     }
+    if (t) t->req_session = 0;
     kobj_unref(&s->o);
     return rc;
 }
 
 /* ============================================================ what dispatchers answer */
-/* the count stops at 4, past the three warnings; once the table is full a new pair is never warned of, which is said
-   once */
+/* A game that polls a command nothing implements would fill the log with it: each pair is reported the first time
+   only. Past WARN_PAIRS pairs the table stops growing and new pairs go unreported, which the log is told once */
 int ipc_warn_once(const char* name, u32 cmd) {
-    int i, r = 0;
-    pm_lock(&g_hle.ipc.lk);
-    for (i = 0; i < g_hle.ipc.nseen && (g_hle.ipc.seen[i].cmd != cmd || strncmp(g_hle.ipc.seen[i].name, name, 127)); i++) {}
-    if (i == g_hle.ipc.nseen && g_hle.ipc.nseen < WARN_PAIRS) {
-        strncpy(g_hle.ipc.seen[i].name, name, 127);
-        g_hle.ipc.seen[i].cmd = cmd;
-        g_hle.ipc.nseen++;
+    char key[128];
+    u32 h = 2166136261u, i;
+    size_t k;
+    int report = 0, full = 0;
+    snprintf(key, sizeof key, "%s", name && *name ? name : "?");
+    for (k = 0; key[k]; k++) h = (h ^ (u8)key[k]) * 16777619u; /* FNV-1a over the name, then the command */
+    h = (h ^ cmd) * 16777619u;
+    pm_lock(&g_host.ipc.lk);
+    for (i = h % WARN_SLOTS;; i = (i + 1) % WARN_SLOTS) {
+        if (!g_hle.ipc.seen[i].name[0]) break;
+        if (g_hle.ipc.seen[i].cmd == cmd && !strcmp(g_hle.ipc.seen[i].name, key)) break;
     }
-    if (i < g_hle.ipc.nseen) {
-        r = g_hle.ipc.seen[i].n < 3;
-        if (g_hle.ipc.seen[i].n < 4) g_hle.ipc.seen[i].n++;
+    if (!g_hle.ipc.seen[i].name[0]) {
+        if (g_hle.ipc.nseen < WARN_PAIRS) {
+            memcpy(g_hle.ipc.seen[i].name, key, sizeof key);
+            g_hle.ipc.seen[i].cmd = cmd;
+            g_hle.ipc.nseen++;
+            report = 1;
+        } else if (!g_hle.ipc.warn_full) {
+            g_hle.ipc.warn_full = 1;
+            full = 1;
+        }
     }
-    pm_unlock(&g_hle.ipc.lk);
-    if (i == WARN_PAIRS) WARN_LIMIT(1, "ipc: %d service commands warned of, no more are\n", WARN_PAIRS);
-    return r;
+    pm_unlock(&g_host.ipc.lk);
+    if (full) WARN("ipc: %d unimplemented commands reported, further ones are not\n", WARN_PAIRS);
+    return report;
 }
 /* "undeclared", not "stub": a success carrying none of the command's outputs. The SDK still reads them from the reply,
    past what respond writes, so they are zeroed here: a count, an object or a handle reads as none, not as the request's
@@ -676,7 +690,7 @@ SvcObj* ipc_in_obj(IpcCtx* c, int i) {
 }
 
 /* ============================================================ the service registry */
-/* g_hle.ipc.reg, under g_hle.ipc.lk: a slot array whose live entries have a name (an all-zero one is empty), never
+/* g_hle.ipc.reg, under g_host.ipc.lk: a slot array whose live entries have a name (an all-zero one is empty), never
    freed. A constructor runs outside the lock: it makes a service object, which takes it */
 static int reg_find_nl(const char* name) {
     int i;
@@ -687,7 +701,7 @@ static int reg_find_nl(const char* name) {
 void svc_register(const char* name, SvcCtor ctor) {
     SvcReg* r;
     int i;
-    pm_lock(&g_hle.ipc.lk);
+    pm_lock(&g_host.ipc.lk);
     i = reg_find_nl(name);
     if (i >= 0)
         r = &g_hle.ipc.reg[i];
@@ -696,21 +710,21 @@ void svc_register(const char* name, SvcCtor ctor) {
         r->name = name;
     }
     r->ctor = ctor;
-    pm_unlock(&g_hle.ipc.lk);
+    pm_unlock(&g_host.ipc.lk);
 }
 SvcObj* svc_open(const char* name) {
     SvcCtor ctor = NULL;
     int i;
-    pm_lock(&g_hle.ipc.lk);
+    pm_lock(&g_host.ipc.lk);
     i = reg_find_nl(name);
     if (i >= 0) ctor = g_hle.ipc.reg[i].ctor;
-    pm_unlock(&g_hle.ipc.lk);
+    pm_unlock(&g_host.ipc.lk);
     return ctor ? ctor() : NULL;
 }
 int svc_registered(const char* name) {
     int r;
-    pm_lock(&g_hle.ipc.lk);
+    pm_lock(&g_host.ipc.lk);
     r = reg_find_nl(name) >= 0;
-    pm_unlock(&g_hle.ipc.lk);
+    pm_unlock(&g_host.ipc.lk);
     return r;
 }

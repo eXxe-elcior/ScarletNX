@@ -10,7 +10,8 @@
 #define OVERLAY_COLS     40 /* the panel, in cells of the 8x16 font: the narrowest */
 #define OVERLAY_COLS_MAX 72 /* and the widest, as far as three quarters of the picture let it */
 #define OVERLAY_ROWS     16 /* the tallest page's: the others are as tall as their items */
-enum { OVERLAY_NONE, OVERLAY_CLOSE, OVERLAY_EXIT, OVERLAY_EDIT };
+/* what a menu action leaves to its caller: the save state ones for the slot overlay_slot names */
+enum { OVERLAY_NONE, OVERLAY_CLOSE, OVERLAY_EXIT, OVERLAY_EDIT, OVERLAY_SAVE, OVERLAY_LOAD, OVERLAY_DELETE };
 
 /* whether it is open, for the renderer's thread too */
 int overlay_shown(void);
@@ -49,12 +50,32 @@ void overlay_pointer_move(u64 id, float x, float y, const int safe[4]);
 int overlay_pointer_up(u64 id, float x, float y, int sw, int sh);
 void overlay_pointer_cancel(u64 id);
 void overlay_pointers_reset(void);
-void overlay_draw(SnxUiList* l, int sw, int sh);
+/* the menu, and over the game a notification until its time is up, at now_ns (plat_ns) */
+void overlay_draw(SnxUiList* l, int sw, int sh, u64 now_ns);
+/* a notification of one line in the picture's corner for SNX_OVERLAY_TOAST_MS from now_ns: a save state saved or
+   loaded, a screenshot taken. Under ui_lock */
+#define SNX_OVERLAY_TOAST_MS 3000
+void overlay_toast(const char* text, u64 now_ns);
+int overlay_toasting(u64 now_ns); /* one shows */
+/* The save states' pages: a row per slot, the focused one's thumbnail beside them, and Save, Load and Delete for one
+   (Load and Delete asked first). Slot 0 is the one a load saves over first, which only loads or goes */
+#define OVERLAY_SLOTS_MAX 33
+typedef struct {
+    char when[32]; /* when it was saved, and the play time then; "" for an empty slot */
+    char why[96];  /* why it can't be loaded, "" when it can */
+    u8* thumb;     /* SNX_UI_IMAGE_W x SNX_UI_IMAGE_H RGBA, NULL for none: allocated, the overlay's to free */
+} OverlaySlot;
+/* the slots listed, n of them from slot 0, taken over, under ui_lock: the frontend's as each page opens and after a
+   save or a delete */
+void overlay_slots_set(const OverlaySlot* slots, int n);
+int overlay_slot(void);        /* the slot the last OVERLAY_SAVE, _LOAD or _DELETE is for */
+int overlay_states_shown(void); /* one of the save states' pages shows: the game waits meanwhile */
+int overlay_states_stale(void); /* the slots page opened since the last overlay_slots_set: its list is read again */
 /* the columns the menu's pages and the stopped panel take at scale on a picture sw wide: as many as three quarters of it
    holds, within OVERLAY_COLS and OVERLAY_COLS_MAX */
 int overlay_cols(int sw, int scale);
 /* a fatal error's panel (backend/sdl3.c), a dialog as the menu's pages are: the head, the game's name, the error, what it
-   means and what to do, cut to its width, then Share log, Copy path and Close, one in focus */
+   means and what to do, cut to its width, then Share Log, Copy path and Close, one in focus */
 typedef struct {
     float x, y, w, h;
 } SnxOverlayRect;
@@ -62,7 +83,7 @@ enum { SNX_OVERLAY_ERROR_SHARE, SNX_OVERLAY_ERROR_COPY, SNX_OVERLAY_ERROR_CLOSE,
 typedef struct {
     const char *name, *msg, *how;
     const char* log;  /* the game's log, underlined as a link; NULL for none */
-    const char* said; /* what Share log or Copy path did, over the items; NULL before either */
+    const char* said; /* what Share Log or Copy path did, over the items; NULL before either */
     int focus;        /* one of SNX_OVERLAY_ERROR_SHARE, _COPY and _CLOSE */
     /* drawn: where the log's link and each item are, empty when not shown */
     SnxOverlayRect link, items[SNX_OVERLAY_ERROR_ITEMS];

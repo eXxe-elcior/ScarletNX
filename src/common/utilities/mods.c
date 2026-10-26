@@ -2,6 +2,7 @@
    Copyright 2026 the ScarletNX contributors */
 #include "common/utilities/mods.h"
 #include "common/utilities/game_ini.h"
+#include "common/utilities/patches.h"
 #include <stdlib.h>
 #include <string.h>
 
@@ -119,23 +120,87 @@ static SnxU64 hash(SnxU64 h, const void* data, size_t size) {
     for (i = 0; i < size; ++i) h = (h ^ p[i]) * 0x100000001b3ull;
     return h;
 }
+/* a file of the stamp, by its name and its bytes */
+static SnxU64 hash_file(SnxU64 h, const char* name, const char* path) {
+    size_t size = 0, k;
+    unsigned char* data = snx_read_file(path, &size);
+    unsigned char size_bytes[8];
+    for (k = 0; k < 8; ++k) size_bytes[k] = (unsigned char)((SnxU64)size >> (8 * k));
+    h = hash(h, name, strlen(name) + 1);
+    h = hash(h, size_bytes, sizeof size_bytes);
+    if (data) h = hash(h, data, size);
+    free(data);
+    return h;
+}
 char* snx_mods_stamp(const char* folder, const char* off) {
-    char **names, **paths;
-    size_t count = snx_mods_exefs(folder, off, &names, &paths), i, k;
+    char **names, **paths, **patches;
+    size_t count = snx_mods_exefs(folder, off, &names, &paths), npatches = snx_mods_patches(folder, off, &patches), i;
     SnxU64 h = 0xcbf29ce484222325ull;
     char* stamp;
-    for (i = 0; i < count; ++i) {
-        size_t size = 0;
-        unsigned char* data = snx_read_file(paths[i], &size);
-        unsigned char size_bytes[8];
-        for (k = 0; k < 8; ++k) size_bytes[k] = (unsigned char)((SnxU64)size >> (8 * k));
-        h = hash(h, names[i], strlen(names[i]) + 1);
-        h = hash(h, size_bytes, sizeof size_bytes);
-        if (data) h = hash(h, data, size);
-        free(data);
+    for (i = 0; i < count; ++i) h = hash_file(h, names[i], paths[i]);
+    for (i = 0; i < npatches; ++i) { /* after the files, so a stamp with none of them is the one of before */
+        const char* name = patches[i] + strlen(patches[i]);
+        while (name > patches[i] && name[-1] != '/' && name[-1] != '\\') --name;
+        h = hash_file(h, name, patches[i]);
     }
-    stamp = count ? snx_format("%016llx", (unsigned long long)h) : snx_strdup("");
+    stamp = count || npatches ? snx_format("%016llx", (unsigned long long)h) : snx_strdup("");
     snx_free_strings(names, count);
     snx_free_strings(paths, count);
+    snx_free_strings(patches, npatches);
     return stamp;
+}
+char* snx_game_stamp_for(unsigned abi, const char* mods) {
+    return mods[0] ? snx_format("%u mods %s", abi, mods) : snx_format("%u", abi);
+}
+char* snx_game_mods_stamp(const char* base) {
+    char *folder = snx_dirname(base), *off = NULL, *mods, *made;
+    const char* game = folder + strlen(folder);
+    while (game > folder && game[-1] != '/' && game[-1] != '\\') --game; /* the game's folder is named as it is */
+    mods = snx_game_mods(folder, game, &off);
+    made = snx_mods_stamp(mods, off);
+    free(mods);
+    free(off);
+    free(folder);
+    return made;
+}
+int snx_game_stamp_is(const char* base, const char* expected) {
+    char* stamp = snx_format("%s.abi", base);
+    size_t size = 0;
+    unsigned char* found = snx_read_file(stamp, &size);
+    int same = found && (size = snx_game_stamp_size((const char*)found, size)) == strlen(expected) &&
+               !memcmp(found, expected, size);
+    free(found);
+    free(stamp);
+    return same;
+}
+char* snx_game_made_line(const SnxGameMade* made) {
+    return snx_format("\nmade opt=%c aot=%d found=%llu code=%llu\n", made->opt ? made->opt : '?', made->aot,
+                      made->found, made->code);
+}
+size_t snx_game_stamp_size(const char* text, size_t size) {
+    size_t i;
+    for (i = size; i-- > 0;)
+        if (text[i] == '\n' && size - i > 6 && !memcmp(text + i + 1, "made ", 5)) return i;
+    return size;
+}
+int snx_game_made_read(const char* base, SnxGameMade* made) {
+    char* stamp = snx_format("%s.abi", base);
+    size_t size = 0, at;
+    unsigned char* text = snx_read_file(stamp, &size);
+    SnxGameMade got = {0, -1, 0, 0};
+    char opt = 0;
+    int n = 0, ok;
+    *made = got;
+    free(stamp);
+    if (!text) return 0;
+    at = snx_game_stamp_size((const char*)text, size);
+    ok = at < size &&
+         sscanf((const char*)text + at, "\nmade opt=%c aot=%d found=%llu code=%llu%n", &opt, &got.aot, &got.found,
+                &got.code, &n) == 4 &&
+         n > 0 && opt && strchr("0123sz", opt) && (got.aot == 0 || got.aot == 1) && got.found <= got.code;
+    free(text);
+    if (!ok) return 0;
+    got.opt = opt;
+    *made = got;
+    return 1;
 }

@@ -7,6 +7,17 @@ on:
     branches: [main]
     tags: ['v*'] # a version's release (publish.yml)
   pull_request:
+    # skipped when the change is only in files that no build or test reads. tracked_material.py reads them all and runs
+    # on its own (pr-checks.yml). docs/ARCHITECTURE.md, DEPRECATIONS.md and GUI.md are test inputs: they build
+    paths:
+      - '**'
+      - '!**/*.md'
+      - '!.claude/**'
+      - '!.gitignore'
+      - '!.github/ISSUE_TEMPLATE/**'
+      - 'docs/ARCHITECTURE.md'
+      - 'docs/DEPRECATIONS.md'
+      - 'docs/GUI.md'
   workflow_dispatch:
 
 # Jobs only read the repository. A push to main that builds everywhere becomes a nightly, and a pull request's run a
@@ -71,7 +82,7 @@ jobs:
       - name: Install tools
         run: |
           for try in 1 2 3; do
-            pacman -Syu --noconfirm --needed cmake ninja make patch nasm perl python git clang llvm pkgconf sdl3 libxtst libxrandr libxss vulkan-swrast ccache gdb jq glslang && break
+            pacman -Syu --noconfirm --needed cmake ninja make patch nasm perl python git clang lld llvm qemu-user pkgconf sdl3 libxtst libxrandr libxss vulkan-swrast vulkan-validation-layers ccache gdb jq glslang && break
             [ "$try" = 3 ] && exit 1
             sleep 5
           done
@@ -121,9 +132,20 @@ jobs:
             echo "SNX_DEPS_CACHE=$ws/.cache/deps"
             echo "SNX_CCACHE_START=$(date +%s)"
           } >> "$GITHUB_ENV"
+      # Unicorn 2.1.4, the A32 and Thumb differentials' reference (SNX_TEST_ARM_DIFF), in a venv: Arch's Python takes no
+      # pip install of its own. PyPI drops a connection now and then, so it is tried 3 times, 5 s apart
+      - name: Install Unicorn
+        run: |
+          python -m venv --system-site-packages .cache/unicorn
+          for try in 1 2 3; do
+            .cache/unicorn/bin/pip install --quiet unicorn==2.1.4 && break
+            [ "$try" = 3 ] && exit 1
+            sleep 5
+          done
       - name: Build the runtime
         run: |
-          cmake --preset default -DSNX_TEST_VP9_VECTORS=ON -DCMAKE_C_COMPILER_LAUNCHER=ccache \
+          cmake --preset default -DSNX_TEST_VP9_VECTORS=ON -DSNX_TEST_ARM_DIFF=ON \
+            -DPython3_EXECUTABLE="$PWD/.cache/unicorn/bin/python" -DCMAKE_C_COMPILER_LAUNCHER=ccache \
             -DCMAKE_CXX_COMPILER_LAUNCHER=ccache
           cmake --build --preset default --parallel "$(getconf _NPROCESSORS_ONLN)"
           cmake --install build/default --prefix stage
@@ -176,10 +198,10 @@ jobs:
           path: .cache/deps
           key: ${{ steps.deps-used.outputs.key }}
       - name: Test headless Vulkan and NX runtime
-        run: ctest --test-dir build/headless -R '^(vulkan_headless|nx_runtime_homebrew|nx_runtime_homebrew_64k_pages)$' --output-on-failure
+        run: ctest --test-dir build/headless -R '^(vulkan_headless|vulkan_headless_vic_validation|nx_runtime_homebrew|nx_runtime_homebrew_64k_pages)$' --output-on-failure
       # The game modules compile src/common/cpu/aarch64/cpu_helpers.c, which no CMake target does
       - name: Check the ABI helpers compile
-        run: clang -fsyntax-only -Wall -fno-strict-aliasing -fwrapv -I src src/common/cpu/aarch64/cpu_helpers.c
+        run: clang -fsyntax-only -Wall -I src src/common/cpu/aarch64/cpu_helpers.c
       - name: Test native tooling and indexed filesystems
         run: ctest --test-dir build/default --output-on-failure --parallel 4
       - name: Check optional Python diagnostics
@@ -222,7 +244,7 @@ jobs:
       - name: Install tools
         run: |
           for try in 1 2 3; do
-            pacman -Syu --noconfirm --needed cmake ninja make patch nasm perl python git clang llvm pkgconf sdl3 libxtst libxrandr libxss vulkan-swrast ccache gdb jq glslang && break
+            pacman -Syu --noconfirm --needed cmake ninja make patch nasm perl python git clang lld llvm qemu-user pkgconf sdl3 libxtst libxrandr libxss vulkan-swrast vulkan-validation-layers ccache gdb jq glslang && break
             [ "$try" = 3 ] && exit 1
             sleep 5
           done
@@ -366,7 +388,7 @@ jobs:
   #         path: .cache/deps
   #         key: ${{ steps.deps-used.outputs.key }}
   #     # every test through qemu-ppc64le (the preset's emulator and QEMU_LD_PREFIX), the recompiler's included: the
-  #     # LLVM backend's PowerPC code against the C templates (llvm_differential), linked by link_elf.c and loaded
+  #     # LLVM backend's PowerPC code (native_codegen, native_recompiler), linked by link_elf.c and loaded
   #     - name: Test under qemu-user
   #       run: ctest --preset linux-ppc64le-cross --parallel "$(getconf _NPROCESSORS_ONLN)"
 
@@ -440,15 +462,16 @@ jobs:
             echo "SNX_DEPS_CACHE=$GITHUB_WORKSPACE/.cache/deps"
             echo "SNX_CCACHE_START=$(date +%s)"
           } >> "$GITHUB_ENV"
-      # the Linux runtime and the programs of the tests below, no more: the services' tests are configured even without
-      # the Switch runtime, and need its libraries
+      # the Linux runtime (scarletnx with the GNU ABI driver alone, scarletnx-gnuabi a link to it) and the programs of
+      # the tests below, no more: the services' tests are configured even without the Switch runtime, and need its
+      # libraries
       - name: Build
         run: |
           cmake --preset linux-ppc64-cross -DSNX_OPT_FLAGS="-O2 -g0" \
-            -DSNX_BUILD_NX=OFF -DSNX_BUILD_3DS=OFF -DSNX_BUILD_GUI=OFF \
+            -DSNX_BUILD_NX=OFF -DSNX_BUILD_3DS=OFF -DSNX_BUILD_VITA=OFF -DSNX_BUILD_AGB=OFF -DSNX_BUILD_GUI=OFF \
             -DCMAKE_C_COMPILER_LAUNCHER=ccache -DCMAKE_CXX_COMPILER_LAUNCHER=ccache
           cmake --build --preset linux-ppc64-cross --parallel "$(getconf _NPROCESSORS_ONLN)" \
-            --target scarletnx-gnuabi-run snx-test-cas128 snx-test-endian snx-test-gnuabi-runtime snx-test-gnuabi-vfs \
+            --target scarletnx snx-test-cas128 snx-test-endian snx-test-gnuabi-runtime snx-test-gnuabi-vfs \
             snx-test-gnuabi-hostfs snx-test-gnuabi-network
       - name: Trim the compiler cache
         shell: bash
@@ -558,14 +581,14 @@ jobs:
       - name: Install the packaging tools
         uses: pkgforge-dev/anylinux-setup-action@b2d1ce4216f71162e00ae58fa11ee9aeb723d0d5 # v5
         env:
-          QUICK_SHARUN: https://raw.githubusercontent.com/pkgforge-dev/Anylinux-AppImages/e97c4932e3b445a2de8136253e4cf41537896723/useful-tools/quick-sharun.sh
-          DEBLOATED_PACKAGES: https://raw.githubusercontent.com/pkgforge-dev/Anylinux-AppImages/e97c4932e3b445a2de8136253e4cf41537896723/useful-tools/get-debloated-pkgs.sh
-          MAKE_AUR_PACKAGE: https://raw.githubusercontent.com/pkgforge-dev/Anylinux-AppImages/e97c4932e3b445a2de8136253e4cf41537896723/useful-tools/make-aur-package.sh
+          QUICK_SHARUN: https://raw.githubusercontent.com/pkgforge-dev/Anylinux-AppImages/c28bb80743106fdf08cb10fb27d19d9932eb0865/useful-tools/quick-sharun.sh
+          DEBLOATED_PACKAGES: https://raw.githubusercontent.com/pkgforge-dev/Anylinux-AppImages/c28bb80743106fdf08cb10fb27d19d9932eb0865/useful-tools/get-debloated-pkgs.sh
+          MAKE_AUR_PACKAGE: https://raw.githubusercontent.com/pkgforge-dev/Anylinux-AppImages/c28bb80743106fdf08cb10fb27d19d9932eb0865/useful-tools/make-aur-package.sh
       - name: Check the packaging tools
         run: |
           sha256sum -c <<'EOF'
-          33b661316746a8152cef2e5b65cc8a83da2e7512db970d20821b0eccc86e5eb1  /usr/local/bin/quick-sharun
-          217ff68aafe085d2d4ab34a50e267805af43736ad8ef880c01ef88e52db8589f  /usr/local/bin/get-debloated-pkgs
+          4ce6946b8d6c9d0f472d41ad533e920132de66ec58d1e3445ea4f1d27376eec7  /usr/local/bin/quick-sharun
+          c8880a7e2f0a47b68ed5ae34e1b7aeecc2e5b3a55f3583b0b43d9818a15dbe8b  /usr/local/bin/get-debloated-pkgs
           86afbf5045b78020c93fcd35bf0f642765a8dc339bb2dce534a0461ce3d3508d  /usr/local/bin/make-aur-package
           EOF
       # llvm: Clang's own, and the opt of the LLVM settings; the runtime links LLVM's libraries statically (below)
@@ -659,12 +682,12 @@ jobs:
     timeout-minutes: 180
     continue-on-error: true
     env:
-      QUICK_SHARUN: https://raw.githubusercontent.com/pkgforge-dev/Anylinux-AppImages/e97c4932e3b445a2de8136253e4cf41537896723/useful-tools/quick-sharun.sh
-      QUICK_SHARUN_SHA: 33b661316746a8152cef2e5b65cc8a83da2e7512db970d20821b0eccc86e5eb1
+      QUICK_SHARUN: https://raw.githubusercontent.com/pkgforge-dev/Anylinux-AppImages/c28bb80743106fdf08cb10fb27d19d9932eb0865/useful-tools/quick-sharun.sh
+      QUICK_SHARUN_SHA: 4ce6946b8d6c9d0f472d41ad533e920132de66ec58d1e3445ea4f1d27376eec7
       APPIMAGETOOL_URL: https://github.com/pkgforge-dev/appimagetool/releases/download/0.5.3/appimagetool-full-x86_64-linux
       APPIMAGETOOL_SHA: 9a6fd46ee6bc5910e7acfa68f9d8090f3751e956840b90304ef57d64321a530d
-      DEBLOATED_PACKAGES: https://raw.githubusercontent.com/pkgforge-dev/Anylinux-AppImages/e97c4932e3b445a2de8136253e4cf41537896723/useful-tools/get-debloated-pkgs.sh
-      DEBLOATED_PACKAGES_SHA: 217ff68aafe085d2d4ab34a50e267805af43736ad8ef880c01ef88e52db8589f
+      DEBLOATED_PACKAGES: https://raw.githubusercontent.com/pkgforge-dev/Anylinux-AppImages/c28bb80743106fdf08cb10fb27d19d9932eb0865/useful-tools/get-debloated-pkgs.sh
+      DEBLOATED_PACKAGES_SHA: c8880a7e2f0a47b68ed5ae34e1b7aeecc2e5b3a55f3583b0b43d9818a15dbe8b
     strategy:
       fail-fast: false
       matrix:
@@ -1409,7 +1432,6 @@ jobs:
           cmake --preset macos -DLLVM_DIR="$PWD/apple-llvm/lib/cmake/llvm" -DSNX_TEST_VP9_VECTORS=ON \
             -DCMAKE_C_COMPILER_LAUNCHER=ccache -DCMAKE_CXX_COMPILER_LAUNCHER=ccache
           cmake --build --preset macos --parallel "$(getconf _NPROCESSORS_ONLN)"
-          cmake --install build/macos --prefix stage-macos
       - name: Build the app for iOS
         id: ios-build
         if: ${{ !cancelled() && steps.ios-llvm-build.outcome != 'failure' }}
@@ -1417,7 +1439,6 @@ jobs:
           cmake --preset ios -DLLVM_DIR="$PWD/ios-llvm/lib/cmake/llvm" \
             -DCMAKE_C_COMPILER_LAUNCHER=ccache -DCMAKE_CXX_COMPILER_LAUNCHER=ccache
           cmake --build --preset ios --parallel "$(getconf _NPROCESSORS_ONLN)"
-          cmake --install build/ios --prefix stage-ios
       - name: Trim the compiler cache
         if: ${{ !cancelled() }}
         run: |
@@ -1444,11 +1465,11 @@ jobs:
           key: ${{ steps.deps-used.outputs.key }}
       - name: Check the ABI helpers compile
         if: ${{ !cancelled() && steps.macos-build.outcome == 'success' }}
-        run: clang -fsyntax-only -Wall -fno-strict-aliasing -fwrapv -I src src/common/cpu/aarch64/cpu_helpers.c
+        run: clang -fsyntax-only -Wall -I src src/common/cpu/aarch64/cpu_helpers.c
       - name: Test native tooling and indexed filesystems
         if: ${{ !cancelled() && steps.macos-build.outcome == 'success' }}
         run: ctest --test-dir build/macos --output-on-failure --parallel 4
-      # ditto keeps the app's links and its signature, which zip would not
+      # the app, signed ad hoc, and its zip, by CPack (cmake/apple_package.cmake)
       - name: Make the macOS app
         if: ${{ !cancelled() && steps.macos-build.outcome == 'success' }}
         run: |
@@ -1456,8 +1477,10 @@ jobs:
             "https://github.com/V380-Ori/Ryujinx.MoltenVK/releases/download/$MOLTENVK_RELEASE/MoltenVK-macos.tar"
           echo "$MOLTENVK_MACOS_SHA256  moltenvk-macos.tar" | shasum -a 256 -c
           mkdir moltenvk-macos && tar -xf moltenvk-macos.tar -C moltenvk-macos
-          scripts/apple-app.sh macos stage-macos app-macos moltenvk-macos
-          ditto -c -k --keepParent app-macos/ScarletNX.app ScarletNX-macos-arm64-${{ steps.commit.outputs.short }}.zip
+          cmake build/macos -DSNX_MOLTENVK="$PWD/moltenvk-macos"
+          cpack --config build/macos/CPackConfig.cmake -B app-macos \
+            -D CPACK_PACKAGE_FILE_NAME=ScarletNX-macos-arm64-${{ steps.commit.outputs.short }}
+          mv app-macos/ScarletNX-macos-arm64-${{ steps.commit.outputs.short }}.zip .
       - uses: actions/upload-artifact@v7
         if: ${{ !cancelled() && steps.macos-build.outcome == 'success' }}
         with:
@@ -1473,8 +1496,10 @@ jobs:
             "https://github.com/V380-Ori/Ryujinx.MoltenVK/releases/download/$MOLTENVK_RELEASE/MoltenVK-ios.tar"
           echo "$MOLTENVK_IOS_SHA256  moltenvk-ios.tar" | shasum -a 256 -c
           mkdir moltenvk-ios && tar -xf moltenvk-ios.tar -C moltenvk-ios
-          scripts/apple-app.sh ios stage-ios app-ios moltenvk-ios
-          mv app-ios/ScarletNX.ipa ScarletNX-ios-arm64-${{ steps.commit.outputs.short }}.ipa
+          cmake build/ios -DSNX_MOLTENVK="$PWD/moltenvk-ios"
+          cpack --config build/ios/CPackConfig.cmake -B app-ios \
+            -D CPACK_PACKAGE_FILE_NAME=ScarletNX-ios-arm64-${{ steps.commit.outputs.short }}
+          mv app-ios/ScarletNX-ios-arm64-${{ steps.commit.outputs.short }}.ipa .
       - uses: actions/upload-artifact@v7
         if: ${{ !cancelled() && steps.ios-build.outcome == 'success' }}
         with:

@@ -117,7 +117,13 @@ static void test_first(App* app) {
     shows_big(app, "SETUP", rgb(app->theme.ink), title_size(app));
     shows(app, "Changed in older versions", rgb(app->theme.page)); /* YoRHa's: in the box of ink at the foot */
     shows(app, "Notice", rgb(app->theme.page));                    /* the tab shown, inverted */
-    shows(app, "1 Appearance", rgb(app->theme.ink));
+    shows(app, ICON_PALETTE " Appearance", rgb(app->theme.ink));
+    hides(app, "1 " ICON_PALETTE " Appearance", rgb(app->theme.ink));
+    { /* each tab its icon and its name, no number: the six fit a 1280 window at 2x, as before their icons */
+        int i, cols = 0;
+        for (i = 0; i < app->setup_count; ++i) cols += tab_cols(app, i) + 3;
+        assert((cols + 1) * 16 <= 1280);
+    }
     /* the notices one a page, 1/n, read to the last before the setup goes on: Next, Back past the first (the focus
        kept on it while pressed), and OK on the last only; ESC asks to exit, as the menu's */
     {
@@ -188,13 +194,23 @@ static void test_first(App* app) {
         assert(x == row.x + cell_w(app) / 2 + appearance_column(app) * cell_w(app) && y > row.y);
     }
     shows(app, "< YoRHa >", rgb(app->theme.ink));
-    {
+    { /* UI scale: its slider, the size at the row's end (#613) */
         char line[64];
-        snprintf(line, sizeof line, "  Auto (%dx)  ...", app->auto_scale);
-        shows(app, line, rgb(app->theme.ink));
+        GuiSetupBoxes c;
+        GuiAppearanceBoxes a;
+        GuiRect row;
+        int x, y;
+        snprintf(line, sizeof line, "Auto (%dx)", app->auto_scale);
+        setup_boxes(app, &c);
+        appearance_boxes(app, c.content, &a);
+        row = appearance_row_box(app, &a, GUI_APPEARANCE_TEXT);
+        assert(find_text(app, line, rgb(app->theme.ink), 1, &x, &y));
+        assert(x + (int)strlen(line) * cell_w(app) <= row.x + row.w - cell_w(app) && x > row.x + row.w / 2);
+        assert(app->slider_bar.w >= GUI_SIZE_STEPS * cell_w(app) && app->slider_bar.y == row.y &&
+               app->slider_bar.x == row.x + cell_w(app) / 2 + appearance_column(app) * cell_w(app));
     }
-    hides(app, "Next", rgb(app->theme.page));      /* drawn, not in focus */
-    key(app, SDLK_RETURN); /* as Settings > App's Enter: the language a step on, the page kept */
+    hides(app, "Next", rgb(app->theme.page)); /* drawn, not in focus */
+    key(app, SDLK_RETURN);                    /* as Settings > App's Enter: the language a step on, the page kept */
     assert(page(app) == SNX_SETUP_LANGUAGE && app->setup_row == GUI_APPEARANCE_LANGUAGE && app->language == 2);
     key(app, SDLK_LEFT);
     assert(!app->language);
@@ -241,7 +257,10 @@ static void test_first(App* app) {
         assert(app->setup_row == GUI_APPEARANCE_NEXT && page(app) == SNX_SETUP_LANGUAGE);
         point(app, appearance_row_box(app, &a, GUI_APPEARANCE_THEME), false);
         assert(app->setup_row == GUI_APPEARANCE_THEME);
-        point(app, appearance_row_box(app, &a, GUI_APPEARANCE_TEXT), true); /* UI scale clicked: its box */
+        { /* UI scale clicked on its name, off its slider: its box */
+            GuiRect text = appearance_row_box(app, &a, GUI_APPEARANCE_TEXT);
+            mouse_px(app, text.x + 2 * cell_w(app), text.y + text.h / 2, true);
+        }
         assert(app->sizes_shown && app->setup_row == GUI_APPEARANCE_TEXT && app->language == 2);
         key(app, SDLK_ESCAPE);
         assert(!app->sizes_shown);
@@ -291,10 +310,47 @@ static void test_first(App* app) {
     path = join(home, ".config/scarletnx/app.ini");
     assert(!snx_is_file(path)); /* kept for the setup's end, in the folders Install picks */
     free(path);
-    key(app, SDLK_LEFT); /* UI scale's box again, closed by ESC */
+    key(app, SDLK_LEFT); /* its slider a step back: Auto, asked about as App's is, ESC bringing 1x back */
+    assert(!app->menu.text_size && app->confirm.shown && app->confirm.ask == GUI_ASK_TEXT && app->size_slid);
+    key(app, SDLK_ESCAPE);
+    assert(!app->confirm.shown && app->menu.text_size == 1 && app->setup_row == GUI_APPEARANCE_TEXT);
+    key(app, SDLK_RETURN); /* its box again, closed by ESC */
     assert(app->sizes_shown);
     key(app, SDLK_ESCAPE);
     assert(!app->sizes_shown && app->setup_on && page(app) == SNX_SETUP_LANGUAGE);
+    /* the Side panel, and Games' View and Icon size, as Settings > App and the View box have them, their words: a step
+       either way, kept for the setup's end; Icon size the grid's, greyed in the list, a step there saying why (#614) */
+    key(app, SDLK_DOWN);
+    assert(app->setup_row == GUI_APPEARANCE_SIDE && app->side_box == GUI_SIDE_AUTO);
+    render(app);
+    shows(app, "< Auto >", rgb(app->theme.page)); /* in focus, inverted */
+    key(app, SDLK_RIGHT);
+    assert(app->side_box == GUI_SIDE_ON && app->setup_save);
+    key(app, SDLK_DOWN);
+    assert(app->setup_row == GUI_APPEARANCE_VIEW && !games_grid(app));
+    render(app);
+    shows(app, "< List >", rgb(app->theme.page));
+    shows(app, "< Medium >", rgb(app->theme.soft)); /* Icon size, greyed */
+    key(app, SDLK_DOWN);
+    assert(app->setup_row == GUI_APPEARANCE_ICONS);
+    key(app, SDLK_RIGHT);
+    assert(app->options[GUI_OPTION_ICONS] == 1 && !strcmp(app->message, "Icon size is the grid's: View is List"));
+    app->message[0] = 0;
+    key(app, SDLK_UP);
+    key(app, SDLK_RETURN); /* Grid */
+    assert(games_grid(app) && app->setup_row == GUI_APPEARANCE_VIEW);
+    key(app, SDLK_DOWN);
+    key(app, SDLK_RIGHT);
+    assert(app->options[GUI_OPTION_ICONS] == 2);
+    render(app);
+    shows(app, "< Large >", rgb(app->theme.page));
+    key(app, SDLK_UP);
+    key(app, SDLK_LEFT); /* the list again */
+    assert(!games_grid(app));
+    path = join(home, ".config/scarletnx/app.ini");
+    assert(!snx_is_file(path)); /* still for the setup's end */
+    free(path);
+    key(app, SDLK_DOWN);
     key(app, SDLK_DOWN);
     assert(app->setup_row == GUI_APPEARANCE_NEXT);
     render(app);
@@ -358,7 +414,7 @@ static void test_first(App* app) {
     shows(app, "Recompiled", rgb(app->theme.ink));
     key(app, SDLK_DOWN); /* round to Keep */
     key(app, SDLK_RETURN);
-    /* the keys: none, Later in focus; a folder of them installed where the menu keeps them, Use these then */
+    /* the keys: none, Later in focus; a folder of them installed where the menu keeps them, Use These then */
     assert(page(app) == SNX_SETUP_KEYS && app->setup_choice.count == 2 && app->setup_choice.focus == 1);
     key(app, SDLK_UP);
     key(app, SDLK_RETURN);
@@ -420,6 +476,9 @@ static void test_first(App* app) {
     }
     holds(config, "app.ini", "language = xx\n");
     holds(config, "app.ini", "theme = yorha\nui_scale = 1\n");
+    holds(config, "app.ini", "side_box = on\n");
+    holds(config, "app.ini", "games_view = list\n");
+    holds(config, "app.ini", "games_icons = large\n");
     path = join(home, ".config/scarletnx/setup.ini");
     assert(!snx_is_file(path)); /* nothing in the user's folders */
     free(path);
@@ -572,12 +631,42 @@ static void test_places(App* app) {
     assert(b.content.h == b.place.list.h && !b.choices.tab.h);
     assert(SDL_abs(b.choices.box.x + b.choices.box.w / 2 - (b.place.list.x + b.place.list.w / 2)) <= cell_w(app));
     assert(SDL_abs(b.choices.box.y + b.choices.box.h / 2 - (b.place.list.y + b.place.list.h / 2)) <= cell_h(app));
-    shows(app, "Install type", rgb(app->theme.warning));
+    shows(app, "Install Type", rgb(app->theme.warning));
     shows(app, "2/5", rgb(app->theme.soft));
     app->theme = *gui_theme_builtin("yorha");
+    /* the foot: the tips beside the keys, halves; where half is under the keys' widest sentence, which a row cannot
+       break (the narrowest window, 800 wide, at 4x: the foot's letters 3x), the keys that wide and the tips what is
+       left */
+    render(app);
+    setup_boxes(app, &b);
+    assert(b.place.tips.h && b.place.tips.y == b.place.keys.y && SDL_abs(b.place.tips.w - b.place.keys.w) <= 1);
+    { /* a row of the foot's letters for the keys, two with [tips] wrap: the tips' rows */
+        int fs = foot_scale(app);
+        assert(b.place.keys.h == 16 * fs + 4 * fs);
+        app->theme.tips_wrap = true;
+        render(app);
+        setup_boxes(app, &b);
+        /* two, four pixels between them for the keys' buttons (hints_h) */
+        assert(b.place.keys.h == 2 * 16 * fs + 4 * fs + 4 * fs && b.place.tips.h == b.place.keys.h);
+        app->theme.tips_wrap = false;
+    }
+    assert(SDL_SetWindowSize(app->window, 800, 1024));
+    SDL_SyncWindow(app->window);
+    app->menu.text_size = GUI_TEXT_MAX;
+    render(app);
+    setup_boxes(app, &b);
+    assert(app->scale == 4);
+    {
+        int least = frame_keys_least(app);
+        assert(least > (b.place.tips.w + b.place.keys.w) / 2 && b.place.keys.w == least && b.place.tips.w > 0 &&
+               b.place.tips.w + cell_w(app) + least == b.place.keys.x + b.place.keys.w - b.place.tips.x);
+    }
+    app->menu.text_size = 0;
+    assert(SDL_SetWindowSize(app->window, width, height));
+    SDL_SyncWindow(app->window);
     setup_finish(app);
     free(file);
-    puts("PASS the question where options-dialog puts it");
+    puts("PASS the question where options-dialog puts it, the foot's keys their widest sentence wide");
 }
 
 /* Skip, on the first page alone, after its choices: every page left taken as its defaults have it (the notices read

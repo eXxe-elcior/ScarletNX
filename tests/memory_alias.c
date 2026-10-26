@@ -3,15 +3,18 @@
 /* Views of guest memory through the alias pool, with the real POSIX platform layer (memfd, userfaultfd write
    tracking): MapMemory's view and its source, code memory's owner and slave, ldr:ro's code view and shared memory are
    the same pages; the pool gives everything back; write tracking keeps working over remapped ranges. Skips (77)
-   where the host has no pool */
+   where the host has no pool. --copies runs the same calls with alias_pool=0, as Windows has them: views are
+   copies, and a flush of a line written through one copies it back into the code */
 #include "nx/hle/kernel/kernel_int.h"
 #include "nx/hle/hle.h"
 #include "nx/gpu/gpu.h"
 #include "nx/runtime/clock.h"
+#include "snx_settings.h"
 #include <dirent.h>
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 #include <unistd.h>
 
 #define MIB (1ull << 20)
@@ -81,8 +84,15 @@ KObj* h_get_ref(u32 h, int type) {
     return test_handle;
 }
 void kobj_ref(KObj* o) { o->refs++; }
+/* the destroys of the types svc_mem.c makes, as kernel.c's kobj_destroy picks them */
 void kobj_unref(KObj* o) {
-    if (!--o->refs && o->destroy) o->destroy(o);
+    if (--o->refs) return;
+    if (o->type == KO_SHMEM)
+        kshmem_destroy(o);
+    else if (o->type == KO_TMEM)
+        tmem_destroy(o);
+    else if (o->type == KO_CODEMEM)
+        kcodemem_destroy(o);
 }
 
 static u32 state(u64 a) {
@@ -209,7 +219,7 @@ static void test_code_memory(void) {
     gw32(owner + 0x10000 + 4, 0x22);
     CHECK(gr32(slave + 4) == 0x22);
     CHECK(svc_codemem_control(o, 0, owner, 0x4000, PERM_RW) == R_BADSTATE);
-    o->destroy(o);
+    kcodemem_destroy(o);
     CHECK(mem_pool_used() == 0 && state(owner + 0x10000) == MS_FREE && state(slave) == MS_FREE);
     mem_query(src, &b);
     CHECK(b.perm == PERM_RW && b.attr == 0 && b.pool == 0);
@@ -237,6 +247,39 @@ static void test_code_view(void) {
     mem_query(m.bss, &b);
     CHECK(b.perm == PERM_RW && b.attr == 0 && b.pool == 0);
     check_tracking(m.source, 0x3000);
+}
+
+/* MapProcessMemory on a host without the pool (Windows, or alias_pool=0): the view is a copy, and a mod that
+   keeps it mapped writes its hook pool through the RW bytes and flushes the line it wrote (IC IVAU). The flush must
+   copy the line back into the code before the runtime compiles it, as a host with the pool gets for free */
+static void test_process_memory_copies(void) {
+    KObj process = {0};
+    u64 src = HEAP_BASE + 0x1000, dst = STACK_BASE + 0x20000, code;
+    int i;
+    process.type = KO_PROCESS;
+    process.refs = 1;
+    test_handle = &process;
+    CHECK(mem_map(src, 0x2000, MS_CODE, PERM_RX) == 0);
+    memset(GP(src), 0, 0x2000); /* the module's hook pool, zeros until the mod writes it */
+    CHECK(svc_map_process_memory(dst, 0x1234, src, 0x2000) == 0);
+    CHECK(state(dst) == MS_SHAREDCODE && state(src) == MS_CODE);
+    CHECK(gr32(dst) == 0 && gr32(src) == 0);
+    gw32(dst + 0x40, 0xD65F03C0); /* a trampoline, through the writable view */
+    CHECK(gr32(src + 0x40) == 0); /* the view is a copy here */
+    CHECK(svc_code_line(dst + 0x40, &code) == 1 && code == src + 0x40);
+    CHECK(gr32(src + 0x40) == 0xD65F03C0);
+    CHECK(svc_code_line(dst + 0x40, &code) == 0); /* the snapshot has it now */
+    /* a patcher flushes the code address, not the view */
+    gw32(dst + 0x100, 0xD503201F);
+    CHECK(svc_code_line(src + 0x100, &code) == 1 && code == src + 0x100);
+    CHECK(gr32(src + 0x100) == 0xD503201F);
+    /* a line the view didn't write is no change */
+    for (i = 0; i < 0x2000; i += 0x40)
+        if (i != 0x40 && i != 0x100) CHECK(svc_code_line(src + (u64)i, &code) == 0);
+    CHECK(svc_unmap_process_memory(dst, 0x1234, src, 0x2000) == 0);
+    CHECK(state(dst) == MS_FREE && gr32(src + 0x40) == 0xD65F03C0 && gr32(src + 0x100) == 0xD503201F);
+    CHECK(mem_unmap(src, 0x2000) == 0);
+    test_handle = NULL;
 }
 
 /* shared memory: the service's pointer and every guest mapping are the same pages */
@@ -288,7 +331,7 @@ static void test_pool_full(u64 info) {
     CHECK(info_attr_perm(info, src, &perm) == 0 && perm == PERM_RW);
     s = kshmem_new(0x2000, "copy");
     CHECK(s && !s->pool && kshmem_ptr(s) == s->host);
-    s->o.destroy(&s->o);
+    kshmem_destroy(&s->o);
     CHECK(svc_map_memory(dst, src, 0x1000) == 0 && mem_pool_used() == 0x1000); /* what fits */
     CHECK(svc_unmap_memory(dst, src, 0x1000) == 0 && mem_pool_used() == 0);
     g_pool_size = keep;
@@ -307,7 +350,7 @@ static void test_cycles(void) {
         CHECK(gr32(dst + (u64)(i & 7) * 0x10000) == (u32)i);
         CHECK(svc_unmap_memory(dst + (u64)(i & 7) * 0x10000, src, 0x8000) == 0);
         s = kshmem_new(0x1000, "cycle");
-        s->o.destroy(&s->o);
+        kshmem_destroy(&s->o);
     }
     CHECK(mem_pool_used() == 0 && count_fds() == fds);
     CHECK(count_maps() <= maps + 2);
@@ -315,20 +358,57 @@ static void test_cycles(void) {
     check_tracking(HEAP_BASE, 0x3000); /* the heap's own pages beside it */
 }
 
-int kobj_never_signaled(KObj* o) {
-    (void)o;
-    return 0;
+
+/* GPU-owned physical pages retain their normal guest state after moving into the alias pool. */
+static void test_physical_pool(void)
+{
+	u64 a = ALIAS_BASE + 0x1000000;
+	MemPoolRun runs[4];
+	u32 n;
+	MemBlock b;
+	u64 used = mem_pool_used();
+
+	CHECK(mem_map_physical(a, 0x4000, 1ull << 30) == 0);
+	CHECK(mem_own_prepare(a, 0x3000, runs, 4, &n) == 0 && n == 1);
+	CHECK(mem_pool_used() == used + 0x3000);
+	CHECK(mem_unmap_physical(a + 0x1000, 0x1000) == 0);
+	CHECK(mem_pool_used() == used + 0x2000);
+	mem_query(a, &b);
+	CHECK(b.state == MS_NORMAL && b.pool);
+	mem_query(a + 0x2000, &b);
+	CHECK(b.state == MS_NORMAL && b.pool);
+	CHECK(mem_unmap_physical(a, 0x4000) == 0);
+	CHECK(mem_pool_used() == used && g_phys_mapped == 0);
+	CHECK(mem_map_physical(a, 0x4000, 1ull << 30) == 0);
+	CHECK(gr32(a) == 0 && gr32(a + 0x2000) == 0);
+	CHECK(mem_unmap_physical(a, 0x4000) == 0);
 }
 
-int main(void) {
+int main(int argc, char** argv) {
+    int copies = argc > 1 && strcmp(argv[1], "--copies") == 0;
+    /* --copies runs the Windows path on a host that has a pool (alias_pool=0) */
+    if (copies) g_settings.alias_pool = 0;
     hle_init();
-    u64 info = STACK_BASE, off;
+    u64 info = STACK_BASE, off, mapped = 0, hole = 0;
     u8* p;
+    /* the address space as plat_posix.c reads it, which a host thread that cannot start logs: told on Linux and on
+       Apple's systems, every host's pages whatever their size */
+#if defined(__linux__) || defined(__APPLE__)
+    CHECK(plat_address_space(&mapped, &hole) && mapped > 0 && hole > 0);
+#else
+    CHECK(!plat_address_space(&mapped, &hole));
+#endif
     if (sysconf(_SC_PAGESIZE) != 4096) {
         printf("skipped: this host's pages are %ld bytes, and guest memory needs 4 KiB ones\n", sysconf(_SC_PAGESIZE));
         return 77;
     }
     mem_init();
+    if (copies) {
+        test_process_memory_copies();
+        CHECK(mapping_depth == 0);
+        printf("memory alias copies: %u checks passed\n", checks);
+        return 0;
+    }
     p = mem_pool_host(0x1000, &off);
     if (!p) {
         printf("skipped: no alias pool on this host (views are copies)\n");
@@ -348,6 +428,7 @@ int main(void) {
     test_shared_memory();
     test_pool_full(info);
     test_cycles();
+    test_physical_pool();
     CHECK(mapping_depth == 0);
     if (g_ww) CHECK(plat_ww_scan(g_mem, AS_SIZE, on_written) == 0); /* tracking never went off */
     printf("memory alias: %u checks passed%s\n", checks, g_ww ? "" : " (no write tracking)");

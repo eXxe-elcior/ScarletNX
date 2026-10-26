@@ -23,6 +23,7 @@
 /* Including the production file exposes its service constructors without test hooks in the runtime. */
 #include "nx/hle/filesystem/fs.c"
 #include "nx/hle/hle.c"
+#include "kobj_ids.h" /* the kernel objects the stubs make, as ids */
 
 u8* g_mem;
 u64 g_as_size = AS_MAX; /* the reservation's size, mem.c's, which this test does not link */
@@ -76,26 +77,9 @@ void pm_unlock(PMutex* m) { pthread_mutex_unlock(&m->l); }
 int plat_mkdir(const char* path) { return mkdir(path, 0777); }
 #endif
 
-int plat_dir_open(PDir* d, const char* path) {
-    (void)d;
-    (void)path;
-    test_fail("HLE attempted platform directory enumeration", __LINE__);
-    return -1;
-}
-int plat_dir_next(PDir* d) {
-    (void)d;
-    test_fail("HLE attempted platform directory enumeration", __LINE__);
-    return 0;
-}
-void plat_dir_close(PDir* d) { (void)d; }
 int plat_is_dir(const char* path) {
     (void)path;
     test_fail("HLE attempted host existence query", __LINE__);
-    return 0;
-}
-u64 plat_file_size(const char* path) {
-    (void)path;
-    test_fail("HLE attempted host size query", __LINE__);
     return 0;
 }
 i64 plat_pread(FILE* f, void* buf, u64 size, u64 off) {
@@ -208,13 +192,14 @@ void svcobj_unref(SvcObj* obj) {
 }
 /* the notifiers' events: counted, so the test sees each one dropped with its notifier */
 static int test_events;
-KEvent* owned_event(const char* name) {
+u32 owned_event(const char* name) {
     KEvent* event = calloc(1, sizeof *event);
     CHECK(event != NULL);
     (void)name;
+    event->o.type = KO_EVENT;
     event->o.refs = 1;
     test_events++;
-    return event;
+    return kobj_id(&event->o);
 }
 void kobj_unref(KObj* o) {
     if (--o->refs) return;
@@ -223,7 +208,8 @@ void kobj_unref(KObj* o) {
 }
 static KEvent* test_handles[32]; /* handle 0x100 + i is a reference on test_handles[i], as the kernel's would be */
 static unsigned test_nhandles;
-u32 ev_handle(KEvent* event) {
+u32 ev_handle(u32 ev) {
+    KEvent* event = kev(ev);
     CHECK(test_nhandles < sizeof test_handles / sizeof test_handles[0]);
     event->o.refs++;
     test_handles[test_nhandles] = event;
@@ -828,6 +814,57 @@ static void test_virtual_services(SvcObj* fs, SvcObj* proxy) {
         }
         svcobj_unref(ngword);
     }
+
+    /* MiiModel (0100000000000802), with none in system/archives: a placeholder with no parts, the six resource files
+       each a magic (NFTR for the textures, NFSR for the shapes) and version 1, then nought as long as the SDK's
+       loader reads its tables: 0x2428 bytes of a texture file, 0x14dd4 of a shape file */
+    {
+        static const char* const names[6] = {"NXTextureLowLinear.dat", "NXTextureLowSRGB.dat",
+                                             "NXTextureMidLinear.dat", "NXTextureMidSRGB.dat",
+                                             "ShapeHigh.dat",          "ShapeMid.dat"};
+        Request a;
+        unsigned i;
+        request(&a, 202);
+        argument64(&a, 8, 0x0100000000000802ull);
+        dispatch(proxy, &a, 0);
+        CHECK(a.c.nout_objs == 1);
+        SvcObj* model = a.c.out_objs[0];
+        u64 model_size = get_size(model);
+        CHECK(model_size > 4 * 0x2428 + 2 * 0x14dd4 && model_size <= 0x34000);
+        test_storage_contracts(model, model_size);
+        /* the RomFS header and tables, then each file in pieces the test's guest memory holds */
+        u8 tables[0x400];
+        request(&a, 0);
+        argument64(&a, 0, 0);
+        argument64(&a, 8, sizeof tables);
+        output_buffer(&a, sizeof tables);
+        dispatch(model, &a, 0);
+        memcpy(tables, GP(0x5000), sizeof tables);
+        u64 header[10];
+        memcpy(header, tables, sizeof header);
+        snx_le64_array(header, 10);
+        CHECK(header[0] == 0x50 && header[9] <= sizeof tables && header[9] < model_size);
+        for (i = 0; i < 6; i++) {
+            u32 entry = romfs_find(tables, header, 0, 0, names[i]);
+            u64 offset, size, done;
+            CHECK(entry != UINT32_MAX);
+            offset = snx_ld_le64(tables + header[7] + entry + 8);
+            size = snx_ld_le64(tables + header[7] + entry + 16);
+            CHECK(size == (i < 4 ? 0x2428u : 0x14dd4u) && header[9] + offset + size <= model_size);
+            for (done = 0; done < size; done += 0x8000) {
+                u64 n = size - done < 0x8000 ? size - done : 0x8000, j;
+                const u8* piece = GP(0x5000);
+                request(&a, 0);
+                argument64(&a, 0, header[9] + offset + done);
+                argument64(&a, 8, n);
+                output_buffer(&a, n);
+                dispatch(model, &a, 0);
+                if (!done) CHECK(!memcmp(piece, i < 4 ? "NFTR\1\0\0\0" : "NFSR\1\0\0\0", 8));
+                for (j = done ? 0 : 8; j < n; j++) CHECK(piece[j] == 0);
+            }
+        }
+        svcobj_unref(model);
+    }
     puts("PASS HLE readonly virtual files and synthetic system archive");
 }
 
@@ -1053,7 +1090,7 @@ static void test_raw_romfs(SvcObj* proxy) {
 #undef romfs_build
 #endif
 #if !defined(_WIN32)
-/* Extract game container off: dump-data/Game_data has no ExeFS or RomFS of its own, and dump-data/Game.source links to
+/* Extract dump off: dump-data/Game_data has no ExeFS or RomFS of its own, and dump-data/Game.source links to
    an NSP of decrypted NCAs, which fs_init opens and maps. The game's ExeFS (exefs/...) and RomFS come out of it, read
    in place: nothing is written beside it. With source, the settings' source= names the NSP instead, and Game.source
    is a file that is no dump, which the setting is read over */
@@ -1283,7 +1320,7 @@ static void test_overlay(void) {
     strcpy(g_settings.game_addons, "0100000000AB1001");
     strcpy(g_addondir, "overlay-data/0100000000AB0000_0100000000AB0800_data/");
     strcpy(g_datadir, "overlay-data/0100000000AB0000_data/");
-    fs_init();
+    fs_init(NULL, NULL);
     data = fs_read_file("exefs/main", &size);
     CHECK(data && size == 17 && !memcmp(data, "the update's main", 17));
     free(data);
@@ -1331,8 +1368,11 @@ static const char* const mod_made[][2] = {
     {"mods-data/0100000000AB0000_data/mods/2 second/romfs/dir/b.bin", "second's b"},
     {"mods-data/0100000000AB0000_data/mods/2 second/exefs/main", "second's main"},
     {"mods-data/0100000000AB0000_data/mods/2 second/exefs/notes.txt", "no part of the program"},
+    {"mods-data/0100000000AB0000_data/mods/2 second/exefs/frames.pchtxt", "@nsobid-0123\n@enabled\n"},
+    {"mods-data/0100000000AB0000_data/mods/1 first/exefs/0123.ips", "PATCHEOF"},
     {"mods-data/0100000000AB0000_data/mods/3 off/romfs/a.bin", "off's a"},
     {"mods-data/0100000000AB0000_data/mods/3 off/exefs/subsdk0", "off's subsdk0"},
+    {"mods-data/0100000000AB0000_data/mods/3 off/exefs/0123.ips", "PATCHEOF"},
     {"mods-data/0100000000AB0000_data/mods/.hidden/romfs/a.bin", "hidden's a"},
     {"mods-data/0100000000AB0000_data/mods/readme.txt", "no mod"},
 };
@@ -1365,11 +1405,15 @@ static void test_mods(SvcObj* proxy, int image, int stale) {
     u8* data = fs_read_file("exefs/main", &size);
     const u8* bytes;
     FsNode* node;
-    if (stale) { /* the program's own ExeFS, said */
+    if (stale) { /* the program's own ExeFS, said, and no patch: its code was made without them */
         CHECK(data && size == 15 && !memcmp(data, "the game's main", 15));
         CHECK(strstr(test_fs_text, "the program was recompiled with none of them") != NULL && g_hle.fs.nmexefs == 0);
-    } else {
+        CHECK(g_hle.fs.npatches == 0);
+    } else { /* and the patches it was made with, for the loader: the played mods' in their order */
         CHECK(data && size == 13 && !memcmp(data, "second's main", 13) && g_hle.fs.nmexefs == 1);
+        CHECK(g_hle.fs.npatches == 2 && strstr(g_hle.fs.patches[0], "1 first") &&
+              strstr(g_hle.fs.patches[0], "0123.ips") && strstr(g_hle.fs.patches[1], "2 second") &&
+              strstr(g_hle.fs.patches[1], "frames.pchtxt"));
     }
     free(data);
     data = fs_read_file("exefs/main.npdm", &size);
@@ -1474,7 +1518,9 @@ static void mods_write(int image, int stale) {
     mods = snx_mods_folder("mods-data/0100000000AB0000_data");
     stamp = snx_mods_stamp(mods, g_settings.game_mods_off);
     CHECK(strlen(stamp) == 16);
-    text = stale ? snx_strdup("1") : snx_format("1 mods %s", stamp);
+    /* the image run's stamp ends with the made line the recompile writes now, the other's is one from before it */
+    text = stale ? snx_strdup("1")
+                 : snx_format("1 mods %s%s", stamp, image ? "\nmade opt=2 aot=1 found=10 code=20\n" : "");
     CHECK(!snx_write_file("mods-data/0100000000AB0000.abi", text, strlen(text)));
     free(text);
     free(stamp);
@@ -1520,6 +1566,117 @@ static int tree_has(const char* path) {
     int found = !fs_tree_lookup(&g_hle.fs.tree, NULL, path, &node);
     pm_unlock(&g_hle.fs.tree.lock);
     return found;
+}
+/* save states (runtime/state.c): the bytes a state's sections hold, in memory */
+typedef struct {
+    u8* p;
+    u64 n, at;
+} StateBytes;
+static int bytes_put(void* ctx, const void* p, u64 n) {
+    StateBytes* b = (StateBytes*)ctx;
+    u8* more = (u8*)realloc(b->p, (size_t)(b->n + n + 1));
+    if (!more) return -1;
+    b->p = more;
+    memcpy(b->p + b->n, p, (size_t)n);
+    b->n += n;
+    return 0;
+}
+static int bytes_get(void* ctx, void* p, u64 n) {
+    StateBytes* b = (StateBytes*)ctx;
+    if (n > b->n - b->at) return -1;
+    memcpy(p, b->p + b->at, (size_t)n);
+    b->at += n;
+    return 0;
+}
+static void temp_empty(void) { /* as fs_init leaves it: every launch starts the temporary storage empty */
+    pm_lock(&g_hle.fs.tree.lock);
+    FsTreeResult r = fs_tree_remove(&g_hle.fs.tree, NULL, "save/temp", 1, 1, 0);
+    pm_unlock(&g_hle.fs.tree.lock);
+    CHECK(r == FS_TREE_OK || r == FS_TREE_NOTFOUND);
+}
+/* the state's open file systems, files and folders found again, as state_load does first: NULL with why when refused */
+static FsStaged* resolve_fs(StateBytes* list, StateBytes* temp, const HleFs* saved, char* why, size_t size) {
+    StateIo lio = {list, bytes_put, bytes_get}, tio = {temp, bytes_put, bytes_get};
+    list->at = 0;
+    if (temp) temp->at = 0;
+    return fs_state_resolve(&lio, temp ? &tio : NULL, saved, why, size);
+}
+/* and then what the running game had open let go of, and the state's in place: 0, or -1 with why when refused */
+static int load_fs(StateBytes* list, StateBytes* temp, const HleFs* saved, char* why, size_t size) {
+    FsStaged* st = resolve_fs(list, temp, saved, why, size);
+    if (!st) return -1;
+    fs_state_drop();
+    fs_state_install(st);
+    return 0;
+}
+/* A state holds the application's temporary storage whole, which every launch empties: a load in a fresh process puts
+   its folders and files back before it opens what the game had open there, and a load in the running game takes what
+   the game wrote there since away. A state from before states held it is refused as it was, and one whose save/temp
+   names a path out of it, or lacks a file the game had open there, is refused before anything changes */
+static void test_state_temp(SvcObj* proxy) {
+    StateBytes list = {0}, temp = {0}, bad = {0};
+    StateIo lio = {&list, bytes_put, bytes_get}, tio = {&temp, bytes_put, bytes_get}, bio = {&bad, bytes_put, bytes_get};
+    char why[256];
+    SvcObj* fs = open_save_data(proxy, 51, 4); /* Temporary */
+    CHECK(tree_has("save/temp"));
+    fs_command(fs, 0, "/a.bin", 0, 0);
+    fs_command(fs, 2, "/d", 0, 0);
+    fs_command(fs, 0, "/d/b.bin", 0, 0);
+    SvcObj* a = open_object(fs, 8, "/a.bin", 7);
+    write_data(a, 0, "hello", 5, 0);
+    SvcObj* b = open_object(fs, 8, "/d/b.bin", 7);
+    write_data(b, 0, "xyz", 3, 0);
+    svcobj_unref(b);
+    HleFs* saved = (HleFs*)malloc(sizeof *saved);
+    CHECK(saved != NULL);
+    *saved = g_hle.fs; /* what the state's g_hle holds of fs */
+    CHECK(!fs_state_save(&lio) && !fs_state_temp_save(&tio));
+
+    /* a fresh process: nothing open (Windows deletes no open file), save/temp empty, and the game had it and a.bin in it
+       open */
+    fs_state_drop();
+    temp_empty();
+    CHECK(!tree_has("save/temp"));
+    CHECK(!resolve_fs(&list, NULL, saved, why, sizeof why) &&
+          strstr(why, "the game had save/temp open, which isn't there"));
+    FsStaged* fresh = resolve_fs(&list, &temp, saved, why, sizeof why);
+    CHECK(fresh != NULL);
+    fs_state_install(fresh);
+    CHECK(tree_has("save/temp/a.bin") && tree_has("save/temp/d") && tree_has("save/temp/d/b.bin"));
+    CHECK(read_data(a, 0, 16, 0) == 5 && !memcmp(GP(0x5000), "hello", 5)); /* a.bin open again, its bytes the state's */
+    b = open_object(fs, 8, "/d/b.bin", 1);
+    CHECK(read_data(b, 0, 16, 0) == 3 && !memcmp(GP(0x5000), "xyz", 3));
+    svcobj_unref(b);
+
+    /* the running game: what it wrote there since the save goes, what was there comes back */
+    write_data(a, 0, "HELLO, again", 12, 0);
+    fs_command(fs, 0, "/c.bin", 4, 0);
+    CHECK(!load_fs(&list, &temp, saved, why, sizeof why));
+    CHECK(!tree_has("save/temp/c.bin") && tree_has("save/temp/d/b.bin"));
+    CHECK(read_data(a, 0, 16, 0) == 5 && !memcmp(GP(0x5000), "hello", 5));
+
+    /* a save/temp naming a path out of it, and one without the a.bin the game had open: refused, nothing changed */
+    static const char out[] = "../escape.bin";
+    u32 one = 1, file = 2, n = sizeof out - 1, zero = 0;
+    u64 size = 1;
+    CHECK(!io_put32(&bio, one) && !io_put32(&bio, file) && !io_put32(&bio, n) && !io_put(&bio, out, n) &&
+          !io_put64(&bio, size) && !io_put(&bio, "x", 1) && !io_put32(&bio, zero));
+    CHECK(load_fs(&list, &bad, saved, why, sizeof why) && !strcmp(why, "its temporary storage is damaged"));
+    free(bad.p);
+    bad = (StateBytes){0};
+    CHECK(!io_put32(&bio, one) && !io_put32(&bio, zero));
+    CHECK(load_fs(&list, &bad, saved, why, sizeof why) &&
+          strstr(why, "the game had save/temp/a.bin open, which the state's temporary storage doesn't hold"));
+    CHECK(tree_has("save/temp/a.bin") && read_data(a, 0, 16, 0) == 5);
+
+    svcobj_unref(a);
+    svcobj_unref(fs);
+    temp_empty();
+    free(bad.p);
+    free(list.p);
+    free(temp.p);
+    free(saved);
+    puts("PASS a state's save/temp: put back in a fresh process and over the running game's, damaged ones refused");
 }
 /* the event notifiers (500, 501, 510) give the same event each time, never signaled, and drop it with themselves;
    OpenSaveDataTransferProhibiter (83) gives a prohibiter; OpenDataFileSystemWithProgramIndex (204) has no data
@@ -1713,13 +1870,19 @@ static void cleanup_service(void) {
     CHECK(test_shared == 0);
 }
 
-int kobj_never_signaled(KObj* o) {
-    (void)o;
-    return 0;
-}
 
+/* rhash against the RomFS format's definition, worked by hand: the seed is the parent's offset xor 123456789
+   (0x075BCD15), each byte rotates right by 5 then xors in. "a": 0x075BCD15 ror 5 = 0xA83ADE68, xor 0x61 = 0xA83ADE09.
+   A byte past 0x7F counts unsigned */
+static void test_rhash(void) {
+    CHECK(rhash(0, "") == 0x075BCD15u);
+    CHECK(rhash(0, "a") == 0xA83ADE09u);
+    CHECK(rhash(0x18, "Data") == 0x0418D017u);
+    CHECK(rhash(0, "\xC3\xA9") == 0x5D41D65Cu);
+}
 int main(int argc, char** argv) {
     hle_init();
+    test_rhash();
     g_hle.kernel.title_id = 0x0100000000010000ull; /* the title the test was written for */
     CHECK((argc == 3 || argc == 4) && strstr(argv[1], "scarletnx-fs-tree-") != NULL);
     CHECK(!test_chdir(argv[1]));
@@ -1737,7 +1900,7 @@ int main(int argc, char** argv) {
         dump_write(source);
         if (source) strcpy(g_settings.game_dump, "dump-data/Game.nsp");
         strcpy(g_datadir, "dump-data/Game_data/");
-        fs_init();
+        fs_init(NULL, NULL);
         test_scans_allowed = 0;
         svc_fs_init();
         romfs_init();
@@ -1757,7 +1920,7 @@ int main(int argc, char** argv) {
         addon_write(update, !strcmp(argv[3], "dump-update-extracted"));
         strcpy(g_settings.game_dump, "dump-data/Game.nsp"); /* the game's .ini's, which the add-on runs with */
         strcpy(g_datadir, "dump-data/Game_data/");
-        fs_init();
+        fs_init(NULL, NULL);
         test_scans_allowed = 0;
         svc_fs_init();
         romfs_init();
@@ -1786,7 +1949,7 @@ int main(int argc, char** argv) {
         CHECK(strcmp(ini, ini_file()) != 0);
         if (gone) strcpy(g_settings.game_dump, "dump-data/Gone.nsp");
         strcpy(g_datadir, "dump-data/Game_data/");
-        fs_init();
+        fs_init(NULL, NULL);
         if (strcmp(test_fs_text, said)) fprintf(stderr, "said:     %sexpected: %s", test_fs_text, said);
         CHECK(!strcmp(test_fs_text, said) && g_hle.fs.dfs == NULL);
         free(dir);
@@ -1801,7 +1964,7 @@ int main(int argc, char** argv) {
     if (argc == 4 && (!strcmp(argv[3], "mods") || !strcmp(argv[3], "mods-image") || !strcmp(argv[3], "mods-stale"))) {
         int image = !strcmp(argv[3], "mods-image"), stale = !strcmp(argv[3], "mods-stale");
         mods_write(image, stale);
-        fs_init();
+        fs_init(NULL, NULL);
         test_scans_allowed = 0;
         svc_fs_init();
         romfs_init();
@@ -1822,7 +1985,7 @@ int main(int argc, char** argv) {
         return 0;
     }
     strcpy(g_datadir, raw ? "raw-data/" : "service-data/");
-    fs_init();
+    fs_init(NULL, NULL);
     CHECK(test_scans > 0);
     /* the temporary storage the fixture left is gone, from the index and the disk: each launch starts it empty */
     FILE* left = fopen("service-data/save/temp/last-launch.bin", "rb");
@@ -1856,6 +2019,7 @@ int main(int argc, char** argv) {
     test_virtual_services(fs, proxy);
     test_extracted_romfs(proxy);
     test_save_data(proxy);
+    test_state_temp(proxy);
     test_notifiers_and_program_index(proxy);
     svcobj_unref(fs);
     svcobj_unref(proxy);

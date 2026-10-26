@@ -24,12 +24,14 @@ static void name_of(const char* path, char* out, size_t size) {
 int gui_recent_add(GuiRecent* recent, const char* path, int driver, int prepared) {
     GuiRecentGame game;
     int i;
-    if ((driver != GUI_SWITCH && driver != GUI_LINUX && driver != GUI_3DS) || !fits(path, sizeof game.path)) return 1;
+    if ((driver != GUI_SWITCH && driver != GUI_LINUX && driver != GUI_3DS && driver != GUI_VITA && driver != GUI_GBA) ||
+        !fits(path, sizeof game.path))
+        return 1;
     memset(&game, 0, sizeof game);
     strcpy(game.path, path);
     name_of(path, game.name, sizeof game.name);
     game.driver = driver;
-    game.prepared = driver == GUI_3DS ? 0 : prepared;
+    game.prepared = prepared; /* a game made, whichever console's, or its dump or package */
     for (i = 0; i < recent->count; ++i)
         if (!strcmp(recent->game[i].path, path)) {
             if (recent->game[i].driver == driver) strcpy(game.name, recent->game[i].name); /* the run's name stays */
@@ -86,7 +88,8 @@ void gui_recent_load(GuiRecent* recent, const char* file) {
         field[0] = line;
         for (n = 1; n < 4 && (field[n] = strchr(field[n - 1], '\t')) != NULL; ++n) *field[n]++ = 0;
         if (n < 4 || strchr(field[3], '\t') ||
-            (strcmp(field[0], "switch") && strcmp(field[0], "linux") && strcmp(field[0], "3ds")) ||
+            (strcmp(field[0], "switch") && strcmp(field[0], "linux") && strcmp(field[0], "3ds") &&
+             strcmp(field[0], "vita") && strcmp(field[0], "gba")) ||
             (strcmp(field[1], "file") && strcmp(field[1], "games")))
             continue;
         game = &recent->game[recent->count];
@@ -100,8 +103,12 @@ void gui_recent_load(GuiRecent* recent, const char* file) {
             strcpy(game->name, field[3]);
         else
             name_of(game->path, game->name, sizeof game->name);
-        game->driver = field[0][0] == 's' ? GUI_SWITCH : field[0][0] == '3' ? GUI_3DS : GUI_LINUX;
-        game->prepared = game->driver != GUI_3DS && field[1][0] == 'g';
+        game->driver = field[0][0] == 's'   ? GUI_SWITCH
+                       : field[0][0] == '3' ? GUI_3DS
+                       : field[0][0] == 'v' ? GUI_VITA
+                       : field[0][0] == 'g' ? GUI_GBA
+                                            : GUI_LINUX;
+        game->prepared = field[1][0] == 'g';
         recent->count++;
     }
     free(data);
@@ -118,6 +125,8 @@ int gui_recent_save(const GuiRecent* recent, const char* file) {
         at += (size_t)sprintf(text + at, "%s\t%s\t%s\t%s\n",
                               recent->game[i].driver == GUI_SWITCH ? "switch"
                               : recent->game[i].driver == GUI_3DS  ? "3ds"
+                              : recent->game[i].driver == GUI_VITA ? "vita"
+                              : recent->game[i].driver == GUI_GBA  ? "gba"
                                                                    : "linux",
                               recent->game[i].prepared ? "games" : "file", recent->game[i].path, recent->game[i].name);
     /* staged beside it, then put in place: a crash mid-write leaves the old list */

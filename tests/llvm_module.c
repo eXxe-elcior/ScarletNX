@@ -2,15 +2,20 @@
    Copyright 2026 the ScarletNX contributors */
 /* A whole program through the LLVM backend: a synthetic NRO with a loop, BL/RET, an indirect branch inside its
    function (the D_ dispatch), a tail call into another function, SVC, exclusives, FP and SIMD, recompiled by the CLI
-   in small chunks (calls cross units). The module runs it AOT and through the reference interpreter of the templates'
-   C (snx_a64_interp, built here: modules carry none since the runtime JIT replaced it), which also takes the run's
-   misses, from the same state; every register, the flags, FP state, stack memory and the SVC calls must match.
+   in small chunks (calls cross units). The module's run must end in the state qemu-aarch64 -cpu cortex-a57 ends the
+   same program in from the same start (tests/qemu_ref, a free run of the image, its final RET to x30 = 0 taken by
+   hand): every register, the flags, FP state, the stack memory and the SVC call. A miss (RtAPI.miss) stands in for
+   the runtime JIT compiling the code at its pc: the module's function there, made live again, or the image's words
+   as LLVM steps where no function is (the BR's target).
    CPU.poll is set when each run starts: the AOT code must call rt->poll at the loop's backward branch, resuming at
-   its head (the interpreter polls on any taken branch). A second LLVM module built with --hook-direct-calls must run
-   the same, with main's BL to func reaching func through CPU.disp, where a wrapper counts it.
-     llvm_module SCARLETNX REPO CLANG */
-#include "common/cpu/aarch64/a64.h"
-#include "common/cpu/aarch64/a64_emit.h"
+   its head. A second LLVM module built with --hook-direct-calls must run the same, with main's BL to func reaching
+   func through CPU.disp, where a wrapper counts it. With func's functions stale (SnxModule.stale, as the runtime
+   marks them when the guest patches their code: SNX_ABI 14) and out of CPU.disp, main's direct BL must leave the AOT
+   code at func's entry for rt->miss, and the run end the same. With main made stale while it runs (from rt->poll,
+   as a mod patches its caller from inside a call), the next call that returns into main must leave its AOT code
+   too, for the dispatch loop the runtime's threads run, and end the same.
+     llvm_module SCARLETNX REPO */
+#include "llvm_steps.h"
 #include "common/utilities/common.h"
 #include "common/cpu/aarch64/cpu.h"
 #include "nx/loader/module_abi.h"
@@ -32,6 +37,7 @@ static const u32 program[] = {0xD2800000, 0xD2800181, 0x1E6F1001, 0x6F00E402, 0x
 static const u32 tail[] = {0xAA0003E6, 0xD40000E1, 0x9E780009, 0xD65F03C0};
 
 #define IMAGE  0x400
+static u32 g_image_words[IMAGE / 4];
 #define MEMORY 0x10000
 
 static int failures;
@@ -71,6 +77,10 @@ typedef struct {
     int polls; /* rt->poll calls, and c->pc at the first */
     u64 poll_pc;
     int watched; /* calls through the dispatch entry run() wrapped */
+    int stale, stale_misses; /* functions run() made stale, and rt->miss calls at the pc it made them stale at */
+    int stale_on_poll, left;  /* main made stale at the first poll; returns to run()'s loop before the end */
+    int misses, stepped, lost; /* rt->miss calls, those the steps ran, and those nothing could run */
+    u64 base;                 /* the image's */
 } Run;
 static Run* current;
 static GuestFn watched_entry;
@@ -78,76 +88,97 @@ static void watch(CPU* c, u64 e) {
     ++current->watched;
     watched_entry(c, e);
 }
+static u64 g_stale_pc;
+/* what jit_code_changed does to the functions covering pc: out of dispatch first, then the byte. Their number */
+static const SnxModule* g_running;
+static int make_stale(CPU* c, u64 pc) {
+    u64 slots = (g_running->code_hi - g_running->code_lo) / 4, k;
+    u32 f;
+    int n = 0;
+    for (f = 0; f < g_running->nfns; ++f)
+        if (pc >= g_running->fn_lo[f] && pc - g_running->fn_lo[f] < g_running->fn_len[f]) {
+            for (k = 0; k < slots; ++k)
+                if (c->disp[k] == g_running->fn[f]) c->disp[k] = NULL;
+            g_running->stale[f] = 1;
+            ++n;
+        }
+    return n;
+}
 /* the runtime takes the thread off its core here, then gives it back: once, the flag cleared */
 static void on_poll(CPU* c) {
-    if (!current->polls++) current->poll_pc = c->pc;
+    if (!current->polls++) {
+        current->poll_pc = c->pc;
+        if (current->stale_on_poll) current->stale += make_stale(c, g_running->mods[0].base + 0x80);
+    }
     c->poll = 0;
 }
 
-static GuestFn reference; /* the templates' interpreter, built by build_reference */
-#ifdef _WIN32
-static HMODULE reference_library; /* unloaded before the fixture goes: Windows deletes no loaded library */
-#else
-static void* reference_library;
-#endif
+/* the image's words as LLVM steps at their pcs (llvm_steps.c), built at the first miss that needs them: what runs
+   code no function of the module covers, as the runtime JIT would compile it (the BR's target, which no analysis
+   finds) */
+static struct {
+    LlvmSteps steps;
+    int ready;
+    u64 base;
+} g_stepper;
 
-/* the interpreter of a64_templates.inc's C, compiled into a library of its own with compiler and loaded: 0, or -1 */
-static int build_reference(const char* root, const char* repo, const char* compiler) {
-    char *source = snx_path_join(root, "reference.c"), *include = snx_path_join(repo, "src"),
-         *tests = snx_path_join(repo, "tests"), *output = NULL;
-#ifdef _WIN32
-    char* library = snx_path_join(root, "reference.dll");
-#else
-    char* library = snx_path_join(root, "reference.so");
-#endif
-    const char* args[16];
-    FILE* file = snx_fopen(source, "wb");
-    int n = 0, status;
-    if (!file) return -1;
-    fputs("#define SNX_A64_REFERENCE\n#include \"common/cpu/aarch64/cpu.h\"\n#include \"common/cpu/aarch64/cpu_helpers.c\"\n", file);
-    snx_a64_interp(file, 0);
-    fputs("SNX_EXPORT void snx_reference(CPU* c, u64 e) { snx_interp(c, e); }\n", file);
-    if (fclose(file)) return -1;
-    args[n++] = compiler;
-    args[n++] = "-O1";
-    args[n++] = "-shared";
-#ifndef _WIN32
-    args[n++] = "-fPIC";
-#endif
-    args[n++] = "-fno-strict-aliasing";
-    args[n++] = "-fwrapv";
-#if defined(__x86_64__) || defined(_M_X64)
-    args[n++] = "-mcx16";
-#endif
-    args[n++] = "-w";
-    args[n++] = "-I";
-    args[n++] = include;
-    args[n++] = "-I";
-    args[n++] = tests;
-    args[n++] = source;
-    args[n++] = "-o";
-    args[n++] = library;
-    args[n] = NULL;
-    status = snx_run(args, root, NULL, &output);
-    if (status && output) fputs(output, stderr);
-    free(output);
-    if (status) return -1;
-#ifdef _WIN32
-    reference_library = LoadLibraryA(library);
-    reference = reference_library ? (GuestFn)(void*)GetProcAddress(reference_library, "snx_reference") : NULL;
-#else
-    reference_library = dlopen(library, RTLD_NOW | RTLD_LOCAL);
-    reference = reference_library ? (GuestFn)dlsym(reference_library, "snx_reference") : NULL;
-#endif
-    free(source);
-    free(include);
-    free(tests);
-    free(library);
-    return reference ? 0 : -1;
+static int stepper_build(u64 base) {
+    char error[1024];
+    u32 i;
+    if (g_stepper.ready) return g_stepper.base == base ? 0 : -1;
+    if (llvm_steps_begin(&g_stepper.steps, 1, 0, error, sizeof(error))) return snx_error("%s", error);
+    for (i = 0; i < IMAGE / 4; ++i) llvm_steps_add(&g_stepper.steps, g_image_words[i], base + 4 * i, 0);
+    if (llvm_steps_load(&g_stepper.steps, error, sizeof(error))) return snx_error("%s", error);
+    g_stepper.ready = 1;
+    g_stepper.base = base;
+    return 0;
+}
+
+/* RtAPI.miss: the runtime JIT would compile the code at pc, from bytes that are as they were. Inside a function of
+   the module, that function made live again (its stale byte cleared, its slots of CPU.disp back) stands in for it,
+   entered at pc as a dispatch entry would be. Elsewhere the steps run from pc until the code reaches a function's
+   entry, which they hand on to, as the JIT's code would call or jump to it, or leaves the image (a return) */
+static void miss(CPU* c, u64 pc) {
+    const SnxModule* mod = g_running;
+    const u64 base = mod->mods[0].base;
+    u32 f, i, n;
+    ++current->misses;
+    if (pc == g_stale_pc) ++current->stale_misses;
+    for (f = 0; f < mod->nfns; ++f)
+        if (pc >= mod->fn_lo[f] && pc - mod->fn_lo[f] < mod->fn_len[f]) break;
+    if (f < mod->nfns) {
+        mod->stale[f] = 0;
+        for (i = 0; i < mod->nentries; ++i)
+            if (mod->entry_addr[i] >= mod->fn_lo[f] && mod->entry_addr[i] - mod->fn_lo[f] < mod->fn_len[f])
+                c->disp[(mod->entry_addr[i] - mod->code_lo) / 4] = mod->entry_fn[i];
+        if (current->misses > 100) {
+            ++current->lost;
+            c->pc = 0;
+            return;
+        }
+        mod->fn[f](c, pc);
+        return;
+    }
+    if (stepper_build(base)) {
+        ++current->lost;
+        c->pc = 0;
+        return;
+    }
+    ++current->stepped;
+    for (n = 0; n < 10000 && pc - base < IMAGE; ++n) {
+        GuestFn entry = pc >= mod->code_lo && pc < mod->code_hi ? c->disp[(pc - mod->code_lo) / 4] : NULL;
+        if (entry && n) {
+            entry(c, pc);
+            return;
+        }
+        pc = g_stepper.steps.steps[(pc - base) / 4](c);
+    }
+    if (n == 10000) ++current->lost;
+    c->pc = pc;
 }
 
 /* watch_at: an offset in the image whose dispatch entry counts its calls (0: none) */
-static int run(const char* path, const unsigned char* image, int interp, u64 watch_at, Run* out) {
+static int run(const char* path, const unsigned char* image, u64 watch_at, u64 stale_at, int stale_on_poll, Run* out) {
     typedef const SnxModule* (*ModuleFn)(void);
     ModuleFn get;
     const SnxModule* mod;
@@ -164,12 +195,14 @@ static int run(const char* path, const unsigned char* image, int interp, u64 wat
 #endif
     if (!get) return -1;
     mod = get();
+    g_running = mod;
     memset(out, 0, sizeof(*out));
+    out->stale_on_poll = stale_on_poll;
     memset(&rt, 0, sizeof(rt));
     rt.svc = svc;
     rt.undef = undefined;
     rt.poll = on_poll;
-    rt.miss = reference; /* a pc a module has no function for */
+    rt.miss = miss; /* a pc a module has no function for */
     calls = &out->calls;
     current = out;
     memory = (unsigned char*)calloc(1, (size_t)mod->mods[0].base + MEMORY);
@@ -181,6 +214,12 @@ static int run(const char* path, const unsigned char* image, int interp, u64 wat
         watched_entry = *slot;
         if (watched_entry) *slot = watch;
     }
+    if (stale_at) {
+        out->stale = make_stale(&out->cpu, mod->mods[0].base + stale_at);
+        g_stale_pc = mod->mods[0].base + stale_at;
+    } else {
+        g_stale_pc = ~0ull;
+    }
     out->cpu.mem = memory;
     out->cpu.rt = &rt;
     out->cpu.code_lo = mod->code_lo;
@@ -188,11 +227,20 @@ static int run(const char* path, const unsigned char* image, int interp, u64 wat
     out->cpu.x[31] = mod->mods[0].base + MEMORY / 2;
     out->cpu.x[30] = 0xDEAD0000;
     out->cpu.poll = 1;
-    if (interp)
-        reference(&out->cpu, mod->mods[0].base);
-    else if (out->cpu.disp[0])
+    out->base = mod->mods[0].base;
+    if (out->cpu.disp[0]) {
+        int steps;
         out->cpu.disp[0](&out->cpu, mod->mods[0].base);
+        /* the runtime's thread loop: what the code left at c->pc runs through dispatch, or rt->miss */
+        for (steps = 0; out->cpu.pc && out->cpu.pc != 0xDEAD0000 && steps < 1000; ++steps) {
+            u64 pc = out->cpu.pc;
+            GuestFn f = pc >= mod->code_lo && pc < mod->code_hi ? out->cpu.disp[(pc - mod->code_lo) / 4] : NULL;
+            ++out->left;
+            (f ? f : rt.miss)(&out->cpu, pc);
+        }
+    }
     memcpy(out->memory, memory + mod->mods[0].base, MEMORY);
+    if (stale_at || stale_on_poll) memset(mod->stale, 0, mod->nfns); /* the module's own data, should it stay loaded */
     free(memory);
     free(out->cpu.disp);
 #ifdef _WIN32
@@ -237,14 +285,52 @@ static void differences(const Run* a, const Run* b, const char* what) {
     if (memcmp(&a->calls, &b->calls, sizeof(a->calls))) fprintf(stderr, "  %s calls differ\n", what);
 }
 
+/* the end state qemu-aarch64 -cpu cortex-a57 gives the program from run()'s start (SP base + MEMORY / 2, X30
+   0xDEAD0000, the rest zero, the image in zeroed memory), a free run of the image under tests/qemu_ref's runner with
+   the window and the code at base; the final RET, to the X30 = 0 that main's tail sets, by hand */
+static void expected(Run* want, const unsigned char* image, u64 base) {
+    static const struct {
+        unsigned n;
+        u64 value;
+    } x[] = {{0, 0x49A}, {3, 0x7D}, {5, 0x145}, {6, 0x49A}, {9, 0x3BB4}};
+    static const struct {
+        unsigned n;
+        u64 lo, hi;
+    } v[] = {{0, 0x40CDDA0518000000ull, 0},
+             {1, 0x3FF8000000000000ull, 0},
+             {2, 0x0000B0010000B001ull, 0x0000B0010000B001ull},
+             {3, 0x405F400000000000ull, 0},
+             {4, 0x0000000100000001ull, 0x0000000100000001ull}};
+    const u64 sp = base + MEMORY / 2;
+    unsigned i;
+    memset(want, 0, sizeof(*want));
+    for (i = 0; i < sizeof(x) / sizeof(x[0]); ++i) want->cpu.x[x[i].n] = x[i].value;
+    want->cpu.x[2] = base + 0xC0; /* ADR X2 of the BR's target */
+    want->cpu.x[31] = sp;
+    for (i = 0; i < sizeof(v) / sizeof(v[0]); ++i) {
+        want->cpu.v[v[i].n].d[0] = SNX_GUEST64(v[i].lo);
+        want->cpu.v[v[i].n].d[1] = SNX_GUEST64(v[i].hi);
+    }
+    want->cpu.z = want->cpu.cf = 1; /* NZCV 0110 from the loop's last SUBS */
+    want->cpu.fpsr = 0x10;          /* IXC */
+    want->cpu.pc = 0;
+    /* the image, X0 (0x7D) stored at SP - 16 by the pre-indexed STR, W0 (0x465) by the STLXR at SP, which succeeds */
+    memcpy(want->memory, image, IMAGE);
+    put32(want->memory, MEMORY / 2 - 16, 0x7D);
+    put32(want->memory, MEMORY / 2, 0x465);
+    want->calls.count = 1;
+    want->calls.imm[0] = 7;
+    want->calls.x0[0] = 0x49A;
+}
+
 int main(int argc, char** argv) {
-    static Run runs[2], hooked, unhooked;
+    static Run runs[1], want, hooked, unhooked, stale, stale_running;
     unsigned char image[IMAGE];
     char *root, *input, *self, *out[2], *module[2], *text = NULL;
     const char* args[24];
-    int b, k, interp;
+    int b, k;
     size_t i;
-    if (argc != 4) return 2;
+    if (argc != 3) return 2;
     root = snx_temp_dir(NULL);
     if (!root) return 1;
     memset(image, 0, sizeof(image));
@@ -258,13 +344,12 @@ int main(int argc, char** argv) {
     put32(image, 0x34, 0x80);
     for (i = 0; i < sizeof(program) / sizeof(program[0]); ++i) put32(image, 0x80 + 4 * i, program[i]);
     for (i = 0; i < sizeof(tail) / sizeof(tail[0]); ++i) put32(image, 0x200 + 4 * i, tail[i]);
+    for (i = 0; i < IMAGE / 4; ++i)
+        g_image_words[i] = (u32)image[4 * i] | (u32)image[4 * i + 1] << 8 | (u32)image[4 * i + 2] << 16 |
+                           (u32)image[4 * i + 3] << 24;
     input = snx_path_join(root, "program.nro");
     self = snx_executable(argv[0]);
     check(!snx_write_file(input, image, sizeof(image)), "write NRO");
-    if (build_reference(root, argv[2], argv[3])) {
-        check(0, "build the reference interpreter");
-        return 1;
-    }
     for (b = 0; b < 2; ++b) { /* the second: with --hook-direct-calls */
         out[b] = snx_path_join(root, b ? "llvm-hooked" : "llvm");
 #ifdef _WIN32
@@ -296,33 +381,66 @@ int main(int argc, char** argv) {
         free(text);
         text = NULL;
         if (b) break;
-        for (interp = 0; interp < 2; ++interp)
-            check(!run(module[0], image, interp, 0, &runs[interp]), interp ? "interpreter run" : "AOT run");
+        check(!run(module[0], image, 0, 0, 0, &runs[0]), "AOT run");
     }
     /* func, which main's BL at 0x90 calls on each pass of the loop */
-    check(!run(module[0], image, 0, 0xE8, &unhooked) && !run(module[1], image, 0, 0xE8, &hooked),
+    check(!run(module[0], image, 0xE8, 0, 0, &unhooked) && !run(module[1], image, 0xE8, 0, 0, &hooked),
           "hooked and unhooked runs");
+    check(!run(module[0], image, 0, 0xE8, 0, &stale), "a run with func stale");
+    check(!run(module[0], image, 0, 0, 1, &stale_running), "a run with main made stale while it runs");
+    check(stale_running.stale > 0 && stale_running.left > 0,
+          "a call returning into a function made stale while it ran leaves its AOT code for dispatch");
+    if (!same(&runs[0], &stale_running)) differences(&runs[0], &stale_running, "stale while running");
+    check(same(&runs[0], &stale_running), "the run with main made stale while it runs is the same");
+    check(runs[0].left == 0, "an ordinary run never leaves its AOT code early");
+    check(runs[0].misses == 1 && runs[0].stepped == 1, "the BR's target, no function's code, is the run's one miss");
+    check(!runs[0].lost && !stale.lost && !stale_running.lost && !hooked.lost && !unhooked.lost,
+          "every miss runs");
+    check(stale.stale > 0 && stale.stale_misses > 0, "a stale function's direct caller reaches it through rt->miss");
+    if (!same(&runs[0], &stale)) differences(&runs[0], &stale, "stale");
+    check(same(&runs[0], &stale), "the run with func stale is the same");
     check(same(&runs[0], &hooked), "the --hook-direct-calls module runs the same");
     check(!unhooked.watched && hooked.watched > 0,
           "a direct BL reaches its function through CPU.disp only with --hook-direct-calls");
     check(runs[0].cpu.pc == 0 && runs[0].calls.count == 1 && runs[0].calls.imm[0] == 7 && !runs[0].calls.undefined,
           "the program returns to 0 after one SVC #7");
-    if (!same(&runs[0], &runs[1])) differences(&runs[0], &runs[1], "interpreter");
-    check(same(&runs[0], &runs[1]), "LLVM AOT and the reference interpreter agree");
+    expected(&want, image, runs[0].base);
+    if (!same(&runs[0], &want)) differences(&runs[0], &want, "QEMU");
+    check(same(&runs[0], &want), "LLVM AOT ends as QEMU does");
     /* the loop: b.ne back to main+0x10 */
     if (runs[0].polls != 1 || runs[0].poll_pc != runs[0].cpu.code_lo + 0x90)
         fprintf(stderr, "%d polls, the first at %llx\n", runs[0].polls, (unsigned long long)runs[0].poll_pc);
     check(runs[0].polls == 1 && runs[0].poll_pc == runs[0].cpu.code_lo + 0x90,
           "AOT code polls at the loop's backward branch");
-    check(runs[1].polls == 1, "the interpreter polls");
     printf("x0=%llx x9=%llx d0=%llx v2=%llx:%llx\n", (unsigned long long)runs[0].cpu.x[0],
            (unsigned long long)runs[0].cpu.x[9], (unsigned long long)runs[0].cpu.v[0].d[0],
            (unsigned long long)runs[0].cpu.v[2].d[1], (unsigned long long)runs[0].cpu.v[2].d[0]);
-#ifdef _WIN32
-    if (reference_library) FreeLibrary(reference_library);
-#else
-    if (reference_library) dlclose(reference_library);
-#endif
+    /* the setting unit_instructions sizes the code units as --chunk does: one instruction makes a unit of each
+       function, a million one unit of them all */
+    for (b = 0; b < 2; ++b) {
+        char* dir = snx_path_join(root, b ? "units-whole" : "units-each");
+        k = 0;
+        args[k++] = argv[1];
+        args[k++] = "--repo";
+        args[k++] = argv[2];
+        args[k++] = "-r";
+        args[k++] = input;
+        args[k++] = "Program";
+        args[k++] = "--outdir";
+        args[k++] = dir;
+        args[k++] = "--runtime";
+        args[k++] = self;
+        args[k++] = b ? "--unit_instructions=1000000" : "--unit_instructions=1";
+        args[k] = NULL;
+        check(!snx_run(args, root, NULL, &text), "a build sized by unit_instructions");
+        if (text && !strstr(text, b ? "LLVM: 1 code unit and" : "code units and")) fprintf(stderr, "%s\n", text);
+        check(text && strstr(text, b ? "LLVM: 1 code unit and" : "code units and"),
+              b ? "a million instructions: one code unit" : "one instruction: a code unit of each function");
+        free(text);
+        text = NULL;
+        free(dir);
+    }
+    if (g_stepper.ready) llvm_steps_end(&g_stepper.steps);
     check(!snx_remove_tree(root), "fixture cleanup");
     for (b = 0; b < 2; ++b) {
         free(out[b]);

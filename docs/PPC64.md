@@ -53,9 +53,8 @@ ctest --preset linux-ppc64le-cross -j"$(nproc)"
 ```
 
 The target's `llvm-config` is a PowerPC program, so `scripts/cross-llvm-config.sh` runs it under qemu. The presets
-point pkg-config at the sysroot and set `QEMU_LD_PREFIX` for the tests. Three tests are skipped under the emulator:
-`3ds_static_pipeline` and `3ds_extract` link with the compiler path built into the driver, which is the build
-machine's, and `gui_process_tree` reads a resident size that qemu reports as zero.
+point pkg-config at the sysroot and set `QEMU_LD_PREFIX` for the tests. One test is skipped under the emulator:
+`gui_process_tree` reads a resident size that qemu reports as zero.
 
 ## Running a game under qemu
 
@@ -64,7 +63,7 @@ minutes, against 4 natively on x86-64):
 
 ```bash
 export QEMU_LD_PREFIX=$SNX_SYSROOT VK_DRIVER_FILES=/usr/share/vulkan/icd.d/lvp_icd.json
-qemu-ppc64le build/linux-ppc64le-cross/scarletnx -r app.nro -o App --outdir games/ppc64le
+qemu-ppc64le build/linux-ppc64le-cross/scarletnx -r app.nro --name App --outdir games/ppc64le
 cd games/ppc64le/App && qemu-ppc64le ./App -H --seconds=120 --shot=/path/to/shot
 ```
 
@@ -127,10 +126,10 @@ or writes a guest value as a number converts it:
 - The recompiler swaps where generated code reads memory as numbers (`ir_rd`, `ir_wr`, `ir_ldacq`, `ir_strel` in
   `ir_state.c`) and where it compares in memory (`cas` in `ir_helpers.c`, `snx_cas128`). LLVM folds the swaps into
   POWER's byte-reversed loads and stores. The vector registers hold the guest's bytes too: the views that read a lane
-  as a number swap it (`ir_vd`, `ir_ve`, the lane helpers of `ir_simd.c`), and Q loads, LD1 to LD4, TBL and EXT stay
+  as a number swap it (`ir_vd`, `ir_ve`, the lane helpers of `ir_vec.c`), and Q loads, LD1 to LD4, TBL and EXT stay
   byte copies. The emitters decide by the target's data layout, so a little-endian host's code is what it was. The
-  templates' C and the reference interpreter's helpers, which the tests hold the emitters to, read and write a lane
-  as a number through `SNX_VS` and its kin in `cpu.h`, which swap on a big-endian host.
+  helpers and the tests that set and check lanes read and write a lane as a number through `SNX_VS` and its kin in
+  `cpu.h`, which swap on a big-endian host.
 - The Linux runtime's system calls read and write the guest's structures through `common/utilities/endian.h`
   (`snx_ld_le32`, `snx_st_le64` and their kin), which compile to plain copies on a little-endian host.
 - `scripts/le-unchanged.sh` builds a base commit and the working tree on a little-endian machine and lists every
@@ -142,9 +141,12 @@ root is Debian ports' unstable:
 ```bash
 scripts/ppc64-sysroot.sh ppc64 .cache/sysroot-ppc64
 export SNX_SYSROOT=$PWD/.cache/sysroot-ppc64
-cmake --preset linux-ppc64-cross -DSNX_BUILD_NX=OFF -DSNX_BUILD_3DS=OFF -DSNX_BUILD_GUI=OFF
-cmake --build --preset linux-ppc64-cross --target scarletnx-gnuabi-run
+cmake --preset linux-ppc64-cross -DSNX_BUILD_NX=OFF -DSNX_BUILD_3DS=OFF -DSNX_BUILD_VITA=OFF -DSNX_BUILD_AGB=OFF \
+    -DSNX_BUILD_GUI=OFF
+cmake --build --preset linux-ppc64-cross --target scarletnx
 ```
+
+`scarletnx` is then the Linux runtime alone, and `scarletnx-gnuabi` a link to it.
 
 CI's `linux-ppc64` job builds it this way against that system root, made weekly, and runs the Linux runtime's tests
 (`gnuabi_*`, `endian`, `cas128`) under qemu-ppc64. Debian ports' unstable can break for a day, so the job may fail
@@ -194,6 +196,15 @@ cmake --build --preset linux-ppc64-elfv2-cross
 ctest --preset linux-ppc64-elfv2-cross -j"$(nproc)"
 ```
 
+The Vita and Game Boy Advance runtimes are ported the same way. Their guests are little-endian Arm, and what reads or
+writes guest memory as a number goes through endian.h: `vita_read16`, `vita_read32` and their writes
+(`vita/runtime/process.h`) for a guest address, and `snx_ld_le32` and its kin for the loader's files, GXP programs,
+the HLE's structures and the GBA's bus, video memory and wave RAM. Network order and the trophy pack stay big-endian
+(`snx_ld_be32`). The Vita renderer's push constants are swapped to little-endian for the device, and the GBA's frame
+is a texture of packed 0xAABBGGRR words (`SDL_PIXELFORMAT_ABGR8888`) in either order. Their tests pass under
+qemu-ppc64, jsmolka's GBA test ROMs among them: their modules are linked by the backend's linker, as the Switch's are.
+No Vita or GBA game has run on a big-endian machine yet.
+
 The 3DS runtime is built too, as the AppImage carries every runtime, but it isn't ported: its board, services and
 GPU read the guest's memory as host numbers, so it doesn't run 3DS games on a big-endian host.
 
@@ -211,9 +222,9 @@ the host's CPU, or for this one where the host's name isn't known. What changes 
 - **STXP's 16-byte compare-and-swap goes through the runtime** (`RtAPI.cas128`, `common/runtime/cas128.c`), as on
   RISC-V and LoongArch. It runs POWER8's `lqarx`/`stqcx.` where the kernel reports ISA 2.07, and takes a lock of the
   address's stripe elsewhere, which keeps the 16 bytes atomic against other STXPs but not against plain stores.
-- **Single-precision vector lanes take the slow path** (`altivec_lanes` in `ir_fp.c`). Without VSX, LLVM puts them
-  on AltiVec, whose VSCR[NJ] is set when Linux starts a thread, so denormals flush to zero. Double lanes and scalars
-  use the FPU.
+- **Single-precision vector lanes can flush denormals.** Without VSX, LLVM puts them on AltiVec, whose VSCR[NJ] is
+  set when Linux starts a thread, so denormals flush to zero where an emitter (`ir_vec_fp.c`) uses the host's vector
+  arithmetic. Double lanes and scalars use the FPU.
 - Rounding, `floor`, `trunc`, `rint`, `minnum` and the half conversions would be libm calls on these CPUs, which the
   emitters already avoid on PowerPC64.
 

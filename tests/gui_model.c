@@ -2,6 +2,7 @@
    Copyright 2026 the ScarletNX contributors */
 #include "gui/model.h"
 #include "gui/browser.h"
+#include "gui/icons.h"
 #include "gui/latin.h"
 #include "gui/wide.h"
 #include <assert.h>
@@ -36,6 +37,16 @@ int main(void) {
     assert(menu.selected == GUI_3DS);
     gui_menu_key(&menu, GUI_SELECT);
     assert(menu.active == GUI_3DS && menu.view == GUI_LOAD_DROP);
+    gui_menu_key(&menu, GUI_CANCEL);
+    gui_menu_key(&menu, GUI_RIGHT);
+    assert(menu.selected == GUI_VITA);
+    gui_menu_key(&menu, GUI_SELECT);
+    assert(menu.active == GUI_VITA && menu.view == GUI_LOAD_DROP);
+    gui_menu_key(&menu, GUI_CANCEL);
+    gui_menu_key(&menu, GUI_RIGHT);
+    assert(menu.selected == GUI_GBA);
+    gui_menu_key(&menu, GUI_SELECT);
+    assert(menu.active == GUI_GBA && menu.view == GUI_LOAD_DROP);
     gui_menu_key(&menu, GUI_CANCEL);
     gui_menu_key(&menu, GUI_RIGHT);
     assert(menu.selected == GUI_KEYS);
@@ -75,15 +86,15 @@ int main(void) {
     {
         char use[128];
         gui_usage_text(use, sizeof use, true, 812ull << 20, 52, 4);
-        assert(!strcmp(use, "GUI + children: RAM 812 MB  CPU 13% (0.5 cores)"));
+        assert(!strcmp(use, "RAM 812 MB  CPU 13% (0.5 cores)"));
         gui_usage_text(use, sizeof use, true, 1404ull << 20, 216, 8); /* a game compiling on 8 cores */
-        assert(!strcmp(use, "GUI + children: RAM 1.4 GB  CPU 27% (2.2 cores)"));
+        assert(!strcmp(use, "RAM 1.4 GB  CPU 27% (2.2 cores)"));
         gui_usage_text(use, sizeof use, true, 1, 830, 8);
-        assert(!strcmp(use, "GUI + children: RAM 1 KB  CPU 100% (8.0 cores)"));
+        assert(!strcmp(use, "RAM 1 KB  CPU 100% (8.0 cores)"));
         gui_usage_text(use, sizeof use, true, 0, 150, 0); /* SDL knows no cores: one */
-        assert(!strcmp(use, "GUI + children: RAM 0 MB  CPU 100% (1.0 cores)"));
+        assert(!strcmp(use, "RAM 0 MB  CPU 100% (1.0 cores)"));
         gui_usage_text(use, sizeof use, false, 1, 1, 1);
-        assert(!strcmp(use, "GUI + children: resource usage unavailable"));
+        assert(!strcmp(use, "RAM and CPU: unavailable"));
         /* sizes, as the footer and the Settings' disk line write them: KB under a MB, rounded up, MB under a GB */
         gui_size_text(use, sizeof use, 0);
         assert(!strcmp(use, "0 MB"));
@@ -132,7 +143,7 @@ int main(void) {
     assert(gui_wrap("\xe8\x8f\x9c\xe5\x8d\x95\xe8\x8f\x9c", 5) == 6 && gui_wrap("\xe8\x8f\x9c\xe5\x8d\x95", 4) == 6);
     assert(gui_wrap("a/\xe8\x8f\x9c", 3) == 2 && gui_wrap("\xe8\x8f\x9c\xe5\x8d\x95", 1) == 3);
 
-    /* the head (Add a folder and two recent games) over each page of the games: Up and Down go over the whole list, a
+    /* the head (Add Folder and two recent games) over each page of the games: Up and Down go over the whole list, a
        page's last game to the next one's first and back, one ring from the list's last game round to the head */
     /* items no one picks (headings): the focus steps over them, Select on one asks nothing, a page that opens with
        its focus on one moves it off */
@@ -210,7 +221,7 @@ int main(void) {
     gui_browser_key(&browser, GUI_DOWN);
     assert(browser.selected == 3);
     assert(gui_browser_key(&browser, GUI_CANCEL) == GUI_BROWSER_BACK);
-    browser = (GuiBrowser){.head = 1}; /* no games: Add a folder alone */
+    browser = (GuiBrowser){.head = 1}; /* no games: Add Folder alone */
     gui_browser_resize(&browser, 0);
     gui_browser_key(&browser, GUI_DOWN);
     gui_browser_key(&browser, GUI_PAGE_DOWN);
@@ -268,6 +279,23 @@ int main(void) {
         for (i = 1; i < (size_t)gui_wide_count; ++i) assert(gui_wide_points[i - 1] < gui_wide_points[i]);
         for (i = 0; i < (size_t)gui_wide_count; ++i)
             assert(gui_menu_glyph(gui_wide_points[i]) == 256 + gui_latin_count + 2 * (int)i);
+    }
+    /* the icons, two columns each after the wide letters, from U+E000 in icons.h's order: each with ink in its
+       glyph, the code point past the last '?', and each written as UTF-8 reads back as itself */
+    {
+        int i, wide = 256 + gui_latin_count + 2 * gui_wide_count;
+        char utf8[4];
+        const char* at;
+        for (i = 0; i < GUI_ICON_COUNT; ++i) {
+            int c = gui_menu_glyph((uint32_t)(GUI_ICON_FIRST + i)), ink = 0, r;
+            assert(c == wide + 2 * i && gui_glyph_cols(c) == 2);
+            for (r = 0; r < 32; ++r) ink |= gui_icon_font[i * 32 + r];
+            assert(ink);
+            at = gui_icon_utf8((unsigned)(GUI_ICON_FIRST + i), utf8);
+            assert(strlen(utf8) == 3 && gui_utf8_step(&at) == (uint32_t)(GUI_ICON_FIRST + i) && !*at);
+        }
+        assert(gui_menu_glyph(GUI_ICON_END) == '?' && gui_menu_glyph(GUI_ICON_FIRST - 1) == '?');
+        assert(!gui_icon_utf8(GUI_ICON_NONE, utf8)[0] && gui_text_cols(gui_icon_utf8(GUI_ICON_SAVE, utf8)) == 2);
     }
     /* UTF-8 a character a step; U+FFFD and a byte for what no character is (overlong, a surrogate, past U+10FFFF, cut
        short, a stray byte), 0 at the end */
@@ -428,8 +456,8 @@ int main(void) {
         assert(gui_choice_key(&choice, GUI_SELECT) == GUI_CHOICE_STAY &&
                gui_choice_key(&choice, GUI_UP) == GUI_CHOICE_STAY);
     }
-    /* the setup's Appearance: Up/Down round its three rows and Next; Left/Right a step of Language's and Theme's value,
-       Text size's box on its row, nothing on Next; Select Language's and Theme's value a step on, as Settings > App's
+    /* the setup's Appearance: Up/Down round its rows and Next; Left/Right a step of a row's value, UI scale's slider
+       too, nothing on Next; Select Language's and Theme's value a step on, as Settings > App's
        Enter does, that box on Text size, and on from Next; Cancel back */
     {
         int row = GUI_APPEARANCE_LANGUAGE, step = 9;
@@ -445,8 +473,9 @@ int main(void) {
         assert(row == GUI_APPEARANCE_THEME);
         assert(gui_appearance_key(&row, GUI_LEFT, &step) == GUI_APPEARANCE_CHANGE && step == -1);
         assert(gui_appearance_key(&row, GUI_DOWN, &step) == GUI_APPEARANCE_STAY && row == GUI_APPEARANCE_TEXT);
-        assert(gui_appearance_key(&row, GUI_LEFT, &step) == GUI_APPEARANCE_SIZES && !step);
-        assert(gui_appearance_key(&row, GUI_RIGHT, &step) == GUI_APPEARANCE_SIZES);
+        /* UI scale's slider a step either way, its box Select's */
+        assert(gui_appearance_key(&row, GUI_LEFT, &step) == GUI_APPEARANCE_CHANGE && step == -1);
+        assert(gui_appearance_key(&row, GUI_RIGHT, &step) == GUI_APPEARANCE_CHANGE && step == 1);
         assert(gui_appearance_key(&row, GUI_SELECT, &step) == GUI_APPEARANCE_SIZES && row == GUI_APPEARANCE_TEXT);
         assert(gui_appearance_key(&row, GUI_PAGE_DOWN, &step) == GUI_APPEARANCE_STAY && row == GUI_APPEARANCE_TEXT);
         assert(gui_appearance_key(&row, GUI_CANCEL, &step) == GUI_APPEARANCE_BACK && row == GUI_APPEARANCE_TEXT);
@@ -456,7 +485,7 @@ int main(void) {
     assert(!gui_confirm_key(&confirm, GUI_SELECT) && !gui_confirm_key(&confirm, GUI_DOWN));
     assert(!confirm.shown && confirm.selected == GUI_CONFIRM_KEEP);
     confirm.shown = true;
-    assert(!gui_confirm_key(&confirm, GUI_SELECT) && !confirm.shown); /* Keep going is the first choice */
+    assert(!gui_confirm_key(&confirm, GUI_SELECT) && !confirm.shown); /* Continue is the first choice */
     confirm.shown = true;
     assert(!gui_confirm_key(&confirm, GUI_DOWN) && confirm.selected == GUI_CONFIRM_ABORT && confirm.shown);
     assert(!gui_confirm_key(&confirm, GUI_PAGE_DOWN) && confirm.selected == GUI_CONFIRM_ABORT && confirm.shown);

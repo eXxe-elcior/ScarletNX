@@ -5,8 +5,8 @@
    byte land the owner first, the CPU's bytes on a page it shares with an owner stay, a neighbour writing during the
    move into the pool loses nothing, a system call fails on owned memory until it is acquired, dropping and unmapping
    land nothing, a view of owned memory lands it first, a fault on the thread holding the producer's lock ends the
-   process, and threads faulting at once on many pages while owners come and go read every owner's bytes. Skips (77)
-   where the host has no traps */
+   process, the write watch's scan skips owned spans, and threads faulting at once on many pages while owners come
+   and go read every owner's bytes. Skips (77) where the host has no traps */
 #include "nx/memory/mem.h"
 #include "nx/memory/own.h"
 #include "nx/runtime/platform/plat.h"
@@ -25,6 +25,7 @@
 #include <unistd.h>
 
 static unsigned checks;
+static int diagnostic_log;
 static void test_fail(const char* expr, int line) {
     fprintf(stderr, "memory_own.c:%d: %s\n", line, expr);
     exit(1);
@@ -36,8 +37,12 @@ static void test_fail(const char* expr, int line) {
     } while (0)
 
 void logf_(int level, const char* fmt, ...) {
+    va_list ap;
     (void)level;
-    (void)fmt;
+    if (!diagnostic_log) return;
+    va_start(ap, fmt);
+    vfprintf(stderr, fmt, ap);
+    va_end(ap);
 }
 void fatal(const char* fmt, ...) {
     va_list ap;
@@ -45,6 +50,10 @@ void fatal(const char* fmt, ...) {
     vfprintf(stderr, fmt, ap);
     va_end(ap);
     fputc('\n', stderr);
+#if defined(__linux__)
+    /* Let the diagnostics inspect proc registers first, then prevent a piped core dump. */
+    prctl(PR_SET_DUMPABLE, 0);
+#endif
     abort();
 }
 void log_crash_mode(void) {}
@@ -279,7 +288,7 @@ static void test_view(void) {
 
 /* a fault on the thread holding the producer's lock is the runtime's bug: it ends the process, not hangs. In a
    process of its own (this test run again: a forked one has no traps, which aren't inherited) */
-static int busy_child(void) {
+static int busy_child(int write, int restricted) {
     u64 a = region(R0 + 0x500000, 0x2000);
     Res* r = res_new(0x1000, 0x10);
     /* no core of the abort it expects: its address space is the guest's whole reservation, which a core_pattern pipe
@@ -288,23 +297,45 @@ static int busy_child(void) {
     struct rlimit none = {0, 0};
     CHECK(setrlimit(RLIMIT_CORE, &none) == 0);
 #if defined(__linux__)
-    CHECK(prctl(PR_SET_DUMPABLE, 0) == 0);
+    CHECK(prctl(PR_SET_DUMPABLE, restricted ? 0 : 1) == 0);
+#else
+    (void)restricted;
 #endif
     alarm(10);
+    diagnostic_log = 1;
     if (own_begin(a, 0x1000, r, 0)) return 2;
     g_busy_tid = plat_tid();
     fprintf(stderr, "(an abort with the thread and address is expected next)\n");
+    if (write) *(volatile u8*)GP(a) = 0x42;
     if (GP(a)[3] == 0x13) return 3; /* the fault must not be answered */
     return 4;
 }
-static void test_busy(const char* self) {
-    pid_t pid = fork();
+static void test_busy(const char* self, int write, int restricted) {
+    FILE* output = tmpfile();
+    char report[32768];
+    size_t n;
+    pid_t pid;
     int status = 0;
+    CHECK(output != NULL);
+    pid = fork();
+    CHECK(pid >= 0);
     if (!pid) {
-        execl(self, self, "--busy", (char*)NULL);
+        if (dup2(fileno(output), STDERR_FILENO) < 0) _exit(6);
+        execl(self, self, restricted ? "--busy-private" : write ? "--busy-write" : "--busy", (char*)NULL);
         _exit(5);
     }
     CHECK(waitpid(pid, &status, 0) == pid && WIFSIGNALED(status) && WTERMSIG(status) == SIGABRT);
+    rewind(output);
+    n = fread(report, 1, sizeof report - 1, output);
+    report[n] = 0;
+    fclose(output);
+    CHECK(strstr(report, write ? "access=write" : "access=read") != NULL);
+    CHECK(strstr(report, "ownership-fault: owner guest=[") != NULL);
+    CHECK(strstr(report, "resource-offset=0 landing=0") != NULL);
+    CHECK(strstr(report, "own_acquire first") != NULL);
+    /* Restricted procfs must explain missing context rather than silently printing the handler's PC. */
+    CHECK(strstr(report, "host-pc=") || strstr(report, "unavailable"));
+    if (strstr(report, "host-pc=")) CHECK(strstr(report, "ownership-fault: pc[0] host="));
 }
 
 /* a landing lets its pages go before it releases the resources: the trap thread lands this one (the main thread's
@@ -334,6 +365,33 @@ static void test_busy_unowned(void) {
     g_busy_tid = 0;
     plat_trap_disarm(GP(a), 0x1000);
     CHECK(mem_unmap(a, 0x2000) == 0);
+    res_free(r);
+}
+
+/* the write watch's scan over memory with an owned span in it: the span, in minor mode for its trap, is skipped and
+   the scan goes on, reporting the pages written around it. A failed scan turns write tracking off for the run */
+static u64 g_scan_lo, g_scan_hi;
+static void on_scan(u8* p, u64 size) {
+    u64 lo = (u64)(p - g_mem), hi = lo + size;
+    if (!g_scan_lo || lo < g_scan_lo) g_scan_lo = lo;
+    if (hi > g_scan_hi) g_scan_hi = hi;
+}
+static void test_scan_owned(void) {
+    u64 a = region(R0 + 0xA00000, 0x8000);
+    Res* r = res_new(0x2000, 0x40);
+    if (plat_ww_scan(GP(a), 0x8000, on_scan)) { /* no write tracking here (SNX_NO_WW, or before Linux 6.7) */
+        CHECK(mem_unmap(a, 0x8000) == 0);
+        res_free(r);
+        return;
+    }
+    CHECK(own_begin(a + 0x2000, 0x2000, r, 0) == 0);
+    GP(a)[0x6010] = 0x99;
+    g_scan_lo = g_scan_hi = 0;
+    CHECK(plat_ww_scan(GP(a), 0x8000, on_scan) == 0);
+    CHECK(g_scan_lo == a + 0x6000 && g_scan_hi == a + 0x7000); /* the written page, and nothing in the span */
+    own_acquire(a + 0x2000, 0x2000);
+    CHECK(refs(r) == 0 && GP(a)[0x2000] == 0x40);
+    CHECK(mem_unmap(a, 0x8000) == 0);
     res_free(r);
 }
 
@@ -393,16 +451,21 @@ int main(int argc, char** argv) {
         printf("skipped: no traps on this host (userfaultfd minor faults on shared memory)\n");
         return 77;
     }
-    if (argc > 1 && !strcmp(argv[1], "--busy")) return busy_child();
+    if (argc > 1 && !strcmp(argv[1], "--busy")) return busy_child(0, 0);
+    if (argc > 1 && !strcmp(argv[1], "--busy-write")) return busy_child(1, 0);
+    if (argc > 1 && !strcmp(argv[1], "--busy-private")) return busy_child(0, 1);
     test_read_write();
     test_freeze();
     test_syscall();
     test_drop();
     test_stage();
     test_view();
-    test_busy("/proc/self/exe");
+    test_busy("/proc/self/exe", 0, 0);
+    test_busy("/proc/self/exe", 1, 0);
+    test_busy("/proc/self/exe", 0, 1);
     test_release_order();
     test_busy_unowned();
+    test_scan_owned();
     test_stress();
     CHECK(!g_own_any);
     printf("memory_own: %u checks passed (%d landings, %d bytes)\n", checks, g_lands, g_landed_bytes);

@@ -15,7 +15,8 @@
 /* the item before or after one, round the menu */
 static int step_item(int item, int step) { return (item + GUI_ITEM_COUNT + step) % GUI_ITEM_COUNT; }
 GuiMenuDo gui_menu_key(GuiMenu* menu, GuiKey key) {
-    if (menu->running || menu->view == GUI_LOAD_GAMES) return GUI_MENU_STAY; /* the browser owns its keys */
+    /* the browser owns its keys, and the queue its own */
+    if (menu->running || menu->view == GUI_LOAD_GAMES || menu->view == GUI_LOAD_RECOMPILE) return GUI_MENU_STAY;
     if (menu->view != GUI_LOAD_NONE && key == GUI_CANCEL) {
         menu->view = GUI_LOAD_NONE;
         menu->selected = menu->active;
@@ -34,7 +35,9 @@ GuiMenuDo gui_menu_key(GuiMenu* menu, GuiKey key) {
             switch (menu->selected) {
                 case GUI_SWITCH:
                 case GUI_LINUX:
-                case GUI_3DS: menu->view = GUI_LOAD_DROP; break;
+                case GUI_3DS:
+                case GUI_VITA: menu->view = GUI_LOAD_DROP; break;
+                case GUI_GBA: menu->view = GUI_LOAD_DROP; break;
                 case GUI_KEYS: menu->view = GUI_LOAD_KEYS; break;
                 case GUI_SETTINGS: return GUI_MENU_SETTINGS;
                 case GUI_LOG: return GUI_MENU_LOG;
@@ -78,7 +81,6 @@ GuiAppearanceDo gui_appearance_key(int* row, GuiKey key, int* step) {
         case GUI_DOWN: *row = (*row + 1) % GUI_APPEARANCE_ROWS; return GUI_APPEARANCE_STAY;
         case GUI_LEFT:
         case GUI_RIGHT:
-            if (*row == GUI_APPEARANCE_TEXT) return GUI_APPEARANCE_SIZES;
             if (*row == GUI_APPEARANCE_NEXT) return GUI_APPEARANCE_STAY;
             *step = key == GUI_LEFT ? -1 : 1;
             return GUI_APPEARANCE_CHANGE;
@@ -137,12 +139,12 @@ void gui_usage_text(char* out, size_t size, bool available, uint64_t memory_byte
     double n = cores > 0 ? cores : 1, used = cpu_percent / 100;
     char ram[32];
     if (!available) {
-        snprintf(out, size, "%s", snx_tr("GUI + children: resource usage unavailable"));
+        snprintf(out, size, "%s", snx_tr("RAM and CPU: unavailable"));
         return;
     }
     used = used < 0 ? 0 : used > n ? n : used; /* a sample taken over a little more than its interval */
     gui_size_text(ram, sizeof ram, memory_bytes);
-    snprintf(out, size, snx_tr("GUI + children: RAM %s  CPU %.0f%% (%.1f cores)"), ram, used / n * 100, used);
+    snprintf(out, size, snx_tr("RAM %s  CPU %.0f%% (%.1f cores)"), ram, used / n * 100, used);
 }
 const char* gui_setting_description(const GuiMenu* menu) {
     switch (menu->selected) {
@@ -152,16 +154,13 @@ const char* gui_setting_description(const GuiMenu* menu) {
             return snx_tr(
                 "Saves the last run's output and game log to scarletnx.log in the data folder, then shares it");
 #elif defined(SNX_XDG)
-            return snx_tr(
-                "Saves the last run's output and game log to scarletnx.log in the working folder (an installed "
-                "copy's: its state folder), path copied");
+            return snx_tr("Saves the last run's output and game log to scarletnx.log and copies its path");
 #else
-            return snx_tr(
-                "Saves the last run's output and game log to scarletnx.log in the working folder, path copied");
+            return snx_tr("Saves the last run's output and game log to scarletnx.log and copies its path");
 #endif
 #ifdef __ANDROID__
         case GUI_DATA:
-            return snx_tr("Opens the data folder, games/ and the keys among them, in the system's Files app");
+            return snx_tr("Opens the data folder, recompiled/ and the keys in it, in the system's Files app");
 #endif
         default: return "";
     }

@@ -38,8 +38,46 @@ static int vfp2(uint32_t w) {
         default: return 0;
     }
 }
+/* The Cortex-A9's: a store with writeback into the register it stores (STR r0, [r0, #28]!) is UNPREDICTABLE in
+   ARMv7, and A57's decoders reject it. The A9 stores the register as it was, then writes the base back, which a Vita
+   game's code relies on (one stores a structure's address in its field and passes the field to a callback): decoded
+   as the same instruction with another base, which the emitters run so (they read the stored register before they
+   write the base back). A load's writeback into the register it loads stays rejected, as do the doubleword stores */
+static unsigned other_register(unsigned a, unsigned b) {
+    unsigned r = 0;
+    while (r == a || r == b) ++r;
+    return r;
+}
+static SnxA32Kind a9_a32(uint32_t w) {
+    SnxA32Kind kind = snx_a32_decode(w);
+    unsigned n = (w >> 16) & 15, d = (w >> 12) & 15;
+    int store_writeback = !(w & (1u << 20)) && (!(w & (1u << 24)) || (w & (1u << 21)));
+    if (kind != SNX_A32_UNDEFINED || n != d || n == 15 || !store_writeback || (w >> 28) == 15) return kind;
+    SnxA32Kind twin = snx_a32_decode((w & ~(15u << 16)) | other_register(d, w & 15) << 16);
+    if (twin == SNX_A32_SINGLE || (twin == SNX_A32_EXTRA && ((w >> 5) & 3) == 1)) return twin; /* STR, STRB, STRH */
+    return kind;
+}
+static unsigned a9_thumb(uint16_t h, uint16_t h2, SnxThumb* o) {
+    unsigned len = snx_thumb_decode(h, h2, o), n = h & 15, t = h2 >> 12;
+    /* F8xx/F9xx stores (hw1 bit 4 clear) of the imm8 form (hw2 bit 11) with writeback (hw2 bit 8) */
+    if (len || (h & 0xfe90) != 0xf800 || (h2 & 0x900) != 0x900 || n != t || n == 15) return len;
+    len = snx_thumb_decode((uint16_t)((h & ~15u) | other_register(t, 15)), h2, o);
+    if (len != TH_F32 || o->shape != TH_STORE || !(o->flags & TH_WB)) {
+        memset(o, 0, sizeof *o);
+        return 0;
+    }
+    o->rn = n;
+    return len;
+}
 SnxA32Kind snx_a32_decode_profile(SnxArmProfile profile, uint32_t w) {
     if (profile == SNX_ARM_PROFILE_A57) return snx_a32_decode(w);
+    if (profile == SNX_ARM_PROFILE_A9) return a9_a32(w);
+    if (profile == SNX_ARM_PROFILE_ARM7TDMI) {
+        /* An MSR that writes the control or extension byte switches modes on the AGB board, which banks the
+           registers: the board runs it. A57's EL0 MSR would drop the mode bits */
+        SnxA32Kind kind = snx_a32_decode(w);
+        return kind == SNX_A32_MSR && ((w >> 16) & 3) ? SNX_A32_UNDEFINED : kind;
+    }
     if (profile != SNX_ARM_PROFILE_ARM11) return SNX_A32_UNDEFINED;
     /* ARM11 CP15 barrier operations, not ARMv7's unconditional encodings.
        Only these user-accessible maintenance operations are admitted. */
@@ -85,19 +123,26 @@ SnxA32Kind snx_a32_decode_profile(SnxArmProfile profile, uint32_t w) {
 }
 unsigned snx_thumb_decode_profile(SnxArmProfile profile, uint16_t h, uint16_t h2, SnxThumb* o) {
     if (profile == SNX_ARM_PROFILE_A57) return snx_thumb_decode(h, h2, o);
+    if (profile == SNX_ARM_PROFILE_A9) return a9_thumb(h, h2, o);
     memset(o, 0, sizeof *o);
-    if (profile != SNX_ARM_PROFILE_ARM11) return 0;
-    /* ARMv6K Thumb BL is two separately executable 16-bit instructions. Its
+    if (profile != SNX_ARM_PROFILE_ARM11 && profile != SNX_ARM_PROFILE_ARM7TDMI) return 0;
+    int v6 = profile == SNX_ARM_PROFILE_ARM11; /* the ARM7TDMI's ARMv4T has none of ARMv5's and ARMv6's additions */
+    /* ARMv6K's and ARMv4T's Thumb BL is two separately executable 16-bit instructions. Its
        signed high offset is NOT Thumb-2's S/J1/J2 encoding. LR is observable
-       after the prefix, and execution may enter directly at a suffix. */
+       after the prefix, and execution may enter directly at a suffix (a GBA game's call through LR). BLX's suffix is
+       ARMv5's */
     unsigned top = h & 0xf800;
-    if (top == 0xf000 || top == 0xf800 || (top == 0xe800 && !(h & 1))) {
+    if (top == 0xf000 || top == 0xf800 || (v6 && top == 0xe800 && !(h & 1))) {
         o->shape = TH_LEGACY_BL;
         o->len = TH_F16;
         o->op = top == 0xf000 ? 0 : top == 0xf800 ? 1 : 2;
         o->imm = h & 0x7ff;
         return TH_F16;
     }
+    /* ARMv4T's 1011 group is ADD/SUB SP, PUSH and POP alone: CBZ, the extends, CPS, REV, BKPT, IT and the hints came
+       later */
+    if (!v6 && (h & 0xf000) == 0xb000 && (h & 0xff00) != 0xb000 && (h & 0xfe00) != 0xb400 && (h & 0xfe00) != 0xbc00)
+        goto invalid;
     if (top == 0x4800) {
         o->shape = TH_LOAD;
         o->len = TH_F16;
@@ -124,8 +169,12 @@ unsigned snx_thumb_decode_profile(SnxArmProfile profile, uint16_t h, uint16_t h2
     }
     if (top >= 0xe800 || !snx_thumb_decode(h, h2, o)) goto invalid;
     if (o->shape == TH_IT || o->shape == TH_HINT ||
-        (o->shape == TH_BRANCH && (o->op == BR_CBZ || o->op == BR_CBNZ || (o->op == BR_BLX_REG && o->rm == 15))))
+        (o->shape == TH_BRANCH &&
+         (o->op == BR_CBZ || o->op == BR_CBNZ || (o->op == BR_BLX_REG && (!v6 || o->rm == 15))))) /* BLX is v5's */
         goto invalid;
+    /* the forms ARMv6 makes UNPREDICTABLE (a base in an LDM or STM's list, an empty list, CMP of two low registers)
+       run on the ARM7TDMI as it runs them, which its profile's emitter follows */
+    if (!v6) return TH_F16;
     if (o->shape == TH_HI && o->op == 1 && (o->rd == 15 || o->rm == 15 || (o->rd < 8 && o->rm < 8))) goto invalid;
     if (o->shape == TH_PUSHPOP && !o->imm && !o->ra) goto invalid;
     if (o->shape == TH_LDMSTM) {

@@ -13,6 +13,7 @@ The NX runtime runs 32-bit programs with it. The recompiler compiles a 32-bit pr
 - `llvm.h`, `llvm.c`, `llvm_vector.inc`, `llvm_thumb.inc`: `snx_arm_llvm_block(module, name, words, count, pc, &consumed)` and `snx_thumb_llvm_block(module, name, halfwords, count, pc, &consumed)` emit `void name(SnxArmCPU*)` into a **host-target** LLVM module.
 - `tests/arm_emit.c`, `tests/thumb_emit.c`: object generators demonstrating module creation, verification, optimization and native object emission.
 - `tests/arm_test.py`, `tests/arm_vector_test.py`, `tests/thumb_test.py`: native execution witnesses and optional independent Unicorn comparisons.
+- `tests/arm_fuzz.py`: random encodings of each class, A32 and Thumb, against Unicorn from random FP and flag state (`--only ISA:HEX` replays one).
 
 Input words are host integers decoded from little-endian guest code (A32 words, or Thumb halfwords). A block consumes at most `count` instructions (or halfwords for Thumb) and stops at a control transfer, including a conditional transfer. `consumed` reports the compiled length. Bad input returns NULL before changing the module.
 
@@ -41,12 +42,15 @@ Programs linking blocks link `snx_arm_rt`. The executor (`exec.h`, built into `s
 
 ## Thumb32 instructions with A32 twins
 
-Many Thumb32 instructions are A32 ones with their fields elsewhere: coprocessor, VFP and Advanced SIMD (the same bits, or the top byte moved), LDM/STM and PUSH.W/POP.W, the exclusives and acquire/release, barriers, MRS/MSR, long multiplies and divides, REV/RBIT/CLZ and the extends with add. `thumb_decode.c` decodes them to `TH_A32`, the A32 word and its kind, and the A32 emitter runs them reading Thumb's PC. A doubleword exclusive's second register, which Thumb names freely, comes with it. LDRD/STRD (`TH_DUAL`) are Thumb's own, as their register pair and offset are.
+Many Thumb32 instructions are A32 ones with their fields elsewhere: coprocessor, VFP and Advanced SIMD (the same bits, or the top byte moved), LDM/STM and PUSH.W/POP.W, the exclusives and acquire/release, barriers, MRS/MSR, long multiplies and divides, REV/RBIT/CLZ and the extends with add. `thumb_decode.c` decodes them to `TH_A32`, the A32 word and its kind, and the A32 emitter runs them reading Thumb's PC. A doubleword exclusive's second register, which Thumb names freely, comes with it, as does the offset T1's LDREX and STREX add to their base. LDRD/STRD (`TH_DUAL`) are Thumb's own, as their register pair and offset are.
+
+An IT block's conditions are its block's, decided when the block compiles: an instruction that traps under a condition that fails lets the block go on. A block the code ends inside an IT block (callers give the rest of the code, so only at its end), or an SVC or BKPT inside one, leaves ITSTATE in CPSR, and a Thumb block entered with ITSTATE there stops with `SNX_ARM_IT_ENTRY`, the ITSTATE its syndrome. A block compiled again from the halfwords it consumed is the same block, which the AOT compilers check.
 
 ## Opt-in ARM11 profile and checked memory
 
-The existing APIs still select **A57 + flat memory**; `SnxArmCPU` (`SNX_ARM_ABI=3`,
-which added `rt` after the register file) and its field offsets are shared by both. No board-specific compile definition
+The existing APIs still select **A57 + flat memory**; `SnxArmCPU` (`SNX_ARM_ABI=4`: 3
+added `rt` after the register file, 4 the ARM7TDMI profile's `io` after `mem_size`) and its field offsets are shared by
+both. No board-specific compile definition
 changes shared code generation. Other boards opt in through the `_ex` APIs:
 
 ```c
@@ -85,6 +89,17 @@ LDM base-in-list behavior. ARM11 paired transfers require eight-byte alignment.
 Ordinary unaligned scalar RAM transfers model alignment checking disabled and
 ARMv6 unaligned support enabled; CP15 alignment/legacy rotated-load modes are
 not emulated. None of these changes affect A57's original flat-memory path.
+
+The A9 profile (`SNX_ARM_PROFILE_A9`, the Vita's Cortex-A9 MPCore) is A57's
+ARMv7-A subset with the UNPREDICTABLE forms Vita games rely on given the
+Cortex-A9's behavior. So far that is a store with writeback into the register
+it stores (`STR r0, [r0, #28]!`, A32 STR/STRB/STRH and Thumb's imm8 forms): the
+register is stored as it was, then the base is written back. `profile.c` decodes
+it as the same instruction with another base, which the emitters already run in
+that order. Loads with writeback into the loaded register and doubleword stores
+stay rejected. The executor compiles for A57 unless `snx_arm_exec_set_profile`
+selects another profile, and `snx_arm_successors` takes the profile its blocks
+were compiled for.
 
 Checked blocks require `&SnxArmCheckedCPU.cpu` (see `checked.h`), not a standalone
 `SnxArmCPU`. This **separate ABI** supplies a context and one callback; no flat
@@ -138,6 +153,20 @@ HLE transcript, not independent hardware validation of kernel policy. Neither
 reference is an execution fallback. Broader target coverage, full ARM11 semantics and
 cache/resume still need work; none of these are shared A57 defaults.
 
+## Opt-in ARM7TDMI profile
+
+`SNX_ARM_PROFILE_ARM7TDMI` is the AGB board's CPU (`src/agb/cpu/recomp.c`), on flat memory only. It decodes as A57
+does, but for an MSR that writes the control or extension byte (a mode switch, with its banked registers), which is
+UNDEFINED; what the board's runtime refuses there it interprets. Its blocks follow the ARM7TDMI where ARMv8-A differs:
+a misaligned load reads the aligned unit and rotates it (a misaligned LDRSH reads the byte, sign extended), a
+misaligned store writes the aligned unit, STR and STM of the PC store PC + 12, STM stores the written back base when
+the base is in the list after its first register, LDM, STM, PUSH and POP take an unaligned base, and Thumb's POP {pc}
+keeps the Thumb state. Accesses to the regions whose top byte is 0x00, 0x01, 0x04, 0x05, 0x06, 0x07, 0x0E or 0x0F (the
+BIOS, the I/O window, the palette, VRAM, OAM and the save memory) call `SnxArmCPU.io` when it is set: reads pass the
+width (0x200 | 2 for LDRSH)
+and return the value, writes pass 0x100 | width and the value. No other profile reads `io`. `tests/arm7tdmi_test.py`
+runs each rule under both profiles.
+
 ## Implemented instructions (default A57/flat configuration)
 
 - Word/byte LDR and STR, immediate and shifted-register offsets, positive/negative offsets, pre/post indexing, writeback and unprivileged aliases. Stores, like loads, take the PC (PC+8) as their base without writeback.
@@ -180,7 +209,7 @@ flush-to-zero, default-NaN, and alternate-half-precision modes. Rounding modes R
 per lane. Reciprocal step instructions round the product before subtracting, as ARMv8-A specifies, which is
 not the same as a fused step.
 
-Thumb16 and Thumb32 are supported (see `thumb_decode.c`, `llvm_thumb.inc`): integer data processing, loads/stores (immediate, register, pre/post-indexed, unprivileged), push/pop, LDM/STM, branches (B/Bcc/BL/BLX/BX, CBZ/CBNZ, TBB/TBH), bitfield (SBFX/UBFX/BFI/BFC), extends, MOVW/MOVT/ADDW/SUBW, MUL/MLA/MLS, wide data-processing with shifted and modified-immediate operands, and IT blocks (conditions applied per instruction against current flags, as ARMv8-A specifies). Thumb32 coprocessor (VFP/NEON) shares the A32 vector emitter.
+Thumb16 and Thumb32 are supported (see `thumb_decode.c`, `llvm_thumb.inc`): integer data processing, loads/stores (immediate, literal, register, pre/post-indexed, unprivileged), push/pop, LDM/STM, branches (B/Bcc/BL/BLX/BX, CBZ/CBNZ, TBB/TBH), bitfield (SBFX/UBFX/BFI/BFC), extends, MOVW/MOVT/ADDW/SUBW, MUL/MLA/MLS, wide data-processing with shifted and modified-immediate operands, and IT blocks (conditions applied per instruction against current flags, as ARMv8-A specifies). Thumb32 coprocessor (VFP/NEON) shares the A32 vector emitter.
 
 ## Limits and memory model
 
@@ -222,6 +251,9 @@ CPSR, FPSCR and guest memory for 1,490 encodings over 80 initial states each at 
 comparisons per level), including FP edge cases (NaNs, denormals, infinities, rounding-mode and FPSCR
 combinations) and SIMD saturation/shift boundaries. The Thumb suite compares all GPRs, CPSR and guest memory
 for 141 instruction/IT sequences at O0 and O2, covering Thumb16 and Thumb32 data processing, loads/stores,
-branches, bitfield and IT blocks. Decode tests check both accepted and rejected encodings
+branches, bitfield and IT blocks, and witnesses blocks that end or begin around an IT block. `arm_fuzz.py` draws
+encodings at random from each class, keeps those llvm-objdump decodes for the Cortex-A57, and fails on any
+difference in state; what it reports besides (missing, extra, faults) is mostly UNPREDICTABLE encodings, and
+QEMU 5's missing alignment checks. Decode tests check both accepted and rejected encodings
 against llvm-objdump on cortex-a57. Unicorn's ARMv8-capable AArch32 model is the reference, not Cortex-A57
 hardware. Tests use no game assets.

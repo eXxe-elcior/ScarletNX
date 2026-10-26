@@ -15,20 +15,32 @@ typedef struct {
     const char* build;
     const char* executable;
     const char* source; /* the checkout the build came from (snx_checkout), to build tools in; NULL without one */
+    const char* keys; /* optional prod.keys path supplied with --keys */
+    const char* title_keys; /* optional title.keys path supplied with --title-keys */
 } SnxPaths;
 
 void* snx_alloc(size_t size);
 void* snx_realloc(void* ptr, size_t size);
 char* snx_strdup(const char* s);
 char* snx_format(const char* fmt, ...);
+/* a path's / turned into \ on Windows, the separator its system shows (C:\Users\...); nothing elsewhere */
+void snx_path_native(char* path);
+/* the room of a path made in a caller's buffer: Linux's PATH_MAX, past what Windows takes without its long paths */
+#define SNX_PATH_SIZE 4096
+/* fmt's path into out, of size bytes, its separators the system's (snx_path_native). 0; -1 when it does not fit,
+   said with snx_error, out empty */
+int snx_path_format(char* out, size_t size, const char* fmt, ...);
 /* says a line of error, "scarletnx: " and the line on stderr, or to the sink given to snx_error_sink. Returns 1 */
 int snx_error(const char* fmt, ...);
+/* an option given by the name an older version had, old (a literal), said once a run with its name now */
+void snx_option_renamed(const char* old, const char* now);
 /* where snx_error's lines go from now on instead of stderr (the runtime's log, which a game's process on Android has
    no other way to keep them in), NULL for stderr again. Set before the threads that say errors start */
 void snx_error_sink(void (*sink)(const char* line));
 /* the system's reason for the file or folder call that just failed, into out: strerror(errno), or on Windows the
    text of GetLastError, which its calls set instead of errno */
 char* snx_os_error(char* out, size_t size);
+/* a, then b, a separator between: one path in the system's separators (snx_path_native) */
 char* snx_path_join(const char* a, const char* b);
 char* snx_dirname(const char* path);
 char* snx_absolute(const char* path);
@@ -59,6 +71,11 @@ int snx_replace(const char* src, const char* dst);
 int snx_list_dir(const char* path, char*** names, size_t* count);
 void snx_free_strings(char** strings, size_t count);
 unsigned char* snx_read_file(const char* path, size_t* size);
+/* Whether the file at path holds a record of size bytes, its first magic_size bytes magic, that accept takes: it is
+   given each such record in the file, at any offset, until it takes one. What a compiled module was compiled for,
+   read from its descriptor in the file before the module is loaded */
+int snx_file_has_record(const char* path, const void* magic, size_t magic_size, size_t size,
+                        int (*accept)(const unsigned char* record, const void* context), const void* context);
 int snx_write_file(const char* path, const void* data, size_t size);
 int snx_write_changed(const char* path, const void* data, size_t size);
 char* snx_temp_dir(const char* parent);
@@ -91,9 +108,13 @@ char* snx_user_dir(int kind);
 /* 1 for a data folder that keeps each kind of file apart: the user's, a portable copy's (SNX_PORTABLE_DIR), Android's.
    Another folder's games (--repo, --outdir) keep their files in their folders */
 int snx_app_dir(const char* folder);
-/* Such a data folder's folder for one kind of file: the user's as snx_user_dir says, another's config/, state/ and
-   cache/ in it; the data folder itself for SNX_USER_DATA */
+/* Such a data folder's folder for one kind of file: for SNX_USER_STATE and SNX_USER_CACHE the one its config folder's
+   app.ini names, [folders] state = and cache = (Settings > App > Folders' Logs and Caches), a full path; else
+   snx_app_kind_default's. One app.ini names wrongly is said once */
 char* snx_app_kind_dir(const char* app, int kind);
+/* Its folder for one kind of file before Folders picks one: the user's as snx_user_dir says, another's config/, state/
+   and cache/ in it; the data folder itself for SNX_USER_DATA */
+char* snx_app_kind_default(const char* app, int kind);
 /* A path in a data folder (snx_app_dir), moved to the same place in its folder of kind: games/X/X.ini of the data
    folder is games/X/X.ini of the config folder. Any other path (another --repo, an --outdir) is returned as it is */
 char* snx_user_path(const char* path, int kind);
@@ -101,6 +122,8 @@ char* snx_user_path(const char* path, int kind);
    state) for a program in folder: the data folder's (snx_app_dir) that folder is in, else the user's. The launcher
    names its data folder, a game its own folder, so a game finds the files of the launcher whose games/ it is in */
 char* snx_menu_dir(const char* folder, int kind);
+/* The same before Folders picks one: snx_app_kind_default's */
+char* snx_menu_kind_default(const char* folder, int kind);
 /* 1 while what an older build left at old is still there, for the caller to say each run where it is and that this
    build keeps it at now. Nothing is moved: the player does that */
 int snx_left_behind(const char* old, const char* now);
@@ -171,6 +194,19 @@ double snx_seconds(void);
    snx_vm_protect commits the pages it makes accessible and decommits them with SNX_VM_NONE on Windows. 0 or -1 */
 enum { SNX_VM_NONE, SNX_VM_READ, SNX_VM_READ_WRITE, SNX_VM_READ_EXECUTE };
 size_t snx_vm_page_size(void);
+/* A run that cannot be killed (the driver on a thread of the app, where an app may start no process) is stopped by
+   asking: the player's abort sets this, and the long loops (the recompiler's units) end early once it is set */
+void snx_abort_request(int on);
+int snx_abort_requested(void);
+/* the memory this process is charged for now, in bytes: its footprint on macOS and iOS, its resident set on Linux,
+   Android and FreeBSD, its working set on Windows; 0 where the system does not tell */
+SnxU64 snx_footprint(void);
+/* the processor time this process has used, every thread's together, in ns; 0 where the system does not tell */
+SnxU64 snx_process_cpu_ns(void);
+/* the memory the system can still give this process, in bytes, into *bytes: what iOS lets the app take before it ends
+   it, the memory available on Linux and Android (MemAvailable), on macOS (free, inactive and purgeable pages) and on
+   Windows (available physical memory); whether the system told it */
+int snx_memory_available(SnxU64* bytes);
 void* snx_vm_reserve(size_t size); /* NULL when the system refuses */
 int snx_vm_protect(void* p, size_t size, int access);
 void snx_vm_release(void* p, size_t size);
@@ -183,10 +219,6 @@ int snx_terminal(void);
 /* The program name names: a path, or a file of that name in a folder of PATH (with .exe on Windows). Its folder is
    resolved and its name kept, as a link's name can say what the program does; NULL when there is none */
 char* snx_find_tool(const char* name);
-/* The C compiler to run, owned: built (the path the build's own compiler had, on the machine that built it) where it is
-   a file here, else a clang in the folder beside (NULL: none), else one on PATH. NULL, the places looked at in error,
-   when there is none: a release runs on machines without the build's own */
-char* snx_find_compiler(const char* built, const char* beside, char* error, size_t error_size);
 /* argv is NULL terminated. No shell. Captured output is heap-owned by caller.
    home isolates HOME/USERPROFILE and removes XDG_CONFIG_HOME in the child. */
 int snx_run(const char* const* argv, const char* cwd, const char* home, char** output);
@@ -202,6 +234,20 @@ void snx_set_stage_runner(int (*run)(int argc, char** argv));
 /* As above, but intentional debugger stops do not abort the game. */
 int snx_run_debug_stage(const char* const* argv, const char* cwd, const char* stage);
 FILE* snx_fopen(const char* path, const char* mode);
+/* The launcher's logs, in its state folder (docs/USAGE.md#folders): what it says, and a fatal error of it or of a game
+   in the other one too */
+#define SNX_CONSOLE_LOG "scarletnx-console.log"
+#define SNX_ERROR_LOG   "scarletnx-error.log"
+/* text appended to the file at path, each of its lines after the local time and this process's id
+   ("2026-10-25 11:30:02 [4242] "), in one write: two programs appending at once keep each line whole and named, and a
+   text without an ending newline gets one. 0, or -1 with errno set */
+int snx_log_lines(const char* path, const char* text);
+/* An exclusive lock on the file at path, made when it is not there and left as it is, held until snx_unlock_file: 0
+   with *lock set, 1 when another holder has it (another program, or another lock of this one), -1 with errno. The
+   file's bytes stay free to be read and written by anyone: POSIX's flock, which only other locks see, and on Windows a
+   lock of one byte past any end the file reaches */
+int snx_lock_file(const char* path, intptr_t* lock);
+void snx_unlock_file(intptr_t lock);
 /* f to offset from its start, past 2 GiB too (fseek takes a long, 32 bits on Windows); 0, or nonzero */
 int snx_seek(FILE* f, SnxU64 offset);
 

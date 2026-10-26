@@ -20,6 +20,7 @@
 #define MSF_CAN_REPROTECT   (1u << 8)
 #define MSF_CAN_ALIAS       (1u << 15)
 #define MSF_CAN_TRANSFER    (1u << 17)
+#define MSF_CAN_MAP_PROCESS (1u << 23)
 #define MSF_CAN_CHANGE_ATTR (1u << 24)
 #define MSF_CAN_CODE_MEMORY (1u << 25)
 /* MemoryAttribute: Locked, IpcLocked, DeviceShared, Uncached, PermissionLocked */
@@ -89,10 +90,46 @@ static int user_writable(u64 a, u64 size) {
 /* ============================================================ accounting */
 /* The application pool for each memory_gb (Mesosphere's KSystemControl application pool sizes for the 4, 6 and 8 GiB
    boards), see docs/MEMORY_ACCOUNTING.md */
-u64 mem_total(void) {
+static u64 pool(void) {
     if (g_settings.memory_gb >= 8) return 6964 * MIB;
     if (g_settings.memory_gb >= 6) return 4916 * MIB;
     return 3285 * MIB;
+}
+u64 mem_total(void) {
+    u64 total = pool();
+    return g_hle.svcmem.fit && g_hle.svcmem.fit < total ? g_hle.svcmem.fit : total;
+}
+/* the most memory a process may have: Mesosphere's m_max_process_memory, the heap region's size. A 32-bit process
+   gets 2 GiB without an alias region and 1 GiB with one, however large the application pool is; a game that asks
+   GetInfo for the total and sets its heap to nearly all of it would otherwise ask for more than its heap region */
+static u64 process_memory_total(void) {
+    u64 total = mem_total();
+    return total < HEAP_SIZE ? total : HEAP_SIZE;
+}
+/* what the game may have of what the process can reach: the rest takes the runtime as it is now and the graphics'
+   first allocations, never less than a phone's run measured, and the game keeps a GiB however little is left */
+#define FIT_GRAPHICS    (256 * MIB)
+#define FIT_OTHER_LEAST (700 * MIB)
+#define FIT_LEAST       (1024 * MIB)
+u64 mem_fit_budget(u64 available, u64 footprint) {
+    u64 limit = available + footprint, other = footprint + FIT_GRAPHICS;
+    if (other < FIT_OTHER_LEAST) other = FIT_OTHER_LEAST;
+    return limit > other + FIT_LEAST ? limit - other : FIT_LEAST;
+}
+void mem_fit(int measured, u64 available, u64 footprint) {
+    g_hle.svcmem.fit = 0;
+    if (!measured) {
+        LOG("memory: memory_fit=1, but this system tells neither what it can still give nor what the process holds: "
+            "the game is told the console's %llu MiB\n",
+            (unsigned long long)(process_memory_total() >> 20));
+        return;
+    }
+    g_hle.svcmem.fit = mem_fit_budget(available, footprint);
+    LOG("memory: memory_fit=1: the game is told %llu MiB, the console's being %llu (the system can still give %llu MiB, "
+        "the process holds %llu)\n",
+        (unsigned long long)(process_memory_total() >> 20),
+        (unsigned long long)((pool() < HEAP_SIZE ? pool() : HEAP_SIZE) >> 20), (unsigned long long)(available >> 20),
+        (unsigned long long)(footprint >> 20));
 }
 /* the loaded images, the main thread's stack, the heap, physical memory and the system resource, charged once */
 u64 used_memory(void) {
@@ -216,6 +253,109 @@ u32 svc_unmap_memory(u64 dst, u64 src, u64 size) {
     R_SUCCEED();
 }
 
+/* svcMapProcessMemory: a view of a process's memory at dst, shared code read and written, src staying as it is. The
+   one process here is the caller's own, which mods for Atmosphère map their code through to patch it (exlaunch's
+   RwPages): the view and the code are the same pages with the alias pool, and a copy written back at the unmap
+   without. Either way the code compiled from src is stale once the view goes (mem_alias_unmap) */
+static u32 check_process_memory(u64 dst, u32 process, u64 src, u64 size) {
+    KObj* p;
+    R_UNLESS(!((dst | src) & 0xFFF), R_BADADDR);
+    R_UNLESS(size && !(size & 0xFFF), R_BADSIZE);
+    R_UNLESS(dst + size > dst && src + size > src, R_BADMEMSTATE);
+    p = h_get_ref(process, KO_PROCESS);
+    R_UNLESS(p, R_BADHANDLE);
+    kobj_unref(p);
+    R_UNLESS(can_contain(dst, size, MS_SHAREDCODE), R_BADREGION);
+    R_UNLESS(in_region(src, size, 0, AS_END), R_BADMEMSTATE);
+    R_SUCCEED();
+}
+u32 svc_map_process_memory(u64 dst, u32 process, u64 src, u64 size) {
+    u32 r;
+    int i;
+    R_TRY(check_process_memory(dst, process, src, size));
+    R_UNLESS(range_ok(src, size, 0, MSF_CAN_MAP_PROCESS, ANY, ~0u, 0), R_BADMEMSTATE);
+    R_UNLESS(range_ok(dst, size, MS_FREE, 0, ANY, ~0u, 0), R_BADMEMSTATE);
+    R_TRY(mem_result(mem_alias_begin(src, size)));
+    r = mem_result(mem_alias_map(dst, src, size, MS_SHAREDCODE, PERM_RW));
+    if (R_FAILED(r)) {
+        mem_alias_end(src, size);
+        return r;
+    }
+    /* the view of code keeps src as it is now, before anything is written through it (svc_code_line) */
+    pm_lock(&g_host.svcmem.views_lk);
+    for (i = 0; i < KCODEVIEW_MAX && g_hle.svcmem.views[i].size; i++) {}
+    if (i < KCODEVIEW_MAX) {
+        KCodeView* v = &g_hle.svcmem.views[i];
+        v->dst = dst;
+        v->src = src;
+        v->size = size;
+        v->snap = (u8*)malloc((size_t)size);
+        if (v->snap) memcpy(v->snap, GP(src), (size_t)size);
+    } else
+        WARN_LIMIT(1, "kernel: more than %d views of code at once: their flushes recompile what they cover\n",
+                   KCODEVIEW_MAX);
+    pm_unlock(&g_host.svcmem.views_lk);
+    R_SUCCEED();
+}
+u32 svc_unmap_process_memory(u64 dst, u32 process, u64 src, u64 size) {
+    int i;
+    R_TRY(check_process_memory(dst, process, src, size));
+    R_UNLESS(range_ok(dst, size, MS_SHAREDCODE, 0, PERM_RW, ~0u, 0), R_BADMEMSTATE);
+    R_UNLESS(range_ok(src, size, 0, MSF_CAN_MAP_PROCESS, ANY, ~0u, 0), R_BADMEMSTATE);
+    mem_alias_unmap(dst, size, src);
+    mem_alias_end(src, size);
+    pm_lock(&g_host.svcmem.views_lk);
+    for (i = 0; i < KCODEVIEW_MAX; i++)
+        if (g_hle.svcmem.views[i].size && g_hle.svcmem.views[i].dst == dst) {
+            free(g_hle.svcmem.views[i].snap);
+            memset(&g_hle.svcmem.views[i], 0, sizeof g_hle.svcmem.views[i]);
+            break;
+        }
+    pm_unlock(&g_host.svcmem.views_lk);
+    R_SUCCEED();
+}
+/* A line a flush names through a view or in the code it shows changed when its bytes differ from the view's
+   snapshot. A mod may flush its whole view after a few writes (exlaunch's RwPages), as a cache line that didn't
+   change costs the console nothing: here such a line keeps its compiled code. Without the pool the view is a copy, so
+   its bytes are what the mod wrote: copy the line into the code before that line is compiled again */
+int svc_code_line(u64 addr, u64* code) {
+    int i, r = -1, copies = !mem_pool_active();
+    addr &= ~(u64)63;
+    *code = addr;
+    pm_lock(&g_host.svcmem.views_lk);
+    for (i = 0; i < KCODEVIEW_MAX; i++) {
+        KCodeView* v = &g_hle.svcmem.views[i];
+        u64 at;
+        u8 *src, *view;
+        int changed, src_changed;
+        if (!v->size) continue;
+        if (addr - v->dst < v->size)
+            at = addr - v->dst;
+        else if (addr - v->src < v->size)
+            at = addr - v->src;
+        else
+            continue;
+        *code = v->src + at;
+        if (!v->snap || at + 64 > v->size) { /* nothing kept to compare with: it may have changed */
+            if (copies) {
+                u64 n = v->size - at < 64 ? v->size - at : 64;
+                if (n) memcpy(GP(v->src + at), GP(v->dst + at), (size_t)n);
+            }
+            break;
+        }
+        src = GP(v->src + at);
+        view = copies ? GP(v->dst + at) : src;
+        changed = memcmp(v->snap + at, view, 64) != 0;
+        src_changed = view != src && memcmp(v->snap + at, src, 64) != 0;
+        if (changed && view != src) memcpy(src, view, 64); /* what the view wrote is in the code now */
+        r = changed || src_changed;
+        if (r) memcpy(v->snap + at, src, 64); /* what is there to run */
+        break;
+    }
+    pm_unlock(&g_host.svcmem.views_lk);
+    return r;
+}
+
 /* ============================================================ QueryMemory */
 /* svcQueryMemory: the block at addr as the console's MemoryInfo (base, size, the state's low byte, attributes,
    permission, IPC and device reference counts), into info */
@@ -244,33 +384,31 @@ u32 svc_query(u64 info, u64 addr) {
    the game maps it, once: the mapping is a copy, kshmem_ptr gives the service the guest's pages while it lasts, and
    unmapping copies them back */
 static u64 shm_whole(const KShmem* s) { return (s->size + 0xFFF) & ~0xFFFull; }
-static void shm_destroy(KObj* o) {
+void kshmem_destroy(KObj* o) {
     KShmem* s = (KShmem*)o;
     if (s->pool)
         mem_pool_host_free(s->host, s->pool - 1, shm_whole(s));
     else
         free(s->host);
-    free(o->waiters);
-    pm_lock(&g_hle.kernel.pool_lk);
+    pm_lock(&g_host.kernel.pool_lk);
     POOL_PUT(s);
-    pm_unlock(&g_hle.kernel.pool_lk);
+    pm_unlock(&g_host.kernel.pool_lk);
 }
 /* with no reference: the first handle takes one, or the service that keeps it. The object is from g_hle.svcmem.shmems
    (KSHMEM_MAX), its pages (host) of the size the service asks for its own */
 KShmem* kshmem_new(u64 size, const char* name) {
     KShmem* s;
     u64 off;
-    pm_lock(&g_hle.kernel.pool_lk);
+    pm_lock(&g_host.kernel.pool_lk);
     s = (KShmem*)POOL_TAKE(g_hle.svcmem.shmems, g_hle.svcmem.shmem_next, "shared memories");
     s->o.type = KO_SHMEM;
-    pm_unlock(&g_hle.kernel.pool_lk);
+    pm_unlock(&g_host.kernel.pool_lk);
     s->size = size;
     if ((s->host = mem_pool_host(shm_whole(s), &off)) != NULL)
         s->pool = off + 1;
     else if (!(s->host = (u8*)calloc(1, (size_t)shm_whole(s))))
         fatal("Out of memory for the shared memory %s", name);
-    s->o.destroy = shm_destroy;
-    s->o.name = name;
+    kobj_set_name(&s->o, name);
     s->perm = PERM_RW;
     return s;
 }
@@ -326,10 +464,10 @@ u32 svc_map_shm(u32 h, u64 addr, u64 size, u32 perm) {
         r = m == -2 ? R_OUTOFMEM : R_BADMEMSTATE;
         __atomic_store_n(&s->gsize, 0, __ATOMIC_RELEASE);
     } else {
-        pm_lock(&g_hle.kernel.klock);
+        pm_lock(&g_host.kernel.klock);
         memcpy(GP(addr), s->host, (size_t)s->size);
         __atomic_store_n(&s->gaddr, addr, __ATOMIC_RELEASE);
-        pm_unlock(&g_hle.kernel.klock);
+        pm_unlock(&g_host.kernel.klock);
     }
     kobj_unref(&s->o);
     return r;
@@ -358,10 +496,10 @@ u32 svc_unmap_shm(u32 h, u64 addr, u64 size) {
     } else if (__atomic_load_n(&s->gaddr, __ATOMIC_ACQUIRE) != addr)
         r = R_BADMEMSTATE;
     else {
-        pm_lock(&g_hle.kernel.klock);
+        pm_lock(&g_host.kernel.klock);
         memcpy(s->host, GP(addr), (size_t)s->size);
         __atomic_store_n(&s->gaddr, 0, __ATOMIC_RELEASE);
-        pm_unlock(&g_hle.kernel.klock);
+        pm_unlock(&g_host.kernel.klock);
         mem_unmap(addr, __atomic_load_n(&s->gsize, __ATOMIC_ACQUIRE));
         __atomic_store_n(&s->gsize, 0, __ATOMIC_RELEASE);
     }
@@ -378,12 +516,11 @@ u32 svc_tmem_new(u64 addr, u64 size, u32 perm, KTmem** out) {
     if (perm != PERM_NONE && perm != PERM_R && perm != PERM_RW) R_THROW(R_BADPERM);
     if (!in_region(addr, size, 0, AS_END) || !range_ok(addr, size, 0, MSF_CAN_TRANSFER, PERM_RW, ~0u, 0))
         R_THROW(R_BADMEMSTATE);
-    pm_lock(&g_hle.kernel.pool_lk);
+    pm_lock(&g_host.kernel.pool_lk);
     m = (KTmem*)POOL_TAKE(g_hle.svcmem.tmems, g_hle.svcmem.tmem_next, "transfer memories");
     m->o.type = KO_TMEM;
-    pm_unlock(&g_hle.kernel.pool_lk);
-    m->o.destroy = tmem_destroy;
-    m->o.name = "transfer memory";
+    pm_unlock(&g_host.kernel.pool_lk);
+    kobj_set_name(&m->o, "transfer memory");
     m->addr = addr;
     m->size = size;
     m->perm = perm;
@@ -396,10 +533,9 @@ void tmem_destroy(KObj* o) {
     KTmem* m = (KTmem*)o;
     mem_set_attr(m->addr, m->size, MA_LOCKED, 0);
     set_perm(m->addr, m->size, PERM_RW);
-    free(o->waiters);
-    pm_lock(&g_hle.kernel.pool_lk);
+    pm_lock(&g_host.kernel.pool_lk);
     POOL_PUT(m);
-    pm_unlock(&g_hle.kernel.pool_lk);
+    pm_unlock(&g_host.kernel.pool_lk);
 }
 
 /* ============================================================ code memory */
@@ -408,17 +544,16 @@ void tmem_destroy(KObj* o) {
    pages, so code the game writes through the owner is in the slave at once. Without the pool they are copies, the
    slave of the owner when it is mapped, and code written after the slave is mapped doesn't reach it. A KCodeMem, from
    g_hle.svcmem.codemems (KHANDLED_MAX) */
-static void codemem_destroy(KObj* o) {
+void kcodemem_destroy(KObj* o) {
     KCodeMem* c = (KCodeMem*)o;
     if (c->owner) mem_alias_unmap(c->owner, c->size, c->addr);
     if (c->slave) mem_alias_unmap(c->slave, c->size, 0);
     mem_alias_end(c->addr, c->size);
     mem_set_attr(c->addr, c->size, MA_LOCKED, 0);
     set_perm(c->addr, c->size, PERM_RW);
-    free(o->waiters);
-    pm_lock(&g_hle.kernel.pool_lk);
+    pm_lock(&g_host.kernel.pool_lk);
     POOL_PUT(c);
-    pm_unlock(&g_hle.kernel.pool_lk);
+    pm_unlock(&g_host.kernel.pool_lk);
 }
 u32 svc_codemem_new(u64 addr, u64 size, KObj** out) {
     KCodeMem* c;
@@ -426,12 +561,11 @@ u32 svc_codemem_new(u64 addr, u64 size, KObj** out) {
     if (!in_region(addr, size, 0, AS_END) || !range_ok(addr, size, 0, MSF_CAN_CODE_MEMORY, PERM_RW, ~0u, 0))
         R_THROW(R_BADMEMSTATE);
     R_TRY(mem_result(mem_alias_begin(addr, size)));
-    pm_lock(&g_hle.kernel.pool_lk);
+    pm_lock(&g_host.kernel.pool_lk);
     c = (KCodeMem*)POOL_TAKE(g_hle.svcmem.codemems, g_hle.svcmem.codemem_next, "code memories");
     c->o.type = KO_CODEMEM;
-    pm_unlock(&g_hle.kernel.pool_lk);
-    c->o.destroy = codemem_destroy;
-    c->o.name = "code memory";
+    pm_unlock(&g_host.kernel.pool_lk);
+    kobj_set_name(&c->o, "code memory");
     c->addr = addr;
     c->size = size;
     set_perm(addr, size, PERM_NONE);
@@ -478,12 +612,12 @@ static u64 entropy(u32 i) {
             z = (z ^ (z >> 27)) * 0x94D049BB133111EBull;
             v[k] = (z ^ (z >> 31)) | 1;
         }
-        pm_lock(&g_hle.kernel.klock);
+        pm_lock(&g_host.kernel.klock);
         if (!*made) {
             memcpy(e, v, sizeof v);
             __atomic_store_n(made, 1, __ATOMIC_RELEASE);
         }
-        pm_unlock(&g_hle.kernel.klock);
+        pm_unlock(&g_host.kernel.klock);
     }
     return e[i];
 }
@@ -509,7 +643,7 @@ static u32 process_info(u32 id, u64* out) {
         case 3: *out = ALIAS_SIZE; R_SUCCEED();
         case 4: *out = HEAP_BASE; R_SUCCEED();
         case 5: *out = HEAP_SIZE; R_SUCCEED();
-        case 6: *out = mem_total(); R_SUCCEED();
+        case 6: *out = process_memory_total(); R_SUCCEED();
         case 7: *out = used_memory(); R_SUCCEED();
         case 12: *out = AS_BASE; R_SUCCEED();
         case 13: *out = AS_END - AS_BASE; R_SUCCEED();
@@ -524,7 +658,7 @@ static u32 process_info(u32 id, u64* out) {
         }
         case 18: *out = g_hle.kernel.title_id; R_SUCCEED();
         case 20: *out = process_local_region(); R_SUCCEED();
-        case 21: *out = mem_total() - g_hle.kernel.sysres_size; R_SUCCEED();
+        case 21: *out = process_memory_total() - g_hle.kernel.sysres_size; R_SUCCEED();
         case 22: *out = used_memory() - g_hle.kernel.sysres_size; R_SUCCEED();
         case 23: *out = 1; R_SUCCEED(); /* IsApplication */
         case 24: {                   /* FreeThreadCount */

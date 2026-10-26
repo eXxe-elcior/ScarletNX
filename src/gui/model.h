@@ -7,12 +7,14 @@
 #include <stdint.h>
 #include "common/utilities/font.h" /* gui_glyph */
 
-/* the menu's items, in order: the loads, the keys, Settings and Share log, on Android the data folder, Exit. The games
+/* the menu's items, in order: the loads, the keys, Settings and Share Log, on Android the data folder, Exit. The games
    are the Games tab's */
 enum {
     GUI_SWITCH,
     GUI_LINUX,
     GUI_3DS,
+    GUI_VITA,
+    GUI_GBA,
     GUI_KEYS,
     GUI_SETTINGS, /* the game's .ini settings, the launcher's own for the runs and its App: settings.h */
     GUI_LOG,      /* the logs in one file, for a bug report: a phone has no terminal to copy them from */
@@ -24,8 +26,8 @@ enum {
 };
 typedef enum { GUI_UP, GUI_DOWN, GUI_LEFT, GUI_RIGHT, GUI_SELECT, GUI_CANCEL, GUI_PAGE_UP, GUI_PAGE_DOWN } GuiKey;
 #define GUI_TEXT_MAX 4
-/* the screen over the menu: none, a load's file to pick, the games' browser, the keys' */
-typedef enum { GUI_LOAD_NONE, GUI_LOAD_DROP, GUI_LOAD_GAMES, GUI_LOAD_KEYS } GuiLoadView;
+/* the screen over the menu: none, a load's file to pick, the games' browser, the keys', the recompiles' queue */
+typedef enum { GUI_LOAD_NONE, GUI_LOAD_DROP, GUI_LOAD_GAMES, GUI_LOAD_KEYS, GUI_LOAD_RECOMPILE } GuiLoadView;
 typedef struct {
     int selected; /* keyboard/mouse focus, not activation */
     int active;   /* the last explicitly activated item: the load a picked file goes to */
@@ -49,13 +51,16 @@ typedef enum {
     GUI_ASK_ROOM,    /* a run whose extraction may not fit (gui_room) */
     GUI_ASK_TEXT,    /* a UI scale just picked: kept, or the one before it back */
     /* a change to the player's settings or folders, what it changes in the question (main.c's ask_line) */
-    GUI_ASK_CLEAN,  /* App's Clean old settings: the [Deprecated] sections and old keys taken out */
-    GUI_ASK_RESET,  /* Settings' Reset all to the defaults: the settings not at their default */
-    GUI_ASK_PLACES, /* Folders' All back to the defaults: the folders picked */
+    GUI_ASK_CLEAN,  /* App's Clean Old Settings: the [Deprecated] sections and old keys taken out */
+    GUI_ASK_RESET,  /* Settings' Reset to Defaults: the settings not at their default */
+    GUI_ASK_PLACES, /* Folders' Reset to Defaults: the folders picked */
     GUI_ASK_PLACE,  /* a folder picked in Folders, or the Library's recompiled/, back to its default */
     GUI_ASK_FOLDER, /* a game folder taken off the Library */
-    GUI_ASK_MOVE,   /* App's Move old files: how many entries move, how many stay */
+    GUI_ASK_MOVE,   /* App's Move Old Files: how many entries move, how many stay */
+    GUI_ASK_STATE,  /* a save state deleted (the box of a game's save states) */
+    GUI_ASK_CACHE,  /* a game's shader cache and code cache deleted (its box's Clean Cache) */
     GUI_ASK_CLOSE,  /* the window closed while a run goes: it ends with the menu */
+    GUI_ASK_MADE,   /* a dump, package or ROM a game was made from already: play the game, or recompile it */
     GUI_ASK_ERROR   /* a failure of the system's, said whole (main.c's say_failure): OK alone, which closes it */
 } GuiAsk;
 typedef struct {
@@ -72,11 +77,20 @@ typedef struct {
 } GuiChoice;
 typedef enum { GUI_CHOICE_STAY, GUI_CHOICE_TAKE, GUI_CHOICE_BACK } GuiChoiceDo;
 GuiChoiceDo gui_choice_key(GuiChoice* choice, GuiKey key);
-/* The setup's first step, Appearance: Language, Theme and UI scale a row each, as Settings > App has them, and Next
-   under them. Up and Down move round the four; Left and Right change Language's or Theme's value a step either way and
-   open UI scale's box; Select steps Language's or Theme's value on and opens UI scale's box, as Settings > App's
-   Enter does, and goes on from Next; Cancel goes back */
-enum { GUI_APPEARANCE_LANGUAGE, GUI_APPEARANCE_THEME, GUI_APPEARANCE_TEXT, GUI_APPEARANCE_NEXT, GUI_APPEARANCE_ROWS };
+/* The setup's first step, Appearance: Language, Theme and UI scale a row each, as Settings > App has them, the Side
+   panel, and Games' View and Icon size as its View box has them, then Next under them. Up and Down move round them all;
+   Left and Right change a row's value a step either way, UI scale's slider too; Select steps a row's value on and
+   opens UI scale's box, as Settings > App's Enter does, and goes on from Next; Cancel goes back */
+enum {
+    GUI_APPEARANCE_LANGUAGE,
+    GUI_APPEARANCE_THEME,
+    GUI_APPEARANCE_TEXT,
+    GUI_APPEARANCE_SIDE,
+    GUI_APPEARANCE_VIEW,
+    GUI_APPEARANCE_ICONS,
+    GUI_APPEARANCE_NEXT,
+    GUI_APPEARANCE_ROWS
+};
 typedef enum {
     GUI_APPEARANCE_STAY,
     GUI_APPEARANCE_CHANGE, /* the row's value, *step (-1 or 1) away */

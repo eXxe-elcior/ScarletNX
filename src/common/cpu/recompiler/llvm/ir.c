@@ -5,6 +5,7 @@
 #include <llvm-c/Analysis.h>
 #include <llvm-c/BitReader.h>
 #include <llvm/Config/llvm-config.h>
+#include <llvm-c/Support.h>
 #include <llvm-c/Transforms/PassBuilder.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -20,6 +21,13 @@
 /* ---- setup ---- */
 
 SnxIrFeatures snx_ir_host;
+/* snx_ir_slp's */
+static struct {
+    int slp_off;
+    int domain_off; /* snx_ir_init's, of X86DomainReassignment */
+    int fpsr_loose; /* snx_ir_fpsr_flags(0)'s */
+    int volatile_memory; /* snx_ir_volatile_memory's */
+} g_ir;
 static const SnxIrFeatures generic_features;
 
 static int has_feature(const char* features, const char* name) {
@@ -34,6 +42,18 @@ static int has_feature(const char* features, const char* name) {
 static int riscv_triple(const char* triple) { return !strncmp(triple, "riscv64", 7); }
 static int loongarch_triple(const char* triple) { return !strncmp(triple, "loongarch64", 11); }
 
+void snx_ir_slp_vectorizer(int on) {
+    /* the pass builder's SLPVectorization leaves default<O?>'s slp-vectorizer in (LLVM 22): its own switch stops it */
+    static const char* const off[] = {"scarletnx", "-vectorize-slp=false"};
+    if (on || g_ir.slp_off) return;
+    LLVMParseCommandLineOptions(2, off, NULL);
+    g_ir.slp_off = 1;
+}
+int snx_ir_slp(void) { return !g_ir.slp_off; }
+void snx_ir_fpsr_flags(int exact) { g_ir.fpsr_loose = !exact; }
+int snx_ir_fpsr_exact(void) { return !g_ir.fpsr_loose; }
+void snx_ir_volatile_memory(int on) { g_ir.volatile_memory = on != 0; }
+int snx_ir_volatile(void) { return g_ir.volatile_memory; }
 int snx_ir_init(char* error, size_t error_size) {
     char* triple;
     int x86, arm, ppc, other;
@@ -56,6 +76,14 @@ int snx_ir_init(char* error, size_t error_size) {
                  "the LLVM backend targets x86-64, AArch64, PowerPC64, RISC-V and LoongArch hosts, this one is %s",
                  triple);
     LLVMDisposeMessage(triple);
+    if (x86 && !g_ir.domain_off) {
+        /* X86DomainReassignment, which moves chains of i1 and i8 logic into AVX-512 mask registers, takes time
+           quadratic in their size on a function's NZCV and FP fast-path tests: 23 s of one game function's 26 s of
+           code generation, for the same code. Once per process: LLVM's command line is the process's */
+        static const char* const off[] = {"scarletnx", "-disable-x86-domain-reassignment"};
+        LLVMParseCommandLineOptions(2, off, NULL);
+        g_ir.domain_off = 1;
+    }
     if (x86 && !snx_ir_host.x86) {
         char* f = LLVMGetHostCPUFeatures();
         snx_ir_host.sse42 = has_feature(f, "sse4.2");
@@ -207,8 +235,11 @@ static SnxIr* new_ir(const char* name, char opt, const char* target_triple, int 
         ir->tm = LLVMCreateTargetMachineWithOptions(target, triple, options);
         LLVMDisposeTargetMachineOptions(options);
     } else {
+        /* LoongArch's calls as PCADDU18I and JIRL (CALL36, 128 GiB either way), which the medium code model makes: the
+           small one's BL (B26) reaches 128 MiB, less than a game's code, and is LLVM 19's default (later ones make
+           medium the default) */
         ir->tm = LLVMCreateTargetMachine(target, triple, cpu, features, codegen_level(opt), LLVMRelocPIC,
-                                         LLVMCodeModelDefault);
+                                         loongarch_triple(triple) ? LLVMCodeModelMedium : LLVMCodeModelDefault);
     }
 #ifdef __ANDROID__
     /* AArch64's machine outliner holds a unit's functions in memory and outlines nothing at O2: on Android that memory
@@ -363,10 +394,10 @@ int snx_ir_object(SnxIr* ir, char opt, unsigned char** data, size_t* size, char*
     *data = NULL;
     *size = 0;
     if (ir->fallbacks) {
-        size_t index;
-        const SnxA64Pattern* pattern = snx_a64_case_pattern(snx_a64_decode(ir->fallback_word), &index);
+        SnxA64Insn insn;
+        SnxA64Op op = snx_a64_decode_word(ir->fallback_word, ir->guest_features, &insn);
         snprintf(error, error_size, "no IR emitter for %s (%08lx at %llx), %lu instruction%s in all",
-                 pattern ? pattern->name : "?", (unsigned long)ir->fallback_word, (unsigned long long)ir->fallback_pc,
+                 snx_a64_op_text(op), (unsigned long)ir->fallback_word, (unsigned long long)ir->fallback_pc,
                  ir->fallbacks, ir->fallbacks == 1 ? "" : "s");
         return -1;
     }
@@ -421,6 +452,20 @@ int snx_ir_module_object(SnxIr* ir, LLVMModuleRef module, char opt, unsigned cha
         snprintf(error, error_size, "LLVM passes: %s", message);
         LLVMDisposeErrorMessage(message);
         return -1;
+    }
+    /* the NZCV values and other state a function computes in a loop only for the cold paths that store it (the
+       poll's, a helper's call) are left in the loop by default<O?>, whose sinking takes an instruction only into a
+       block its own is the only predecessor of: sink takes them as far down as the block dominating their uses */
+    if (opt != '0' && !(ir->tuning && ir->tuning->pipeline)) {
+        options = LLVMCreatePassBuilderOptions();
+        failure = LLVMRunPasses(module, "function(sink,simplifycfg)", ir->tm, options);
+        LLVMDisposePassBuilderOptions(options);
+        if (failure) {
+            message = LLVMGetErrorMessage(failure);
+            snprintf(error, error_size, "LLVM passes: %s", message);
+            LLVMDisposeErrorMessage(message);
+            return -1;
+        }
     }
     if (ppc_target(ir)) {
         ppc_tail_calls(ir);

@@ -19,7 +19,6 @@ typedef char snx_gui_id_slot[sizeof(((GuiThemes*)0)->ids[0]) == sizeof(((GuiThem
 typedef char snx_gui_word_int[sizeof(GuiStyle) == sizeof(int) && sizeof(GuiRunLayout) == sizeof(int) &&
                                       sizeof(GuiRing) == sizeof(int) && sizeof(GuiLineIn) == sizeof(int) &&
                                       sizeof(GuiAlign) == sizeof(int) && sizeof(GuiPanels) == sizeof(int) &&
-                                      sizeof(GuiHeadPlace) == sizeof(int) && sizeof(GuiTipsPlace) == sizeof(int) &&
                                       sizeof(GuiDialog) == sizeof(int) && sizeof(GuiPicture) == sizeof(int)
                                   ? 1
                                   : -1];
@@ -34,18 +33,15 @@ static const char* const aligns[] = {"left", "center", "right", NULL};
 static const char* const entrances[] = {"none", "typing", "slide", "fade", NULL};
 static const char* const typings[] = {"async", "sync", NULL};
 static const char* const panel_words[] = {"outline", "fill", NULL};
-static const char* const sizings[] = {"fixed", "adaptive", NULL};
 static const char* const flows[] = {"wrap", "slide", NULL};
-static const char* const head_places[] = {"tabs", "below", NULL};
 static const char* const pictures[] = {"none", "square", "round", NULL}; /* GuiPicture's order */
-static const char* const tips_places[] = {"bottom", "top", NULL};
 static const char* const dialogs[] = {"default", "yorha", NULL}; /* GuiDialog's order */
 #define FIELD(f)                    offsetof(GuiTheme, f), sizeof(((GuiTheme*)0)->f)
-#define TEXT(s, k, f, about)        {s, k, GUI_KEY_TEXT, FIELD(f), NULL, 0, about}
-#define COLOUR(s, k, f, about)      {s, k, GUI_KEY_COLOUR, FIELD(f), NULL, 0, about}
-#define FLAG(s, k, f, about)        {s, k, GUI_KEY_FLAG, FIELD(f), NULL, 0, about}
-#define NUMBER(s, k, f, max, about) {s, k, GUI_KEY_NUMBER, FIELD(f), NULL, max, about}
-#define WORD(s, k, f, words, about) {s, k, GUI_KEY_WORD, FIELD(f), words, 0, about}
+#define TEXT(s, k, f, about)        {s, k, GUI_KEY_TEXT, FIELD(f), NULL, 0, about, 0, 0, 0, 0, NULL}
+#define COLOUR(s, k, f, about)      {s, k, GUI_KEY_COLOUR, FIELD(f), NULL, 0, about, 0, 0, 0, 0, NULL}
+#define FLAG(s, k, f, about)        {s, k, GUI_KEY_FLAG, FIELD(f), NULL, 0, about, 0, 0, 0, 0, NULL}
+#define NUMBER(s, k, f, max, about) {s, k, GUI_KEY_NUMBER, FIELD(f), NULL, max, about, 0, 0, 0, 0, NULL}
+#define WORD(s, k, f, words, about) {s, k, GUI_KEY_WORD, FIELD(f), words, 0, about, 0, 0, 0, 0, NULL}
 const GuiThemeKey gui_theme_keys[] = {
     TEXT("theme", "name", name, SNX_TR_NOOP("the name the menu's Theme item shows")),
     TEXT("theme", "author", author, SNX_TR_NOOP("who made it")),
@@ -61,10 +57,8 @@ const GuiThemeKey gui_theme_keys[] = {
            SNX_TR_NOOP("a diff's added lines, as failure its removed ones; no screen uses it yet")),
     WORD("head", "style", head, heads, SNX_TR_NOOP("bar: the tabs and the title on a band of ink")),
     FLAG("head", "rule", head_rule, SNX_TR_NOOP("a line under the head")),
-    WORD("head", "place", head_place, head_places,
-         SNX_TR_NOOP("the title after the tabs, or on a row of its own under them")),
     NUMBER("head", "size", title_size, 3, SNX_TR_NOOP("the title's letters, times the text's, 1 to 3")),
-    FLAG("head", "shadow", title_shadow, SNX_TR_NOOP("a shadow under the title's letters, in the dim colour")),
+    FLAG("head", "shadow", title_shadow, SNX_TR_NOOP("a shadow under the title's letters, in the dim color")),
     WORD("head", "picture", picture, pictures,
          SNX_TR_NOOP("the user at the head's right, their nickname and picture in a box: none, square or round")),
     TEXT("head", "menu", title[GUI_SCREEN_MENU], SNX_TR_NOOP("the menu's title")),
@@ -73,25 +67,20 @@ const GuiThemeKey gui_theme_keys[] = {
     TEXT("head", "compiling", title[GUI_SCREEN_COMPILING], SNX_TR_NOOP("a run's title until the game loads")),
     TEXT("head", "loading", title[GUI_SCREEN_LOADING], SNX_TR_NOOP("a run's title once the runner's banner came")),
     TEXT("body", "marker", marker, SNX_TR_NOOP("before each item")),
-    WORD("body", "focus", focus_bar, focuses, SNX_TR_NOOP("the focused box in the focus colour, or on a band of it")),
+    WORD("body", "focus", focus_bar, focuses, SNX_TR_NOOP("the focused box in the focus color, or on a band of it")),
     WORD("body", "panels", panels, panel_words, SNX_TR_NOOP("the boxes outlined or filled")),
-    WORD("body", "sizing", sizing, sizings,
-         SNX_TR_NOOP(
-             "fixed: the list two fifths of every screen, alone on a narrow one; adaptive: as wide as its entries")),
     WORD("body", "text", text, flows, SNX_TR_NOOP("a text too long for its box over its rows, or on one that slides")),
     TEXT("body", "cursor", cursor, SNX_TR_NOOP("in the margin, beside the focused box")),
     WORD(
         "body", "options-dialog", dialog, dialogs,
         SNX_TR_NOOP("a question: default, a box in the middle; yorha, at the foot, its choices at its right above it")),
-    FLAG("backdrop", "grid", grid, SNX_TR_NOOP("a faint grid on the page, in the dim colour")),
-    WORD("tips", "place", tips_place, tips_places,
-         SNX_TR_NOOP("in a box at the foot beside the keys, or on a row under the head")),
+    FLAG("backdrop", "grid", grid, SNX_TR_NOOP("a faint grid on the page, in the dim color")),
     FLAG("tips", "box", tips_box, SNX_TR_NOOP("in a box with a bar at its left, or on the page")),
     FLAG("tips", "wrap", tips_wrap, SNX_TR_NOOP("over the foot's rows, or on one row that slides")),
     WORD("footer", "style", footer, styles, SNX_TR_NOOP("bar: on a band of ink; none: no Status box")),
     FLAG("footer", "rule", footer_rule, SNX_TR_NOOP("a line over the foot")),
     FLAG("footer", "box", footer_box, SNX_TR_NOOP("the keys in a box with a bar at its left, or on the page")),
-    WORD("run", "layout", run, layouts, SNX_TR_NOOP("steps: the loading screen; the keys below but colours are its")),
+    WORD("run", "layout", run, layouts, SNX_TR_NOOP("steps: the loading screen, in the colors of the keys below")),
     COLOUR("run", "page", run_colors.page, SNX_TR_NOOP("the loading screen's background")),
     COLOUR("run", "ink", run_colors.ink, SNX_TR_NOOP("its text, the cursor, the ring's turning bar")),
     COLOUR("run", "soft", run_colors.soft, SNX_TR_NOOP("older steps, the name, the inner ring")),
@@ -121,14 +110,14 @@ const GuiThemeKey gui_theme_keys[] = {
            SNX_TR_NOOP("a character of the running line, any other line whole")),
     WORD("transitions", "typing", typing_sync, typings, SNX_TR_NOOP("sync: one line at a time")),
     NUMBER("transitions", "blink_ms", blink_ms, 10000,
-           SNX_TR_NOOP("the cursor's, the prompt's and Setup device keys' blink")),
+           SNX_TR_NOOP("the cursor's, the prompt's and Install Keys' blink")),
     NUMBER("transitions", "scroll_ms", scroll_ms, 10000,
            SNX_TR_NOOP("a line too long for its row slides a column each")),
     COLOUR("splash", "page", splash_page, SNX_TR_NOOP("behind the drawing")),
     NUMBER("splash", "ms", splash_ms, 10000, SNX_TR_NOOP("how long; 0: none")),
     NUMBER("splash", "chance", splash_chance, 100,
-           SNX_TR_NOOP("the boots in 100 that show this theme's, the default's the others")),
-    {NULL, NULL, GUI_KEY_TEXT, 0, 0, NULL, 0, NULL}};
+           SNX_TR_NOOP("how many boots in 100 show this theme's splash; the others show the default's")),
+    {NULL, NULL, GUI_KEY_TEXT, 0, 0, NULL, 0, NULL, 0, 0, 0, 0, NULL}};
 static const char* const sections[][2] = {
     {"theme", "Who made it. The theme's id is its folder's name."},
     {"colors", "The menus' colours, #RRGGBB."},
@@ -173,6 +162,62 @@ static int integer(uint32_t* out, const char* value) {
     *out = (uint32_t)n;
     return 1;
 }
+/* The number a setting's typed row takes: the whole of value digits, one '.', two decimals at most (the rest of them
+   dropped, 2.223 as 2.22), the sign of its range first, and within lo to hi; trimmed into out. A value past either end
+   is the closest in range (1.1 of 2 to 5 is 2, 7 is 5), and a whole row's 3.0 is 3 where 3.5 takes no whole. Its
+   leading zeros are left out. 0 when value is no number, 1 as it is, 2 the closest in range. Letters are never part of
+   it, an exponent's e included */
+static int number(const char* value, int whole, double lo, double hi, char* out, size_t size) {
+    size_t n = 0, digits = 0, fraction = 0;
+    const char* dot = NULL;
+    char* end;
+    double d;
+    int clamped = 0;
+    while (*value == ' ' || *value == '\t') value++;
+    if (!*value) { /* no pick: the row is the .ini's again */
+        out[0] = 0;
+        return 1;
+    }
+    if (*value == '-' && lo < 0) {
+        if (n + 1 >= size) return 0;
+        out[n++] = *value++;
+    }
+    for (; *value && *value != ' ' && *value != '\t'; value++) {
+        if (*value == '.') {
+            if (dot) return 0;
+            dot = value;
+        } else if (*value >= '0' && *value <= '9') {
+            if (dot) {
+                if (fraction == 2) continue; /* 2.223: the third decimal and those after it are dropped */
+                ++fraction;
+            } else
+                ++digits;
+        } else
+            return 0;
+        if (n + 1 >= size) return 0;
+        out[n++] = *value;
+    }
+    out[n] = 0;
+    while (*value == ' ' || *value == '\t') value++;
+    if (*value || (!digits && !fraction)) return 0; /* " ." and "-" alone take no number */
+    d = strtod(out, &end);
+    if (end == out || *end || d != d) return 0;
+    if (!whole && lo > 0 && d == 0) return 0; /* 0 is no scale where the range starts above it */
+    if (d < lo) {
+        d = lo;
+        clamped = 1;
+    } else if (d > hi) {
+        d = hi;
+        clamped = 1;
+    }
+    if (whole) { /* "3.0" as 3; a real fraction is no whole number, as the runtime's check of an int says */
+        long long v = (long long)d;
+        if ((double)v != d) return 0;
+        snprintf(out, size, "%lld", v);
+    } else /* a scale as it reads: 2.0 as 2, 01.60 as 1.6, .25 as 0.25 */
+        snprintf(out, size, "%g", d);
+    return clamped ? 2 : 1;
+}
 const char* gui_theme_section_about(const char* section) {
     size_t i;
     for (i = 0; i < sizeof sections / sizeof *sections; ++i)
@@ -190,7 +235,15 @@ int gui_theme_set(void* object, const GuiThemeKey* key, const char* value) {
     uint32_t n;
     int i;
     switch (key->type) {
-        case GUI_KEY_TEXT: return !strchr(value, '\n') && copy(field, key->size, value); /* a line of the file */
+        case GUI_KEY_TEXT: /* a line of the file, or the number a setting is */
+            if (strchr(value, '\n')) return 0;
+            if (!key->numeric) return copy(field, key->size, value);
+            {
+                char text[64];
+                int took = number(value, key->whole, key->lo, key->hi, text, sizeof text);
+                if (!took || !copy(field, key->size, text)) return 0;
+                return took;
+            }
         case GUI_KEY_COLOUR: return colour((GuiRgb*)field, value);
         case GUI_KEY_FLAG:
             if (strcmp(value, "true") && strcmp(value, "false")) return 0;
@@ -255,7 +308,7 @@ static void takes(const GuiThemeKey* k, char* out, size_t size) {
     size_t n = 0;
     int i, count = 0;
     switch (k->type) {
-        case GUI_KEY_COLOUR: snprintf(out, size, "%s", snx_tr("a colour as #RRGGBB")); return;
+        case GUI_KEY_COLOUR: snprintf(out, size, "%s", snx_tr("a color as #RRGGBB")); return;
         case GUI_KEY_FLAG: snprintf(out, size, "%s", snx_tr("true or false")); return;
         case GUI_KEY_NUMBER: snprintf(out, size, snx_tr("a whole number from 0 to %lu"), (unsigned long)k->max); return;
         case GUI_KEY_TEXT:
@@ -329,6 +382,11 @@ static void apply(GuiTheme* t, const char* section, const char* key, const char*
     }
     if (!strcmp(section, "body") && (!strcmp(key, "gap") || !strcmp(key, "scroll"))) { /* docs/DEPRECATIONS.md */
         say(to, snx_tr("[body] %s = %s does nothing: ui.txt lays out the lists now (delete it)"), key, value);
+        return;
+    }
+    if ((!strcmp(section, "head") && !strcmp(key, "place")) || (!strcmp(section, "tips") && !strcmp(key, "place")) ||
+        (!strcmp(section, "body") && !strcmp(key, "sizing"))) { /* docs/DEPRECATIONS.md */
+        say(to, snx_tr("[%s] %s = %s does nothing: ui.txt lays out the screens now (delete it)"), section, key, value);
         return;
     }
     k = gui_theme_key(section, key);

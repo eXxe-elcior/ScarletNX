@@ -39,6 +39,16 @@ int pc_wait(PCond* c, PMutex* m, i64 ns) {
     deadline(&t, ns);
     return pthread_cond_timedwait(&c->c, &m->l, &t) != 0;
 }
+/* host1x_drain's clock, which nothing here calls */
+u64 plat_ns(void) {
+    struct timespec t;
+    clock_gettime(CLOCK_MONOTONIC, &t);
+    return (u64)t.tv_sec * 1000000000u + (u64)t.tv_nsec;
+}
+void plat_sleep_ns(i64 ns) {
+    struct timespec t = {(time_t)(ns / 1000000000), (long)(ns % 1000000000)};
+    nanosleep(&t, NULL);
+}
 typedef struct {
     PThreadFn fn;
     void* arg;
@@ -194,13 +204,13 @@ static void iova_tests(H1Ch* ch) {
     host1x_forget_handle(7);
     host1x_forget_handle(2);
     host1x_forget_handle(6);
-    CHECK(g_niova == 0);
+    CHECK(g_host1x.niova == 0);
     dead[3] = 0, size_of[2] = size_of[4] = 0;
     for (h = 1; h <= IOVA_SLOTS; h++) CHECK(map(ch, h, &iovas[h - 1]) == 0);
     CHECK(map(ch, IOVA_SLOTS + 1, &c) == 6);
     for (h = 1; h < IOVA_SLOTS; h++) CHECK(iovas[h] == iovas[h - 1] + 2 * IOVA_PAGE);
     for (h = 1; h <= IOVA_SLOTS; h++) host1x_forget_handle(h);
-    CHECK(g_niova == 0);
+    CHECK(g_host1x.niova == 0);
     memset(buf, 0, sizeof buf); /* UNMAP_BUFFER keeps the mapping */
     r = map(ch, 9, &c);
     CHECK(r == 0);

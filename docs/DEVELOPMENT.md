@@ -5,10 +5,10 @@
 [Architecture](ARCHITECTURE.md) · [build/toolchains](BUILD.md) · [usage](USAGE.md) · [agent rules](../CLAUDE.md) · [contributing](../CONTRIBUTING.md).
 Run from checkout. POSIX examples: Windows uses `python`, `.exe`, PowerShell env syntax.
 The build tree's drivers work in the user's data folder, as an installed copy does ([Folders](USAGE.md#folders));
-the examples name its folders on Linux, and `--repo DIR` keeps a run's files in DIR instead:
+the examples name its folders on Linux, and `--data DIR` keeps a run's files in DIR instead:
 
 ```sh
-games=~/.local/share/scarletnx/games work=~/.cache/scarletnx/work
+games=~/.local/share/scarletnx/recompiled work=~/.cache/scarletnx/work
 ```
 
 ## Rebuild / checks
@@ -19,7 +19,7 @@ cmake --build build
 ctest --test-dir build --output-on-failure
 scripts/format.sh --check
 python3 tests/run_filesystem_tree.py --cc clang --sanitize
-clang -fsyntax-only -Wall -fno-strict-aliasing -fwrapv -I src src/common/cpu/aarch64/cpu_helpers.c
+clang -fsyntax-only -Wall -I src src/common/cpu/aarch64/cpu_helpers.c
 ```
 
 Runtime relink deploys to the data folder's `recompiled/` by default (`SNX_RECOMPILED_DIR`). Recompiler/`src/common/cpu/aarch64/` edits require `-r`.
@@ -50,7 +50,7 @@ python3 tools/run_game.py <id> --runs 5 --seconds 60 --dump "$work/Game" --scrip
 python3 tools/symbols.py "$work/Game" cf34380
 python3 tools/disasm.py "$work/Game" NvRmStreamFlushSync
 python3 tools/disasm.py "$work/Game" cf34240 cf343c0
-build/scarletnx --scan-log "$games/<id>/<id>.log" [--format markdown]
+build/scarletnx --scan-log ~/.local/state/scarletnx/recompiled/<id>/<id>.log [--format markdown]
 ```
 
 - `--scan-log` (`src/common/utilities/logscan.c`, also built as `build/snx-logscan`): a log, or the launcher's Share
@@ -59,14 +59,15 @@ build/scarletnx --scan-log "$games/<id>/<id>.log" [--format markdown]
   commands the runtime doesn't implement, warnings, the frames over 50 ms (how many, the slowest, and what the
   slowest did, from the renderer's frame lines), and a signature that is the same for every log failing the same way.
   JSON (a line a log, versioned by `schema`) or a markdown summary for an issue. Paths are shortened to `~`, and the
-  crash report's code and memory dumps are left out. The launcher's Share log puts the same summary at the top of
+  crash report's code and memory dumps are left out. The launcher's Share Log puts the same summary at the top of
   `scarletnx.log`. A log is read once, a line at a time, in fixed memory: a gigabyte takes about two seconds.
-- `scarletnx --mcp [--repo DIR]` (`src/nx/runtime/driver/mcp.c`): an MCP server over stdio for an agent looking into a
+- `scarletnx --mcp [--data DIR]` (`src/nx/runtime/driver/mcp.c`): an MCP server over stdio for an agent looking into a
   failure on this machine, built into the program so a player's agent has it too. `.mcp.json` starts it for agents
-  opened in the checkout (`build/scarletnx --mcp --repo .`). Its tools: `scan_log` (the summary above), `read_log`
+  opened in the checkout (`build/scarletnx --mcp --data .`). Its tools: `scan_log` (the summary above), `read_log`
   (a log's lines holding a text, `|` between alternatives, with context, or a range, or its last lines, only under
   the data folder and its state, cache and settings folders), `find_game` (the extracted games in `work/` with their
-  title IDs and versions), `symbolize` and `disassemble` (as `tools/symbols.py` and `tools/disasm.py`, A64 through
+  title IDs and versions), `state_info` (a recompiled game's save states: slot, program, when, play time, the build
+  and stamp that saved each, and why this build can't load one), `symbolize` and `disassemble` (as `tools/symbols.py` and `tools/disasm.py`, A64 through
   LLVM's disassembler where LLVM has the AArch64 target). The last game loaded stays loaded for the next call. Its
   edenprobe tools turn a confirmed report into an edenprobe case ([EDENPROBE.md](EDENPROBE.md)). Its GDB tools
   (`mcp_gdb.c`, [USAGE.md](USAGE.md#gdb-through-the-mcp-server)) run one GDB over its machine interface (MI 3,
@@ -86,6 +87,10 @@ build/scarletnx --scan-log "$games/<id>/<id>.log" [--format markdown]
   `--shot=out` → CWD `out.ppm`; `--shot_every=N` → every N frames.
   `--script=ms:hexbuttons,...` (or `Nf:hexbuttons` to press at present N), `--press_len=ms` (default 300).
   `--swkbd_text=TEXT`: the software keyboard answers TEXT instead of opening the host's dialog.
+  `--pause=at:length,...` pauses the whole game at `at` ms of the script's clock for `length` ms, and logs whether
+  guest memory and guest time stayed unchanged while it held (`pause:` lines).
+  `--state_save=at:slot,...` and `--state_load=at:slot,...` save the game to a save state slot and load one at those
+  times (`state:` lines); the files are `<game folder>/states/<id>.<slot>.snxstate`.
   Masks: A/B/X/Y `1/2/4/8`, L/R `40/80`, ZL/ZR `100/200`, Plus/Minus `400/800`,
   left/up/right/down `1000/2000/4000/8000`.
 - `run_game.py`: Catherine New Game sequence by default; **`--script ""` disables it**.
@@ -98,7 +103,10 @@ build/scarletnx --scan-log "$games/<id>/<id>.log" [--format markdown]
   `--log=2`: verbose; Windows `--profile=1`: `profile.txt` every 10 s.
 
 The game's `[Debug]` settings ([USAGE.md](USAGE.md#settings--input)) are for investigating. Each is also given for one run as
-`--key=value` on the game's command line:
+`--key=value` on the game's command line. One not at its default, and the GDB stub, is said at the top of the game's
+picture while it runs (`Debug on: log=2, gdbstub`, a text setting by its key alone), in the log's header
+(`debug: log=2 (default 1), gdbstub`), and in the launcher, as `(Debug on)` on the game's row and its Play and the list
+beside it:
 
 - `--gpu_trace_target=0x5acf62e00[:bytes]`: logs (`gpu-trace-target:`, at most 64 lines of each kind) the clears
   and draws that write a render target starting in that GPU address range, with its size, vertex or index count and
@@ -111,27 +119,25 @@ The game's `[Debug]` settings ([USAGE.md](USAGE.md#settings--input)) are for inv
 
 ## Profiling
 
-The short way: turn on `Settings > Debug > Tracy profiler` in the launcher and start the game. The client comes up
-with the run; connect the Tracy GUI to `127.0.0.1:8086` when it is up. Broadcast discovery is off, so the GUI's *connect
-to the next instrumented process* does not find it. A run recorded to a file needs no GUI at all:
-`Settings > Launch > Tracy capture` records it and opens the trace in the profiler when the game ends. From a
-terminal, one command does the same:
+The profiler is not part of the ordinary runtime: `SNX_TRACY` defaults to OFF, so `scarletnx` carries the pinned
+Tracy 0.14.1 client only in a build that asks for it — `cmake --preset tracy -B build/tracy && cmake --build
+build/tracy`, or `-DSNX_TRACY=ON` in a build of your own (Android's app leaves it out, and iOS cannot have it).
+The client starts only when profiling is requested: the launcher setting, `--tracy-capture`, `--tracy`, or `F10`.
+Without one, a run does not connect.
+
+A game runs profiled from the terminal, the runtime's own flags and nothing else:
 
 ```sh
-scripts/tracy.sh <title-id>                       # records the run, and opens its trace
-scripts/tracy.sh <title-id> --gui                 # a run for the GUI to attach to
-scripts/tracy.sh <title-id> -- --script=script --shot=shot  # the run a normal test makes, profiled
+games="${XDG_DATA_HOME:-$HOME/.local/share}/scarletnx/recompiled"
+build/tracy/scarletnx --game="$games/<id>" --tracy-capture   # records the run, and opens its trace when it ends
+build/tracy/scarletnx --game="$games/<id>" --tracy           # a run for the GUI to attach to
+build/tracy/scarletnx --game="$games/<id>" --tracy-capture --script=script --shot=shot  # a test's run, profiled
 ```
 
-`cmake --preset tracy && cmake --build --preset tracy --target scarletnx` builds a development runtime with the
-pinned Tracy 0.14.1 client. The client starts only when profiling is requested: the launcher setting,
-`--tracy-capture`, `--tracy`, or `F7`. Without one, a run does not connect. The profiled build keeps
-`scarletnx-3ds` and `scarletnx-gnuabi` as their own programs: the client makes `dlclose` a no-op on Linux, and the
-3DS driver reloads the AOT module it just recompiled.
-
-```sh
-build/tracy/scarletnx --game="$games/<id>" --tracy
-```
+The short way is the launcher: turn on `Settings > Debug > Tracy profiler` and start the game. The client comes up
+with the run; connect the Tracy GUI to `127.0.0.1:8086` when it is up. Broadcast discovery is off, so the GUI's
+*connect to the next instrumented process* does not find it. A run recorded to a file needs no GUI at all:
+`Settings > Launch > Tracy capture` records it and opens the trace in the profiler when the game ends.
 
 `--tracy` starts the client without recording a file. The client off, an emission is one atomic load; the client up
 but nothing attached, a zone is a couple of loads on the emitting thread (a thread that is not attached asks at every
@@ -139,11 +145,14 @@ zone, so a thread that makes few — the frontend's one a frame, the audio clock
 one; an attached one asks every few thousand) and the other emissions skip their call; attached, the cost is Tracy's
 own.
 
-The sampler, which says where the time went between the zones, starts when a GUI or a capture connects and stops
-with the client, so a run that is not profiled pays nothing for it. It samples at 1 kHz (`TRACY_SAMPLING_HZ` changes
-that) and `SNX_TRACY_NO_SAMPLING=0` keeps it off. The zones take no callstacks of their own; the wait stacks,
-which walk the stack at every context switch, are off. A profiled build keeps the frame pointers `-O2` drops, as
-the sampler walks them. The sampler needs the kernel's perf events (a normal user has them) while the context
+The sampler, which says where the time went between the zones, waits to be asked for: `Settings > Debug > Tracy
+sampling` (`tracy_sampling`) starts it at the first connection, so a run that leaves it off pays nothing and its
+timeline reads as the instrumented zones alone (with JIT'd guest code and the drivers' own threads, the sample stacks
+read as a wall of [unknown]). It samples at 1 kHz (`TRACY_SAMPLING_HZ` changes that) and stops with the client. The
+zones take no
+callstacks of their own; the wait stacks,
+which walk the stack at every context switch, are off. Every runtime build keeps the frame pointers `-O2` drops,
+as the sampler walks them. The sampler needs the kernel's perf events (a normal user has them) while the context
 switches need the tracefs and so root.
 
 - The server (the GUI, or `tracy-capture`) must be the same Tracy version as the client, 0.14.1 here.
@@ -155,27 +164,27 @@ switches need the tracefs and so root.
   profiled run.
 - `tracy-csvexport` writes a trace out as CSV, without the GUI.
 
-In the launcher, `Settings > Launch > Tracy capture` turns on a capture for each Switch run (the row is only in a
-launcher built with `SNX_TRACY`). The runtime starts `tracy-capture` (from `TRACY_CAPTURE`, beside the game, or on
-`PATH`) and writes `captures/tracy_<game>_<date>.tracy` beside the game when the run ends. It passes `TRACY_PORT` on
-when the client was given one. With the setting off, the runtime does not start the client; use `--tracy` for a
+In the launcher, `Settings > Launch > Tracy capture` turns on a capture for each Switch run. The runtime starts
+`tracy-capture` (from `Settings > Debug > Tracy capture tool` (`tracy_capture_tool`), beside the game, or on `PATH`)
+and writes `captures/tracy_<game>_<date>.tracy` beside the game when the run ends. It passes `Settings > Debug >
+Tracy port` (`tracy_port`) on when the setting names one. With the setting off, the runtime does not start the
+client; use `--tracy` for a
 GUI-only run, or the launcher's `Settings > Debug > Tracy profiler`, which starts the run with the client up for
-the GUI to attach to. The setting and the Tracy flags need a runtime built with `SNX_TRACY`, and `--tracy-capture`
-also needs Tracy 0.14.1's `tracy-capture`; a normal player build refuses either flag. The game's own runtime is the
-one that takes them, so the launcher row works once that copy is the profiled build (see the deployment note below).
+the GUI to attach to. `--tracy-capture` also needs Tracy 0.14.1's `tracy-capture`; a runtime built with
+`-DSNX_TRACY=OFF` (Android, iOS) refuses both flags.
 A capture that cannot start, or one whose handshake the loading game missed three times, leaves the run going
 without a capture and says why in the log: a setting does not cost the game its launch. A capture gets a port of its
 own, so an earlier capture (or a GUI) on 8086 is not in the way, and the run waits for the capture before it starts
 the game: the handshake needs an answer, and a game loading a dump starves it.
 
-To capture only a later part of a run, leave that setting off and press `F7` in the game: it starts the client and
+To capture only a later part of a run, leave that setting off and press `F10` in the game: it starts the client and
 a 60-second capture beside the game, and logs its path. Run it again after it finishes for another segment. A
 connected GUI and `tracy-capture` are both viewers of the same one-connection client, so disconnect the GUI first
 if it is open.
 
-With `--tracy`, connect the Tracy 0.14.1 GUI to `127.0.0.1:8086`, or to `TRACY_PORT`'s port when it is set;
-broadcast discovery is off. `tracy-capture` records the same stream to a file without the GUI. It can start before
-or after the game, and `-s` bounds the recording; it writes the trace when that ends or the game exits.
+With `--tracy`, connect the Tracy 0.14.1 GUI to `127.0.0.1:8086`, or to `tracy_port`'s port when the setting names
+one; broadcast discovery is off. `tracy-capture` records the same stream to a file without the GUI. It can start
+before or after the game, and `-s` bounds the recording; it writes the trace when that ends or the game exits.
 A normal exit (Esc, the game's own exit, or an unattended limit) ends the zones still open on the exiting thread,
 waits a moment for the other threads' short zones, sends the client's queued events and closes the connection, so
 the capture sees a clean end rather than a dropped socket. If a thread is still inside a zone after that wait, the
@@ -208,12 +217,10 @@ The GPU's own track comes with it: the rendering passes of each frame are zones 
 target they draw to, and the GPU clock is put on the CPU's timeline once a frame, so a pass that took the GPU long
 shows against the CPU's work that waited for it. The timestamps come from the graphics queue's, which the device
 must have; they are taken when the runtime is profiled (a GUI connected or a capture running) or when
-`SNX_VK_GPU_PROFILE=1` asks for them, which also logs what the GPU's time went to every 10 s. The preset builds into
-`build/tracy` and turns the post-build deploy off (`SNX_DEPLOY=OFF`, which `SNX_TRACY` forces), so a profiled build is
-not copied over every game as a normal one is. The driver still gives a game the runtime that plays it, though: the
-first run through `build/tracy/scarletnx` (the script, or `--game=`) puts the profiled runtime beside the game, and a
-later run through a normal build puts its own back. `SNX_TRACY` is for development builds and is not available on
-iOS. The Windows-only `profile=1` sampler is separate.
+`SNX_VK_GPU_PROFILE=1` asks for them, which also logs what the GPU's time went to every 10 s. The binary is
+not deployed beside every game the way an ordinary build is, so a game it is not run through the profiled driver for
+keeps the runtime it already had: run it through the profiled driver once, and launcher rows work from then.
+`SNX_TRACY=OFF` leaves the client out; iOS has none. The Windows-only `profile=1` sampler is separate.
 
 The guest's own file I/O is in the trace too: a read or a write is a zone with the file's name and the bytes, and
 `io read MB/s` and `io write MB/s` are the rate. The game's assets are not read during a run, though: they are mapped

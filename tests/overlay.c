@@ -12,6 +12,7 @@
 #include "nx/runtime/platform/controls_atlas.h"
 #include "nx/runtime/platform/plat.h"
 #include "common/utilities/font.h"
+#include "gui/icons.h"
 #include "gui_theme_colors.h"
 #include "common/utilities/users.h"
 #include "gui/splash.h"
@@ -38,6 +39,11 @@ void fatal(const char* fmt, ...) {
     va_end(ap);
     fputc('\n', stderr);
     abort();
+}
+/* settings.txt's Display table, which holds the menu's Stats, names options.c's setter of the game's language */
+void options_language_set(const IniOpt* o, const char* v) {
+    (void)o;
+    (void)v;
 }
 /* the platform's lock and the backend's touch screen, without either */
 void pm_lock(PMutex* m) { (void)m; }
@@ -66,7 +72,7 @@ unsigned gamepad_held(int i) { return i < 0 ? pads_held[0] | pads_held[1] | pads
 const char* gamepad_name(int i) { return i >= 0 && i < 3 ? pad_names[i] : NULL; }
 int gamepad_of_player(int slot) { return slot >= 0 && slot < 3 ? pad_of_player[slot] : -1; }
 const IniOpt g_backend_ini[] = {
-    {"touch", "2", NULL, INI_INT, 0, &touch, 0, 2, NULL, "Touch screen", "Off|Fingers|Mouse too", 0, 0, 0},
+    {"touch", "2", NULL, INI_INT, 0, &touch, 0, 2, NULL, "Touch screen", "Off|Fingers|Fingers and mouse", 0, 0, 0},
     {NULL, NULL, NULL, 0, 0, NULL, 0, 0, NULL, NULL, NULL, 0, 0, 0}};
 /* each player's own, two of them here: swap and vibration, every player's until picked, and a map */
 static SnxPlayerConfig players[2];
@@ -76,16 +82,18 @@ void gamepad_store_player_map(int p) {
     (void)p;
     ++player_maps_stored;
 }
-const IniOpt g_gamepad_players_ini[] = {
-    {"gamepad_p1_swap_ab", "-1", NULL, INI_INT, 0, &g_settings.player_swap_a_b[0], -1, 1, NULL, "Swap A/B", "As All|Off|On", 0, 0, 0},
-    {"gamepad_p1_rumble", "-10", NULL, INI_INT, 0, &g_settings.player_vibration[0], -10, 100, NULL, "Vibration", "As All|Off|#%", 10,
-     0, 0},
-    {NULL, NULL, NULL, 0, 0, NULL, 0, 0, NULL, NULL, NULL, 0, 0, 0}};
+const IniOpt g_gamepad_players_ini[] = {{"gamepad_p1_swap_ab", "-1", NULL, INI_INT, 0, &g_settings.player_swap_a_b[0],
+                                         -1, 1, NULL, "Swap A/B", "As All|Off|On", 0, 0, 0},
+                                        {"gamepad_p1_rumble", "-10", NULL, INI_INT, 0, &g_settings.player_vibration[0],
+                                         -10, 100, NULL, "Vibration", "As All|Off|#%", 10, 0, 0},
+                                        {NULL, NULL, NULL, 0, 0, NULL, 0, 0, NULL, NULL, NULL, 0, 0, 0}};
 const IniOpt g_gamepad_ini[] = {
     {"gamepad_swap_ab", "0", NULL, INI_INT, 0, &g_settings.swap_a_b, 0, 1, NULL, "Swap A/B", "Off|On", 0, 0, 0},
-    {"gamepad_deadzone", "20", NULL, INI_INT, 0, &g_settings.stick_dead_zone, 0, 90, NULL, "Stick dead zone", "#%", 5, 0, 0},
+    {"gamepad_deadzone", "20", NULL, INI_INT, 0, &g_settings.stick_dead_zone, 0, 90, NULL, "Stick dead zone", "#%", 5,
+     0, 0},
     {"gamepad_rumble", "100", NULL, INI_INT, 0, &g_settings.vibration, 0, 100, NULL, "Vibration", "Off|#%", 10, 0, 0},
-    {"gamepad_background", "0", NULL, INI_INT, 0, &g_settings.background_input, 0, 1, NULL, "Background input", "Off|On", 0, 0, 0},
+    {"gamepad_background", "0", NULL, INI_INT, 0, &g_settings.background_input, 0, 1, NULL, "Background input",
+     "Off|On", 0, 0, 0},
     {NULL, NULL, NULL, 0, 0, NULL, 0, 0, NULL, NULL, NULL, 0, 0, 0}};
 static char stored[64], log_[512]; /* the last key kept, and every key=value since log_ was emptied */
 static void store(const char* key, const char* value) {
@@ -115,7 +123,7 @@ static void draw(void) {
     list.q = quads;
     list.n = 0;
     list.max = 2048;
-    overlay_draw(&list, SW, SH);
+    overlay_draw(&list, SW, SH, 0);
 }
 /* whether text shows anywhere on the picture, its letters a cell apart on one row (spaces draw nothing) */
 static int shows(const char* text) {
@@ -149,6 +157,17 @@ static int glyph_at(int col, int row, u8 c) {
             list.q[i].u == SNX_CONTROLS_FONT_X + c % 16 * 8 && list.q[i].v == SNX_CONTROLS_FONT_Y + c / 16 * 16)
             return i;
     return -1;
+}
+/* whether an icon of gui/icons.h is drawn from that cell on, two cells wide, from its texels beside the picture */
+static int icon_at(int col, int row, unsigned icon) {
+    int i;
+    for (i = 0; i < list.n; ++i)
+        if (list.q[i].x == (float)(px + col * 8 * s) && list.q[i].y == (float)(py + row * 16 * s) &&
+            list.q[i].w == (float)(16 * s) && list.q[i].h == (float)(16 * s) &&
+            list.q[i].u == SNX_UI_ICONS_X + 16 * (icon - GUI_ICON_FIRST) && list.q[i].v == SNX_CONTROLS_ATLAS_HEIGHT &&
+            list.q[i].uw == 16 && list.q[i].vh == 16 && list.q[i].sample == UI_SHARP)
+            return 1;
+    return 0;
 }
 /* whether a line of text is drawn from that cell on, in the font's glyphs (a space draws none) */
 static int text_at(int col, int row, const char* text) {
@@ -228,14 +247,14 @@ int main(void) {
     overlay_toggle();
     assert(overlay_shown());
     /* letters half the screen's height at most, in whole steps, in the middle: a phone held wide, a small window. The
-       page is as tall as its items (three here, under three rows of head, over a blank one), at the scale of the
+       page is as tall as its items (five here, under three rows of head, over a blank one), at the scale of the
        tallest page, and as wide as three quarters of the picture hold, between 40 and 72 columns */
     overlay_place(SW, SH, &px, &py, &s);
     C = overlay_cols(SW, s);
-    assert(s == 2 && C == OVERLAY_COLS_MAX && px == (SW - C * 16) / 2 && py == (SH - 7 * 32) / 2);
+    assert(s == 2 && C == OVERLAY_COLS_MAX && px == (SW - C * 16) / 2 && py == (SH - 9 * 32) / 2);
     assert(overlay_cols(1280, 2) == 60 && overlay_cols(500, 1) == 46 && overlay_cols(400, 1) == OVERLAY_COLS &&
            overlay_cols(3840, 4) == OVERLAY_COLS_MAX);
-    overlay_place(500, 120, &x, &y, &sc);
+    overlay_place(500, 152, &x, &y, &sc);
     assert(sc == 1 && x == (500 - 46 * 8) / 2 && y == 4);
     /* a phone's display scale: the Poco F8 (408 dpi, 2510x1156) and the Pixel 9 (420 dpi) at 3x, where half the
        picture gave 2x; a 4K picture at 100% keeps the 4x half of it gives */
@@ -252,17 +271,27 @@ int main(void) {
     /* the first page: the title on a band of ink, the items under it, the focused one on a band; the page hides the
        game, whose text would show through it */
     draw();
-    assert(list.q[0].w == (float)(C * 16) && list.q[0].h == 7 * 32 && list.q[1].rgba == ink && list.q[1].h == 32);
+    assert(list.q[0].w == (float)(C * 16) && list.q[0].h == 9 * 32 && list.q[1].rgba == ink && list.q[1].h == 32);
     assert(list.q[0].rgba >> 24 == 0xFFu);
     assert(text_at(C - 2, 3, ">") && text_at(C - 2, 4, ">")); /* a page under each */
-    assert(text_at(1, 0, "SCARLETNX  /  MENU") && text_at(1, 3, "\xFE On-screen controls") &&
-           text_at(1, 4, "\xFE Controllers") && text_at(1, 5, "\xFE Exit"));
+    /* each item its marker, its icon in two cells and one, its name */
+    assert(text_at(1, 0, "SCARLETNX  /  MENU") && text_at(1, 3, "\xFE") && icon_at(3, 3, GUI_ICON_POINTER) &&
+           text_at(6, 3, "On-screen controls") && icon_at(3, 4, GUI_ICON_GAMEPAD_2) && text_at(6, 4, "Controllers") &&
+           icon_at(3, 5, GUI_ICON_SAVE) && text_at(6, 5, "Save states") && icon_at(3, 6, GUI_ICON_ACTIVITY) &&
+           text_at(6, 6, "Stats") && icon_at(3, 7, GUI_ICON_LOG_OUT) && text_at(1, 7, "\xFE") && text_at(6, 7, "Exit"));
+    assert(!icon_at(3, 3, GUI_ICON_SAVE) && !text_at(1, 3, "\xFE On-screen controls"));
+    /* Stats: a tap turns it on and keeps it in the game's .ini, as F12 does, and again off */
+    assert(text_at(C - 4, 6, "Off") && !g_settings.stats);
+    assert(tap(3, 3) == OVERLAY_NONE && g_settings.stats && !strcmp(stored, "stats"));
+    draw();
+    assert(text_at(C - 3, 6, "On"));
+    assert(tap(3, 3) == OVERLAY_NONE && !g_settings.stats);
     /* a tap on Exit exits; on the title, nothing; outside the panel, it closes */
-    assert(tap(2, 3) == OVERLAY_EXIT && tap(-3, 3) == OVERLAY_NONE);
+    assert(tap(4, 3) == OVERLAY_EXIT && tap(-3, 3) == OVERLAY_NONE);
     assert(overlay_tap(5.0f, 5.0f, SW, SH) == OVERLAY_CLOSE);
     /* the focus goes round, from Exit to the first item and back over the top; Back from here closes */
     overlay_move(1);
-    overlay_move(-4);
+    overlay_move(-6);
     assert(overlay_select() == OVERLAY_EXIT && overlay_back() == OVERLAY_CLOSE);
 
     /* the controls' page: each setting shown with its value, changed and kept */
@@ -308,7 +337,7 @@ int main(void) {
     tap(8, 3);
     assert(touch == 2);
     draw();
-    assert(text_at(C - 10, 11, "Mouse too"));
+    assert(text_at(C - 1 - (int)strlen("Fingers and mouse"), 11, "Fingers and mouse"));
     tap(8, 3);
     assert(touch == 0);
     draw();
@@ -363,6 +392,9 @@ int main(void) {
            left stick past half way as one, goes on after a while, then on and on; with the menu closed, nothing, and
            a press held as it opens does not act */
         assert(overlay_controls(0, still, 1000) == OVERLAY_NONE); /* the focus back on Controllers */
+        overlay_move(1);                                          /* Save states */
+        assert(overlay_controls(0, down, 1000) == OVERLAY_NONE);  /* to Stats */
+        assert(overlay_controls(0, still, 1000) == OVERLAY_NONE); /* let go */
         assert(overlay_controls(0, down, 1000) == OVERLAY_NONE);  /* to Exit */
         assert(overlay_controls(0, down, 1000 + SNX_OVERLAY_REPEAT_DELAY - 1) == OVERLAY_NONE);
         assert(overlay_controls(1ull << 0, down, 1000 + SNX_OVERLAY_REPEAT_DELAY - 1) == OVERLAY_EXIT); /* not yet */
@@ -372,10 +404,12 @@ int main(void) {
         assert(text_at(1, 0, "SCARLETNX  /  CONTROLS"));
         assert(overlay_controls(1ull << 1, still, 2000) == OVERLAY_NONE);  /* B: back to the menu, on its first */
         assert(overlay_controls(1ull << 15, still, 2001) == OVERLAY_NONE); /* the D-pad down: Controllers */
-        assert(overlay_controls(1ull << 15, still, 2001 + SNX_OVERLAY_REPEAT_DELAY) == OVERLAY_NONE); /* Exit */
+        assert(overlay_controls(1ull << 15, still, 2001 + SNX_OVERLAY_REPEAT_DELAY) == OVERLAY_NONE); /* Save states */
         assert(overlay_controls(1ull << 15, still, 2001 + SNX_OVERLAY_REPEAT_DELAY + SNX_OVERLAY_REPEAT_MS - 1) ==
                OVERLAY_NONE);
-        assert(overlay_controls(1ull << 0, still, 3000) == OVERLAY_EXIT);
+        overlay_move(1); /* past Save states, to Stats */
+        assert(overlay_controls(1ull << 0, still, 3000) == OVERLAY_NONE && g_settings.stats); /* A on it */
+        g_settings.stats = 0;
         assert(overlay_controls(1ull << 13, still, 3001) == OVERLAY_NONE &&
                overlay_controls(0, left, 3002) == OVERLAY_NONE);
         assert(overlay_controls(1ull << 1, still, 3003) == OVERLAY_CLOSE);
@@ -549,6 +583,69 @@ int main(void) {
     assert(text_at(1, 0, "SCARLETNX  /  CONTROLLERS") && overlay_back() == OVERLAY_NONE);
     draw();
     assert(text_at(1, 0, "SCARLETNX  /  MENU"));
+    /* the save states' pages: a row per slot, the auto one first, then a slot's Save, Load and Delete, Load and
+       Delete asked first. The list is read again each time the page opens */
+    {
+        OverlaySlot sl[3];
+        u8* thumb = (u8*)calloc((size_t)SNX_UI_IMAGE_W * SNX_UI_IMAGE_H, 4);
+        u32 version;
+        memset(sl, 0, sizeof sl);
+        snprintf(sl[2].when, sizeof sl[2].when, "2026-10-22 14:05  0:02:00");
+        sl[2].thumb = thumb;
+        assert(!overlay_states_shown());
+        overlay_move(1);
+        assert(overlay_select() == OVERLAY_NONE && overlay_states_shown() && overlay_states_stale());
+        overlay_slots_set(sl, 3);
+        assert(!overlay_states_stale());
+        draw();
+        assert(shows("SCARLETNX  /  SAVE STATES") && shows("\xFE Auto") && shows("\xFE Slot 1") &&
+               shows("\xFE Slot 2") && shows("\xFE Back"));
+        assert(shows("Empty") && shows("2026-10-22 14:05  0:02:00"));
+        /* the focused slot's thumbnail beside the list: none for an empty one, slot 2's once in focus */
+        assert(!ui_image_get(&version));
+        overlay_move(2);
+        draw();
+        assert(ui_image_get(&version) != NULL);
+        assert(overlay_select() == OVERLAY_NONE);
+        draw();
+        assert(shows("SCARLETNX  /  SLOT 2") && shows("\xFE Save"));
+        assert(overlay_select() == OVERLAY_SAVE && overlay_slot() == 2);
+        overlay_move(1); /* Load: asked, Cancel in focus */
+        assert(overlay_select() == OVERLAY_NONE);
+        draw();
+        assert(shows("SCARLETNX  /  LOAD SLOT 2?"));
+        assert(overlay_select() == OVERLAY_NONE); /* Cancel */
+        draw();
+        assert(shows("SCARLETNX  /  SLOT 2"));
+        assert(overlay_select() == OVERLAY_NONE); /* Load again, the focus back on it, then yes */
+        overlay_move(-1);
+        assert(overlay_select() == OVERLAY_LOAD && overlay_slot() == 2);
+        /* an empty slot neither loads nor goes */
+        assert(overlay_back() == OVERLAY_NONE && overlay_states_shown());
+        overlay_move(-1);
+        assert(overlay_select() == OVERLAY_NONE);
+        overlay_move(1);
+        assert(overlay_select() == OVERLAY_NONE);
+        draw();
+        assert(shows("SCARLETNX  /  SLOT 1"));
+        /* the auto slot has no Save */
+        assert(overlay_back() == OVERLAY_NONE);
+        overlay_move(-1);
+        assert(overlay_select() == OVERLAY_NONE);
+        draw();
+        assert(shows("SCARLETNX  /  AUTO SLOT") && shows("\xFE Load"));
+        assert(overlay_back() == OVERLAY_NONE && overlay_back() == OVERLAY_NONE && !overlay_states_shown());
+        draw();
+        assert(shows("SCARLETNX  /  MENU"));
+    }
+    /* a notification over the game, closed or open, until its time is up */
+    overlay_toast("Saved to slot 2", 1000);
+    assert(overlay_toasting(1000) && !overlay_toasting(1000 + (u64)SNX_OVERLAY_TOAST_MS * 1000000u));
+    overlay_toggle();
+    draw();
+    assert(!overlay_shown() && shows("Saved to slot 2"));
+    overlay_toast("", 0); /* none */
+    overlay_toggle();
     /* closed, it draws nothing; opened again, its first page */
     overlay_toggle();
     draw();
@@ -583,19 +680,25 @@ int main(void) {
                            (gui_vga_font[sc * 16 + y] & (0x80 >> x) ? 0xFFFFFFFFu : 0));
         assert(gui_vga_font['A' * 16 + 5] && gui_vga_font['A' * 16 + 5] != 0xFF);
         assert(a[(SNX_CONTROLS_WHITE_Y + 1) * w + SNX_CONTROLS_WHITE_X + 1] == 0xFFFFFFFFu);
+        /* each icon beside the picture, white where its glyph's bit is (gui_icon_font: its halves, left then right) */
+        for (sc = 0; sc < GUI_ICON_COUNT; ++sc)
+            for (y = 0; y < 16; ++y)
+                for (x = 0; x < 16; ++x)
+                    assert(a[(SNX_CONTROLS_ATLAS_HEIGHT + y) * w + SNX_UI_ICONS_X + sc * 16 + x] ==
+                           (gui_icon_font[(sc * 2 + x / 8) * 16 + y] & (0x80 >> x % 8) ? 0xFFFFFFFFu : 0));
         ui_atlas_done();
         assert(!ui_atlas(&w, &h, &version) && version == 1);
         free(sprites);
     }
     /* a fatal error's panel: the menu's, centred on its own rows; the head, the game's name, the error in the
-       failure's colour, its hint, then Share log and Close at its foot, Close in focus. UTF-8 comes out in the font's
-       bytes, and on a short picture the last paragraphs give up rows so the panel stays on it, what Share log did last */
+       failure's colour, its hint, then Share Log and Close at its foot, Close in focus. UTF-8 comes out in the font's
+       bytes, and on a short picture the last paragraphs give up rows so the panel stays on it, what Share Log did last */
     {
         float top, row_h;
         int total, i, close_band = -1, share_band = -1;
         unsigned plain, focused;
         SnxOverlayError panel = panel_of("ENDER MAGNOLIA", "vulkan: the GPU device was lost (driver reset or crash)",
-                                         "Share log sends the game's log, which has what ran last.", NULL, NULL);
+                                         "Share Log sends the game's log, which has what ran last.", NULL, NULL);
         list.n = 0;
         overlay_error_draw(&list, SW, SH, &panel);
         overlay_place(SW, SH, &px, &py, &s);
@@ -617,7 +720,7 @@ int main(void) {
             if (list.q[i].y == top + row_h * (float)(total - 2) && list.q[i].h == row_h && list.q[i].w == list.q[0].w)
                 close_band = i;
         assert(close_band >= 0 && text_at(1, total - 2, "\xFE Close") && text_at(1, total - 3, "\xFE Copy path") &&
-               text_at(1, total - 4, "\xFE Share log"));
+               text_at(1, total - 4, "\xFE Share Log"));
         i = glyph_at(3, total - 4, 'S');
         assert(i >= 0);
         plain = list.q[i].rgba;
@@ -641,7 +744,7 @@ int main(void) {
         assert(i >= 0 && list.q[i].rgba == plain);
         i = glyph_at(3, total - 4, 'S');
         assert(i >= 0 && list.q[i].rgba == focused);
-        /* what Share log did, over the items, and kept when the picture is short */
+        /* what Share Log did, over the items, and kept when the picture is short */
         panel.said = "Log saved to /home/player/.local/state/scarletnx/games/0100ABCD12345000/scarletnx.log.";
         list.n = 0;
         overlay_error_draw(&list, SW, 260, &panel);
@@ -695,10 +798,10 @@ int main(void) {
         overlay_error_draw(&list, SW, 160, &panel);
         assert(!overlay_error_hit(&panel.link, panel.link.x, panel.link.y) && !panel.link.h);
         list.n = 0;
-        panel = panel_of("GAME", "message", "Share log", NULL, NULL);
+        panel = panel_of("GAME", "message", "Share Log", NULL, NULL);
         overlay_error_draw(&list, SW, SH, &panel);
         assert(!panel.link.w && !panel.link.h && !overlay_error_hit(NULL, 0, 0));
-        /* Share log's line takes room from the log's label and the hint first: on a picture the panel just fills with
+        /* Share Log's line takes room from the log's label and the hint first: on a picture the panel just fills with
            both, the whole path is still there and still a link */
         {
             const char* said =
@@ -767,7 +870,7 @@ int main(void) {
         for (y = 0; y < SNX_UI_PICTURE; ++y)
             for (x = 0; x < SNX_UI_PICTURE; ++x) {
                 u32 p = snx_le32(a[(SNX_CONTROLS_ATLAS_HEIGHT + y) * w + x]); /* the GPU's bytes R G B A */
-                assert(p >> 24 == 0xFF); /* square: every texel opaque */
+                assert(p >> 24 == 0xFF);                                      /* square: every texel opaque */
                 white += p == 0xFFFFFFFFu;
             }
         assert(a[SNX_CONTROLS_ATLAS_HEIGHT * w] == 0xFFFFFFFFu && white < SNX_UI_PICTURE * SNX_UI_PICTURE * 9 / 10);
@@ -801,11 +904,11 @@ int main(void) {
                 const SnxUiQuad* q = &list.q[i];
                 if (q->v == SNX_CONTROLS_ATLAS_HEIGHT && q->uw == SNX_UI_PICTURE && q->vh == SNX_UI_PICTURE) {
                     ++pictures;
-                    assert(q->y == band + 2 * edge && q->h == side && q->w == side && !q->sharp);
+                    assert(q->y == band + 2 * edge && q->h == side && q->w == side && q->sample == UI_BLEND);
                     assert(q->x + q->w == right - 2 * edge);
                 }
-                frames += q->rgba == LIGHT_RGBA && q->sharp && (q->w == edge || q->h == edge) && q->x >= boxx &&
-                          q->x < right && q->y >= band && q->y < band + 16.0f * (float)s;
+                frames += q->rgba == LIGHT_RGBA && q->sample == UI_SHARP && (q->w == edge || q->h == edge) &&
+                          q->x >= boxx && q->x < right && q->y >= band && q->y < band + 16.0f * (float)s;
                 if (q->u == SNX_CONTROLS_FONT_X + 'P' % 16 * 8 && q->v == SNX_CONTROLS_FONT_Y + 'P' / 16 * 16 &&
                     q->y == band && q->x > boxx)
                     assert(q->x == boxx + 8.0f * (float)s); /* the nickname a column into the box */

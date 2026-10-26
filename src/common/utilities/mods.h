@@ -29,6 +29,32 @@ size_t snx_mods_played(const char* folder, const char* off, const char* part, ch
    that has it: their names into *names, sorted, and their paths into *paths (each snx_free_strings). Their count */
 size_t snx_mods_exefs(const char* folder, const char* off, char*** names, char*** paths);
 /* what the program of a game with mods in folder is built from beyond its own ExeFS, the files snx_mods_exefs gives
-   by their names and bytes, as 16 hex digits, owned. "" when no mod played has any */
+   and then the patches snx_mods_patches gives (common/utilities/patches.h), by their names and bytes, as 16 hex digits,
+   owned. "" when no mod played has any */
 char* snx_mods_stamp(const char* folder, const char* off);
+/* what a game's <name>.abi holds when the recompile made it for abi with mods, its mods' stamp (snx_mods_stamp): the
+   ABI, and " mods " and that stamp unless it is "", owned */
+char* snx_game_stamp_for(unsigned abi, const char* mods);
+/* the stamp of the mods the game at base (<folder>/<name>, a game's or its update's) plays now, its game's (the folder's
+   name), owned */
+char* snx_game_mods_stamp(const char* base);
+/* 1 when the game at base was made as expected says (snx_game_stamp_for): its <base>.abi holds it, then its made line
+   or nothing, a partial write or anything else after it being no completed build. The driver recompiles a game that
+   was not before it plays it, and the launcher compiles it through its queue */
+int snx_game_stamp_is(const char* base, const char* expected);
+/* how the recompile made a game, the made line after the stamp in its <name>.abi ("\nmade opt=2 aot=1 found=N
+   code=N"), which the stamp is not compared by: the -O, whether it made code ahead of time (0: --jit-only, the JIT
+   compiles it all), and of the instructions in the modules' code those its analysis found and made ahead of time.
+   Unknown, from a stamp an older version wrote: opt 0, aot -1, code 0 */
+typedef struct {
+    char opt;
+    int aot;
+    unsigned long long found, code;
+} SnxGameMade;
+/* made as the line the stamp ends with, its "\n" first, owned */
+char* snx_game_made_line(const SnxGameMade* made);
+/* the size of the stamp proper in a <name>.abi's text: what comes before its made line (the last "\nmade "), else all */
+size_t snx_game_stamp_size(const char* text, size_t size);
+/* the made line of the game at base's <base>.abi in made: 1, else 0 with made unknown (no stamp, or one without it) */
+int snx_game_made_read(const char* base, SnxGameMade* made);
 #endif

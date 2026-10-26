@@ -11,6 +11,7 @@
 #include "nx/loader/module_abi.h"
 #include "common/cpu/arm/llvm.h"
 #include "common/cpu/recompiler/llvm/link.h"
+#include "snx_settings.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -569,7 +570,7 @@ int snx_build_module_arm(SnxProgram* loaded, const SnxCodegenOptions* options, c
     memset(&d, 0, sizeof(d));
     memset(&q, 0, sizeof(q));
     memset(&linked, 0, sizeof(linked));
-    if (!loaded->module_count) return snx_error("No modules to generate");
+    if (!loaded->module_count) return snx_error("no modules to generate");
     if (snx_ir_init(error, sizeof(error))) return snx_error("%s", error);
     d.program = loaded;
     start = snx_seconds();
@@ -580,7 +581,7 @@ int snx_build_module_arm(SnxProgram* loaded, const SnxCodegenOptions* options, c
     qsort(d.blocks, d.count, sizeof(*d.blocks), compare_block);
     if (!options->quiet) printf("AArch32: %lu blocks found (%.1f s)\n", (unsigned long)d.count, snx_seconds() - start);
     /* units of whole blocks, by the code they cover, as module_llvm.c's chunks of whole functions */
-    limit = options->chunk_instrs ? options->chunk_instrs : SNX_CHUNK_INSTRUCTIONS;
+    limit = options->chunk_instrs ? options->chunk_instrs : (size_t)g_settings.unit_size;
     q.units = (Unit*)snx_alloc((d.count + 1) * sizeof(*q.units));
     memset(q.units, 0, (d.count + 1) * sizeof(*q.units));
     for (first = 0; first < d.count; first = last) {
@@ -631,12 +632,12 @@ int snx_build_module_arm(SnxProgram* loaded, const SnxCodegenOptions* options, c
     }
     exports[0] = "snx_module_arm";
     if (snx_link(inputs, n, exports, 1, base_name(build->output), &linked, error, sizeof(error))) {
-        snx_error("Linking failed: %s", error);
+        snx_error("linking failed: %s", error);
         goto done;
     }
     tmp = snx_format("%s.tmp", build->output);
     if (snx_write_file(tmp, linked.data, linked.size) || snx_replace(tmp, build->output)) {
-        snx_error("Linking failed: cannot write %s", build->output);
+        snx_error("linking failed: cannot write %s", build->output);
         if (snx_is_file(tmp)) snx_remove_tree(tmp);
         goto done;
     }

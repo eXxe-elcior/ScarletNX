@@ -7,6 +7,11 @@ the ownership map and copies it on the GPU. Only when the guest CPU (recompiled 
 touches an owned range is the data written back into guest memory, the one readback the rules allow, and the range
 is the CPU's again.
 
+Render targets stay the renderer's: their pixels reach guest memory only when a consumer asks. Pitch-linear color
+targets are the exception, as a game draws into those to read the result on the CPU: each release publishes the ones
+drawn since the last (`vk_rt_publish_linear` in `vk/surface.c`), and storage images are published the same way
+(`vk_surf_publish`). A block linear target the CPU reads gets no write-back yet.
+
 The trap model is Skyline's (read for the design only: its source is MPL-2.0 and was withdrawn at the console maker's
 request, so nothing is copied from it). The fault is taken differently on each host (below).
 
@@ -88,6 +93,16 @@ rather than landing in the signal handler.
   without `own_acquire`): fatal, with the range, when that thread is waiting in the fault. A late fault message, from a
   thread that has taken `vk_lock` since, lands as any other. Its fault on a page no entry is on any more (landed, not
   let go yet) goes on.
+- Before that fatal, `ownership-fault:` lines record the read/write direction, guest page and host page, whether
+  the wait was confirmed, and up to sixteen overlapping owners (guest ranges, pool offsets, resource identities,
+  resource offsets and landing state). The address is page-granular, not the exact byte accessed.
+  On Linux the report reads the **blocked thread's** PC and SP from `/proc/self/task/TID/syscall`, then records its
+  executable mapping and file offset. It scans at most 128 native stack words for executable addresses, explicitly
+  labeled `stack-candidate`: these may be saved callers or unrelated values, **not an unwound backtrace**. It never
+  reads shared guest pool pages for this scan or resumes the thread. Missing procfs/register/stack access is logged.
+  Use the build revision printed at startup and that build's unstripped binary/debug symbols to resolve addresses;
+  a file offset must be translated through the ELF load segments before using it as an addr2line address.
+  See https://man7.org/linux/man-pages/man5/proc_pid_syscall.5.html for the blocked-thread register format.
 - Landing is a memcpy into the mirror. A producer's GPU copy keeps the range's layout (block linear surfaces are
   swizzled on the GPU), and covers the range's padding: it is filled from guest memory when the producer takes the
   range.

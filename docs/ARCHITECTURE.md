@@ -48,9 +48,9 @@ music through this path, without input yet. See [3DS port](3DS.md) for coverage 
 and remaining cache/ISA work.
 
 The common target has no runtime-specific imports. NX and GNU ABI each link
-common and have no dependency on each other. The GNU executable target is
-`scarletnx-gnuabi-run`, whose output is `scarletnx-gnuabi`; its library output is
-`scarletnx-gnuabi-runtime`. `SNX_BUILD_NX=OFF` builds GNU ABI without fetching or
+common and have no dependency on each other. The GNU ABI driver is the library
+`scarletnx-gnuabi` (its file `scarletnx-gnuabi-runtime`), command line included, which
+`scarletnx` runs as `scarletnx-gnuabi`. `SNX_BUILD_NX=OFF` builds GNU ABI without fetching or
 linking NX graphics/media packages. CTest checks include ownership and the actual
 transitive CMake dependency graph and target source ownership.
 
@@ -61,12 +61,17 @@ reads Linux syscall number `x8` and arguments `x0` through `x5`, and writes resu
 `x0`. CPU helpers and instruction emission are shared; Horizon handlers are never
 used as Linux syscalls.
 
-`scarletnx-switch` is the `scarletnx` NX implementation under the Switch's name,
-a Unix symlink or a Windows executable copy. On Linux and macOS `scarletnx-3ds` and
-`scarletnx-gnuabi` are symlinks to `scarletnx` too (`SNX_MULTICALL`): `src/multicall/main.c`
-runs the driver the name says, from the library of its own folder (`snx_ctr_program`,
-`snx_gnuabi_program`), so LLVM and SDL are in one program once. Elsewhere each is its own
-executable.
+`scarletnx` is every driver the build has: `src/multicall/main.c` is the only `main`, and runs
+the driver its name says from the library of the driver's own folder (`snx_switch_program`,
+`snx_ctr_program`, `snx_vita_program`, `scarletnx-gnuabi`, `snx_agb_program`), so LLVM and SDL
+are in one program once. On Linux and macOS `scarletnx-switch`, `scarletnx-3ds`,
+`scarletnx-vita`, `scarletnx-gnuabi` and `scarletnx-agb` are symlinks to it. Windows has no
+links: the driver's name goes first (`scarletnx.exe scarletnx-3ds ...`), and the launcher runs
+the drivers that way (`snx_menu_has_driver`). A game's copy runs its driver too: a GBA game's by
+its `.ini` (`system=gba`), a 3DS or Vita game's by its title ID, any other the Switch's (or, in a
+build without it, the one driver there is). The 3DS and Vita
+drivers read what a module was compiled for from its file before loading it, and compile first
+when it is stale, so a module is loaded once.
 The original game-name entry points and CLI remain available. GNU ABI has an
 independent CPU-only entry point; see [GNUABI.md](GNUABI.md) for implemented
 syscalls, ELF execution, filesystem scope, and differential testing.
@@ -74,13 +79,13 @@ syscalls, ELF execution, filesystem scope, and differential testing.
 ## Recompiler + module ABI
 
 NX tooling under `src/nx/runtime/driver/` and `src/nx/loader/`:
-a dump, read in place, or `work/<Game>/{exefs,romfs}` -> `games/<id>/`: `<id>[.exe]`, `<id>_code.{so,dll}`,
+a dump, read in place, or `work/<Game>/{exefs,romfs}` -> `recompiled/<id>/`: `<id>[.exe]`, `<id>_code.{so,dll}`,
 `<id>_data/`, and the dump's path as `source=` in the game's `<id>.ini` (`<id>.source`, a link to it, from older
 versions):
 
 An update or a DLC is recorded beside its game (`snx_addon_name`), its own `.ini` naming only its dump, and checked
 in the game's `addons=` (`common/utilities/game_ini.c`, which the driver and the launcher write). An update also gets a
-program, `games/<id>/<id>_<its title ID>`; a DLC runs its game's code. The runtime (`main.c`'s `addon_init`) runs an
+program, `recompiled/<id>/<id>_<its title ID>`; a DLC runs its game's code. The runtime (`main.c`'s `addon_init`) runs an
 update's program with the game's `.ini` and data folder, and `fs.c` lays the checked DLCs' data folders and then the
 update's over that folder (`fs_tree_overlay`, which takes only their ExeFS, RomFS, control data and `system/`). It
 reads an update's dump with the game's in one `SnxDump` (its Patch RomFS reads the game's NCA), and each checked DLC's
@@ -97,24 +102,30 @@ the game's image read from that image.
 - `driver.c`: CLI dispatch only; `extract.c` and `recompile.c` own their workflows.
 - `container.c`: a dump opened with hactool, its keys loaded and its NCAs picked, shared by the extraction, the
   recompiler (a dump given to `-r`, its ExeFS read through `SnxExefsReader`) and the runtime's `fs.c`. Without
-  Extract game container, `fs.c` maps the dump `source=` names (else the one `<id>.source` links to) and serves `exefs/*` and the RomFS image from
+  Extract dump, `fs.c` maps the dump `source=` names (else the one `<id>.source` links to) and serves `exefs/*` and the RomFS image from
   it through hactool's storage chains (`snx_hac.h`'s `SnxHacFs`), the sections decrypted, an update's patch applied
   and compressed blocks expanded as they are read. Nothing is cached.
 - `src/nx/loader/loader.c`: NSO/NRO, LZ4, SHA-256, NPDM, MOD0, symbols/relocs/FDEs.
-- `src/common/cpu/aarch64/a64.c` + `a64_templates.inc`: shared instruction semantics for the backends, gnuabi's C path and the tests' reference interpreter.
+- `src/common/cpu/aarch64/a64_decoder.c`: the A64 decoder `tools/a64dec` generates from QEMU's `a64.decode` and
+  ScarletNX's `a64.profile` (`src/common/cpu/aarch64/decode/`): each op's flow and the feature it needs, so a target's
+  feature set (the Switch's Cortex-A57 by default) decides what is UNDEF.
 - `src/common/cpu/recompiler/codegen.c`: function/CFG discovery over platform-neutral image views.
   `src/nx/loader/codegen_view.c` adapts NX images; `module.c` holds what the backends share (the dispatch entry
   table, chunk labels, progress lines); chunks batch whole functions up to `SNX_CHUNK_INSTRUCTIONS`, 90000 (20000 on Android).
 - `toolchain.c`: the runtime build for deployment.
 - The code generator, LLVM (`src/common/cpu/recompiler/llvm/`, a required dependency), builds LLVM IR with the
-  LLVM-C API: `ir_a64.c`, `ir_simd.c` and `ir_fp.c` emit each
-  `a64_templates.inc` case as the IR of the C it holds, `ir_codegen.c` the functions of `codegen.c`, and
+  LLVM-C API: `ir_int.c`, `ir_ldst.c`, `ir_fpu.c` and `ir_vec*.c`, ported from QEMU's `translate-a64.c`, emit each
+  op of the generated decoder, `ir_codegen.c` the functions of `codegen.c`, and
   `src/nx/loader/module_llvm.c` the chunks and `SnxModule` of `module.c`. It links the objects itself (`link_elf.c`,
   `link_coff.c`, `link_macho.c`) with `rtlib.c`, the helpers compiled when the recompiler is built, into a module
   with no imports, for the host it runs on: x86-64 (ELF or COFF), AArch64 (ELF, or on macOS and iOS a Mach-O dylib
-  with an ad hoc signature, either with a veneer for a branch past 128 MiB) or PowerPC64 (ELF, ELFv1 or ELFv2, with a stub for a branch past 32 MiB: [PowerPC64](./PPC64.md)). `tests/llvm_differential.c` runs its step functions against the templates' C on random
-  states (every pattern, failing if any instruction has no emitter: the backend refuses such a module), `tests/llvm_module.c`
-  a whole program, `tests/llvm_bench.c` times it on assembly kernels.
+  with an ad hoc signature, either with a veneer for a branch past 128 MiB) or PowerPC64 (ELF, ELFv1 or ELFv2, with a stub for a branch past 32 MiB: [PowerPC64](./PPC64.md)). `tests/llvm_qemu_differential.c` runs its step functions against
+  `qemu-aarch64 -cpu max` (`tests/qemu_ref/`) on random states, for words of every row of the generated decoder, with
+  the groups known to differ in `tests/llvm_qemu_expected.txt` (a new group, or a listed one that no longer differs,
+  fails it; `--sweep` runs more of each), loaded as a module, with the JIT's loader and in the emitters' portable
+  forms. `tests/a64_ported.c` runs rEden's cases through the steps against their expected values and QEMU,
+  `tests/llvm_module.c` a whole program against the end state QEMU gives it, `tests/llvm_bench.c` times it on
+  assembly kernels.
 - The generated code polls `CPU.poll` on backward branches inside a function and at the `D_` dispatch, as `codegen.c`'s C
   does, so a loop without SVCs gives its core to a waiting thread of higher priority.
 - The LLVM backend's speed: guest memory and the CPU structure are separate alias scopes (registers stay in host
@@ -194,6 +205,25 @@ function's arguments, or a field added into a struct's tail padding: for those t
 | 11 | the reworked LLVM backend's modules |
 | 12 | `RtAPI.cas128`, and `snx_cas128` takes the CPU |
 | 13 | the AOT module's `snx_variants()` table, read as optional |
+| 14 | `RtAPI.code_changed` for IC IVAU, and `SnxModule`'s function table with the byte each AOT function checks first |
+
+#### Code the game patches
+
+Mods for Atmosphère (Skyline, exlaunch) hook a game by writing branches into its code through a writable view of it
+(`svcMapProcessMemory`), then make the new instructions visible the way Arm requires, with `IC IVAU` on each line
+they wrote. The AOT code was compiled from the bytes before, so since SNX_ABI 14 `IC IVAU` reaches the runtime
+(`snx_ic_ivau`, `RtAPI.code_changed`), and `jit_code_changed` (`runtime/guest_jit.c`) finds the AOT functions compiled
+from the line by the descriptor's `fn_lo` and `fn_len`. Each one loses its dispatch slots and its entries in
+`entry_fn` (which the JIT calls AOT functions through), then its byte in `SnxModule.stale` is set. Every AOT function
+reads its byte first (`stale_check` in `ir_codegen.c`) and, once it is set, runs its entry through dispatch, where the
+lookup finds no code and the JIT compiles the instructions as they are now, the patch included. A direct call from
+other AOT code arrives at the same check, so a hook in the middle of a function takes effect for every caller. A call
+returning into an AOT function reads the byte too: a loader may patch a function from inside a call it makes, and once
+the byte is set the function leaves for the thread's dispatch loop at the return address, which runs the new code from
+there. The
+JIT's code goes as any other code change drops it (`jit_code_invalidate`): `snx_jit_invalidate` drops every unit
+whose span of guest code the change touches, all its leaders, since a unit's functions call each other directly. That
+covers hooks in code the game maps itself (NROs), which only the JIT runs.
 
 ## Runtime ownership
 
@@ -210,7 +240,7 @@ function's arguments, or a field added into a struct's tail padding: for those t
 
 Guest thread = host thread + `CPU` + TLS. `hle/kernel/thread.c`: one owner/core, four cores; release on kernel block,
 sleep/yield, IPC, WFE. Waiters: priority then FIFO; a waiter of higher priority takes the core at the holder's next SVC
-or backward branch, any taken branch in the interpreter (`CPU.poll`, `RtAPI.poll`). A ready thread that would wait
+or backward branch (`CPU.poll`, `RtAPI.poll`). A ready thread that would wait
 behind its core's holder runs on an idle core of its mask, and an idle core takes such a waiter (only
 `svcSleepThread(0)` keeps a yielding thread on its core). A mutex owner runs at its best waiter's priority
 (`hle/kernel/sync.c`).
@@ -244,7 +274,9 @@ thread, into `<id>.vkshipped` (`prepare_shaders`: before the game's first thread
 or in the background as it runs). `gpu/shipped_pass.c` walks the RomFS and the executables' segments, and
 `gpu/shader/shipped.c` finds the programs by NVN's code wrapper (or a bare NVN shader file's layout) in their bytes,
 and in the Yaz0 SARCs whose names list a shader container. `gpu/vk/pipeline.c` translates each into the file, which a
-draw's lookup reads from when it has no shader of its own.
+draw's lookup reads from when it has no shader of its own. The files the walk found nothing in are kept in
+`<id>.vkscan` by their name, place and size, under the hash of the walk's sources (`cmake/ship_walk.cmake`) rather than
+the build, so a new build or driver reads only the files that hold programs again.
 
 ### Renderer coherence + lifetime
 

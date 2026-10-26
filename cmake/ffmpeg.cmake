@@ -1,35 +1,36 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
 # Copyright 2026 the ScarletNX contributors
 #
-# FFmpeg's libavcodec, libswresample and libavutil as static libraries (targets FFmpeg::avcodec, FFmpeg::swresample and
-# FFmpeg::avutil), built from the release source in cmake/dependencies.cmake with FFmpeg's own configure and make, which
-# it has instead of a CMake build. NVDEC's VP9 jobs need a change to its VP9 decoder (cmake/ffmpeg-vp9-nvdec.patch), so
-# it builds from a patched copy of the release in the build tree. Only the decoders NVDEC handles are in (H.264, VP8,
-# VP9), and Opus for hwopus (FFmpeg's Opus decoder resamples its SILK layer with libswresample, which is why that
-# library is in): no programs, formats, filters, devices, network or autodetected system libraries, so the result needs
+# FFmpeg's libavcodec, libavformat, libswresample and libavutil as static libraries (targets FFmpeg::avcodec,
+# FFmpeg::avformat, FFmpeg::swresample and FFmpeg::avutil), built from the release source in cmake/dependencies.cmake
+# with FFmpeg's own configure and make, which it has instead of a CMake build. NVDEC's VP9 jobs need a change to its VP9
+# decoder (cmake/ffmpeg-vp9-nvdec.patch), so it builds from a patched copy of the release in the build tree. Only the
+# decoders NVDEC handles are in (H.264, VP8, VP9), Opus for hwopus (FFmpeg's Opus decoder resamples its SILK layer with
+# libswresample, which is why that library is in), and for the Vita AAC, ATRAC9, the MP4 demuxer and H.264's Annex B
+# filter: no programs, other formats, filters, devices, network or autodetected system libraries, so the result needs
 # nothing but libc and builds the same everywhere. All of it is LGPL (no --enable-gpl). It needs a POSIX shell and make
 # (gmake on the BSDs), and NASM for the x86-64 assembly. macOS and iOS build it with Xcode's Clang and SDK
-# (cmake/apple.cmake), iOS as a cross build.
-# This file is included into the top-level scope: its variables carry the snx_ffmpeg_ prefix.
-set(snx_ffmpeg_src "${CMAKE_BINARY_DIR}/_deps/ffmpeg-patched")
-set(snx_ffmpeg_prefix "${CMAKE_BINARY_DIR}/ffmpeg")
+# (cmake/apple.cmake), iOS as a cross build. This file is included into the top-level scope: its variables carry the
+# snx_ffmpeg_ prefix.
+set(snx_ffmpeg_src "${PROJECT_BINARY_DIR}/_deps/ffmpeg-patched")
+set(snx_ffmpeg_prefix "${PROJECT_BINARY_DIR}/ffmpeg")
 # FFmpeg's configure stops on a source path with a space in it, which would only show at build time
 if(snx_ffmpeg_src MATCHES "[ \t]")
     message(FATAL_ERROR "FFmpeg can't be built from a path with spaces in it (${snx_ffmpeg_src}). Use a build folder "
                         "whose path has none. FFmpeg is required by the NX runtime.")
 endif()
-set(snx_ffmpeg_patch "${CMAKE_SOURCE_DIR}/cmake/ffmpeg-vp9-nvdec.patch")
+set(snx_ffmpeg_patch "${PROJECT_SOURCE_DIR}/cmake/ffmpeg-vp9-nvdec.patch")
 file(SHA256 "${snx_ffmpeg_patch}" snx_ffmpeg_patch_sha256)
 set(snx_ffmpeg_patched libavcodec/vp9.c 459e8ca79e45680c98ba70ac574172e2389b177c6d19e5466fa63c3f0ff652e1)
 if(CMAKE_C_BYTE_ORDER STREQUAL "BIG_ENDIAN")
     # the H.264 decoder's byte swaps, which only a big-endian host's build calls
-    set(snx_ffmpeg_be_patch "${CMAKE_SOURCE_DIR}/cmake/ffmpeg-h264-bigendian.patch")
+    set(snx_ffmpeg_be_patch "${PROJECT_SOURCE_DIR}/cmake/ffmpeg-h264-bigendian.patch")
     file(SHA256 "${snx_ffmpeg_be_patch}" snx_ffmpeg_be_patch_sha256)
     list(APPEND snx_ffmpeg_patch "${snx_ffmpeg_be_patch}")
     string(APPEND snx_ffmpeg_patch_sha256 " ${snx_ffmpeg_be_patch_sha256}")
     list(APPEND snx_ffmpeg_patched configure f718d0d3a53e6f905299f21938d2f22332a9046f43c6f94dfc867efdfcc0ecef)
 endif()
-include("${CMAKE_SOURCE_DIR}/cmake/patched_copy.cmake")
+include("${PROJECT_SOURCE_DIR}/cmake/patched_copy.cmake")
 snx_patched_copy(SOURCE "${FFmpeg_SOURCE_DIR}" DEST "${snx_ffmpeg_src}" PATCHES ${snx_ffmpeg_patch}
                  FILES ${snx_ffmpeg_patched})
 # sh before bash: on Windows a bash.exe in System32 is WSL's launcher, and w64devkit's sh is the one to use
@@ -57,11 +58,13 @@ set(snx_ffmpeg_args
     --disable-doc
     --disable-network
     --disable-avdevice
-    --disable-avformat
     --disable-avfilter
     --disable-swscale
     --disable-iconv
-    --enable-decoder=h264,vp8,vp9,opus
+    --enable-decoder=h264,vp8,vp9,opus,aac,atrac9
+    # the Vita's SceMp4 (src/vita/hle/mp4.c): MP4 files demuxed from memory (no protocol), their H.264 made Annex B
+    --enable-demuxer=mov
+    --enable-bsf=h264_mp4toannexb
     --cc=${CMAKE_C_COMPILER}
     --cxx=${CMAKE_CXX_COMPILER}
     --ar=${CMAKE_AR}
@@ -164,7 +167,7 @@ else()
         SOURCE_DIR "${snx_ffmpeg_src}"
         # configure leaves a src link to its source there: a tree that built the release's own folder before would
         # keep compiling that one
-        BINARY_DIR "${CMAKE_BINARY_DIR}/ffmpeg-build-patched"
+        BINARY_DIR "${PROJECT_BINARY_DIR}/ffmpeg-build-patched"
         INSTALL_DIR "${snx_ffmpeg_prefix}"
         CONFIGURE_COMMAND "${SNX_FFMPEG_SH}" "${snx_ffmpeg_src}/configure" --prefix=${snx_ffmpeg_prefix}
                           ${snx_ffmpeg_args}
@@ -175,6 +178,7 @@ else()
         COMMAND "${SNX_FFMPEG_MAKE}" install
         INSTALL_COMMAND ""
         BUILD_BYPRODUCTS "${snx_ffmpeg_prefix}/lib/libavcodec.a" "${snx_ffmpeg_prefix}/lib/libswresample.a"
+                         "${snx_ffmpeg_prefix}/lib/libavformat.a"
                          "${snx_ffmpeg_prefix}/lib/libavutil.a"
         # configure and make print a lot: keep it in log files, shown when a step fails
         LOG_CONFIGURE ON
@@ -193,7 +197,7 @@ else()
     ExternalProject_Add_Step(ffmpeg_build private
         COMMAND "${CMAKE_COMMAND}" -E make_directory "${snx_ffmpeg_prefix}/private"
         COMMAND "${CMAKE_COMMAND}" -E copy_if_different config.h "${snx_ffmpeg_prefix}/private/config.h"
-        WORKING_DIRECTORY "${CMAKE_BINARY_DIR}/ffmpeg-build-patched"
+        WORKING_DIRECTORY "${PROJECT_BINARY_DIR}/ffmpeg-build-patched"
         BYPRODUCTS "${snx_ffmpeg_prefix}/private/config.h"
         DEPENDEES build
         DEPENDERS install)
@@ -233,4 +237,10 @@ set_target_properties(FFmpeg::avcodec PROPERTIES IMPORTED_LOCATION "${snx_ffmpeg
 target_link_libraries(FFmpeg::avcodec INTERFACE FFmpeg::swresample FFmpeg::avutil)
 if(TARGET ffmpeg_build)
     add_dependencies(FFmpeg::avcodec ffmpeg_build)
+endif()
+add_library(FFmpeg::avformat STATIC IMPORTED GLOBAL)
+set_target_properties(FFmpeg::avformat PROPERTIES IMPORTED_LOCATION "${snx_ffmpeg_prefix}/lib/libavformat.a" SYSTEM OFF)
+target_link_libraries(FFmpeg::avformat INTERFACE FFmpeg::avcodec FFmpeg::avutil)
+if(TARGET ffmpeg_build)
+    add_dependencies(FFmpeg::avformat ffmpeg_build)
 endif()

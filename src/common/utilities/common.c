@@ -12,6 +12,7 @@
 #define _DARWIN_C_SOURCE
 #endif
 #include "common/utilities/common.h"
+#include "common/utilities/ini_lines.h"
 #include <ctype.h>
 #include <errno.h>
 #include <limits.h>
@@ -26,10 +27,12 @@
 #include <direct.h>
 #include <io.h>
 #include <wchar.h>
+#include <psapi.h>
 #else
 #include <dirent.h>
 #include <fcntl.h>
 #include <poll.h>
+#include <sys/file.h> /* flock */
 #include <sys/stat.h>
 #include <sys/mman.h>
 #include <sys/statvfs.h>
@@ -41,10 +44,16 @@
 #ifdef __FreeBSD__
 #include <sys/types.h>
 #include <sys/sysctl.h>
+#include <sys/user.h> /* struct kinfo_proc */
 #endif
 #ifdef __APPLE__
+#include <TargetConditionals.h>
 #include <libkern/OSCacheControl.h> /* sys_icache_invalidate */
 #include <mach-o/dyld.h>
+#include <mach/mach.h>
+#if TARGET_OS_IPHONE
+#include <os/proc.h>
+#endif
 #endif
 
 void* snx_alloc(size_t size) {
@@ -83,10 +92,49 @@ char* snx_format(const char* fmt, ...) {
     va_end(ap);
     return p;
 }
-/* snx_error's sink, snx_error_sink's: NULL for stderr */
+void snx_path_native(char* path) {
+#ifdef _WIN32
+    for (; path && *path; ++path)
+        if (*path == '/') *path = '\\';
+#else
+    (void)path;
+#endif
+}
+int snx_path_format(char* out, size_t size, const char* fmt, ...) {
+    va_list ap;
+    int n;
+    va_start(ap, fmt);
+    n = vsnprintf(out, size, fmt, ap);
+    va_end(ap);
+    if (n < 0 || (size_t)n >= size) {
+        if (n < 0)
+            snx_error("cannot make a path of %s (%s)", fmt, strerror(errno));
+        else
+            snx_error("the path %.80s... is %d bytes, over the %zu it has room for", size ? out : fmt, n,
+                      size ? size - 1 : 0);
+        if (size) *out = 0;
+        return -1;
+    }
+    snx_path_native(out);
+    return 0;
+}
+/* snx_error's sink, snx_error_sink's: NULL for stderr; the kinds whose folder app.ini names wrongly, and the options
+   given by an older name, said once */
 static struct {
     void (*error_sink)(const char* line);
+    unsigned said_kinds;
+    const char* renamed[16];
+    size_t renamed_count;
+    volatile int abort_requested; /* snx_abort_request's, from another thread than the one that asks */
 } g_common;
+void snx_option_renamed(const char* old, const char* now) {
+    size_t i;
+    for (i = 0; i < g_common.renamed_count; ++i)
+        if (!strcmp(g_common.renamed[i], old)) return;
+    if (g_common.renamed_count < sizeof g_common.renamed / sizeof *g_common.renamed)
+        g_common.renamed[g_common.renamed_count++] = old;
+    snx_error("%s is %s now: this run takes it as %s (docs/DEPRECATIONS.md)", old, now, now);
+}
 
 void snx_error_sink(void (*sink)(const char* line)) {
     g_common.error_sink = sink;
@@ -132,6 +180,7 @@ char* snx_path_join(const char* a, const char* b) {
     memcpy(p, a, n);
     if (n && !separator(a[n - 1])) p[n++] = '/';
     memcpy(p + n, b, m + 1);
+    snx_path_native(p);
     return p;
 }
 char* snx_dirname(const char* path) {
@@ -183,6 +232,96 @@ FILE* snx_fopen(const char* path, const char* mode) {
     return f;
 #else
     return fopen(path, mode);
+#endif
+}
+int snx_log_lines(const char* path, const char* text) {
+    char stamp[64];
+    time_t now = time(NULL);
+    struct tm local = {0};
+    size_t lines = 1, n = 0, w;
+    const char *c, *line;
+    char* out;
+    int failed;
+#ifdef _WIN32
+    unsigned long pid = (unsigned long)GetCurrentProcessId();
+    FILE* f;
+    localtime_s(&local, &now);
+#else
+    unsigned long pid = (unsigned long)getpid();
+    int fd;
+    localtime_r(&now, &local);
+#endif
+    w = strftime(stamp, sizeof stamp, "%Y-%m-%d %H:%M:%S", &local);
+    snprintf(stamp + w, sizeof stamp - w, " [%lu] ", pid);
+    w = strlen(stamp);
+    for (c = text; *c; ++c) lines += *c == '\n';
+    out = (char*)snx_alloc(strlen(text) + lines * w + 2);
+    for (line = text; *line;) { /* each line its stamp, its newline */
+        const char* end = strchr(line, '\n');
+        size_t len = end ? (size_t)(end - line) : strlen(line), kept = len;
+        if (kept && line[kept - 1] == '\r') --kept; /* a Windows program's \r\n: the line ends as the others do */
+        memcpy(out + n, stamp, w);
+        memcpy(out + n + w, line, kept);
+        n += w + kept;
+        out[n++] = '\n';
+        line += len + (end != NULL);
+    }
+#ifdef _WIN32
+    f = snx_fopen(path, "ab");
+    failed = !f || fwrite(out, 1, n, f) != n;
+    if (f && fclose(f)) failed = 1;
+#else
+    fd = open(path, O_WRONLY | O_CREAT | O_APPEND | O_CLOEXEC, 0644);
+    failed = fd < 0 || write(fd, out, n) != (ssize_t)n;
+    if (fd >= 0) {
+        int saved = errno;
+        close(fd);
+        errno = saved;
+    }
+#endif
+    free(out);
+    return failed ? -1 : 0;
+}
+int snx_lock_file(const char* path, intptr_t* lock) {
+#ifdef _WIN32
+    wchar_t* p = wide(path);
+    OVERLAPPED past = {0}; /* not far: windef.h defines it */
+    HANDLE h = p ? CreateFileW(p, GENERIC_READ | GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                               NULL, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL)
+                 : INVALID_HANDLE_VALUE;
+    free(p);
+    if (h == INVALID_HANDLE_VALUE) {
+        errno = EACCES;
+        return -1;
+    }
+    past.OffsetHigh = 0x7fffffffu; /* past any end, so the bytes are never what is locked */
+    if (!LockFileEx(h, LOCKFILE_EXCLUSIVE_LOCK | LOCKFILE_FAIL_IMMEDIATELY, 0, 1, 0, &past)) {
+        DWORD error = GetLastError();
+        CloseHandle(h);
+        if (error == ERROR_LOCK_VIOLATION || error == ERROR_IO_PENDING) return 1;
+        errno = EACCES;
+        return -1;
+    }
+    *lock = (intptr_t)h;
+    return 0;
+#else
+    int fd = open(path, O_RDWR | O_CREAT | O_CLOEXEC, 0644);
+    if (fd < 0) return -1;
+    if (flock(fd, LOCK_EX | LOCK_NB)) {
+        int error = errno;
+        close(fd);
+        errno = error;
+        return error == EWOULDBLOCK ? 1 : -1;
+    }
+    *lock = fd;
+    return 0;
+#endif
+}
+void snx_unlock_file(intptr_t lock) {
+#ifdef _WIN32
+    CloseHandle((HANDLE)lock); /* its lock with it */
+#else
+    close((int)lock);
 #endif
 }
 int snx_path_is_full(const char* path) {
@@ -318,24 +457,6 @@ char* snx_absolute(const char* path) {
     free(resolved);
     return result;
 #endif
-}
-char* snx_find_compiler(const char* built, const char* beside, char* error, size_t error_size) {
-#ifdef _WIN32
-    static const char clang[] = "clang.exe";
-#else
-    static const char clang[] = "clang";
-#endif
-    char *found = built && *built ? snx_find_tool(built) : NULL, *local;
-    if (found) return found;
-    local = beside ? snx_path_join(beside, clang) : NULL;
-    found = local ? snx_find_tool(local) : NULL;
-    free(local);
-    if (!found) found = snx_find_tool("clang");
-    if (!found)
-        snprintf(error, error_size, "%s is not on this machine, %s%s holds no %s, and no folder of PATH has one",
-                 built && *built ? built : "the build's compiler", beside ? "" : "the program's folder",
-                 beside ? beside : "", clang);
-    return found;
 }
 char* snx_executable(const char* argv0) {
 #ifdef _WIN32
@@ -544,6 +665,32 @@ unsigned char* snx_read_file(const char* path, size_t* size) {
     p[n] = 0;
     *size = n;
     return p;
+}
+int snx_file_has_record(const char* path, const void* magic, size_t magic_size, size_t size,
+                        int (*accept)(const unsigned char* record, const void* context), const void* context) {
+    /* read a MiB at a time, the last size - 1 bytes kept for a record that runs into the next */
+    size_t cap = ((size_t)1 << 20) + size, have = 0, got;
+    FILE* f = magic_size && magic_size <= size ? snx_fopen(path, "rb") : NULL;
+    unsigned char* p;
+    int found = 0;
+    if (!f) return 0;
+    p = (unsigned char*)snx_alloc(cap);
+    do {
+        got = fread(p + have, 1, cap - have, f);
+        have += got;
+        if (have >= size) {
+            unsigned char *at = p, *end = p + have - size + 1;
+            while (!found && (at = (unsigned char*)memchr(at, *(const unsigned char*)magic, (size_t)(end - at)))) {
+                found = !memcmp(at, magic, magic_size) && accept(at, context);
+                ++at;
+            }
+            memmove(p, p + have - (size - 1), size - 1);
+            have = size - 1;
+        }
+    } while (!found && got);
+    fclose(f);
+    free(p);
+    return found;
 }
 int snx_write_file(const char* path, const void* data, size_t size) {
     FILE* f = snx_fopen(path, "wb");
@@ -935,12 +1082,53 @@ int snx_app_dir(const char* folder) {
     free(full);
     return app;
 }
-char* snx_app_kind_dir(const char* app, int kind) {
+char* snx_app_kind_default(const char* app, int kind) {
     char* user = snx_user_data_dir();
     int own = user && same_folder(app, user);
     free(user);
     if (own) return snx_user_dir(kind);
     return kind == SNX_USER_DATA ? snx_strdup(app) : snx_path_join(app, kind_names[kind]);
+}
+/* the folder of kind the app.ini in config names in [folders] (Settings > App > Folders' Logs and Caches): 1 with *dir
+   a full path, -1 with *dir a value that is not one, 0 for none (no file, no key, an empty one) */
+static int picked_kind(const char* config, int kind, char** dir) {
+    size_t size;
+    char *path = snx_path_join(config, "app.ini"), *text = path ? (char*)snx_read_file(path, &size) : NULL, *key,
+         *value;
+    const char* wanted = kind == SNX_USER_STATE ? "state" : "cache";
+    int found = 0;
+    SnxIni ini;
+    *dir = NULL;
+    if (text) snx_ini_start(&ini, text);
+    while (text && snx_ini_next(&ini, &key, &value))
+        if (!strcmp(ini.section, "folders") && !strcmp(key, wanted)) { /* the last one, as the launcher reads it */
+            free(*dir);
+            *dir = *value ? snx_strdup(value) : NULL;
+            found = !*value ? 0 : snx_path_is_full(value) ? 1 : -1;
+        }
+    free(text);
+    free(path);
+    return found;
+}
+char* snx_app_kind_dir(const char* app, int kind) {
+    char *dir = snx_app_kind_default(app, kind), *config, *picked;
+    int found;
+    if (kind != SNX_USER_STATE && kind != SNX_USER_CACHE) return dir;
+    config = snx_app_kind_default(app, SNX_USER_CONFIG);
+    found = config ? picked_kind(config, kind, &picked) : 0;
+    if (found > 0) {
+        free(dir);
+        dir = picked;
+        picked = NULL;
+    } else if (found < 0 && !(g_common.said_kinds & 1u << kind)) {
+        g_common.said_kinds |= 1u << kind;
+        snx_error("%s/app.ini: [folders] %s = %s is not a full path: the %s go in %s", config,
+                  kind == SNX_USER_STATE ? "state" : "cache", picked, kind == SNX_USER_STATE ? "logs" : "caches",
+                  dir ? dir : "(none)");
+    }
+    if (found) free(picked);
+    free(config);
+    return dir;
 }
 /* the data folder (snx_app_dir) full, an absolute path, is in, from full itself up; NULL for none */
 static char* app_of(const char* full) {
@@ -972,13 +1160,17 @@ char* snx_user_path(const char* path, int kind) {
     free(root);
     return moved ? moved : snx_strdup(path);
 }
-char* snx_menu_dir(const char* folder, int kind) {
-    char *full = folder ? snx_absolute(folder) : NULL, *app = full ? app_of(full) : NULL;
-    char* dir = app ? snx_app_kind_dir(app, kind) : snx_user_dir(kind);
+/* snx_menu_dir, with the folder Folders picked (snx_app_kind_dir) or without it (snx_app_kind_default) */
+static char* menu_dir(const char* folder, int kind, char* (*of)(const char* app, int kind)) {
+    char *full = folder ? snx_absolute(folder) : NULL, *app = full ? app_of(full) : NULL, *dir;
+    if (!app) app = snx_user_data_dir(); /* any other folder's: the user's */
+    dir = app ? of(app, kind) : snx_user_dir(kind);
     free(app);
     free(full);
     return dir;
 }
+char* snx_menu_dir(const char* folder, int kind) { return menu_dir(folder, kind, snx_app_kind_dir); }
+char* snx_menu_kind_default(const char* folder, int kind) { return menu_dir(folder, kind, snx_app_kind_default); }
 int snx_left_behind(const char* old, const char* now) { return strcmp(old, now) && snx_path_exists(old); }
 int snx_launcher_name(const char* name) {
     static const char own[] = "scarletnx";
@@ -994,7 +1186,8 @@ const SnxGameFile snx_game_files[SNX_GAME_FILES] = {{".log", SNX_USER_STATE},
 char* snx_work_dir(const char* data_dir) {
     char *old = snx_path_join(data_dir, "work"), *work = snx_user_path(old, SNX_USER_CACHE);
     if (snx_left_behind(old, work))
-        printf("%s was left by an older version: this one keeps extractions in %s\n", old, work);
+        printf("scarletnx: %s was left by an older version: this one keeps it in %s (docs/DEPRECATIONS.md)\n", old,
+               work);
     free(old);
     return work;
 }
@@ -1017,8 +1210,8 @@ void snx_recompiled_left(const char* data_dir) {
     char *old = snx_path_join(data_dir, "games"), *now = snx_recompiled_dir(data_dir);
     if (old && now && snx_left_behind(old, now))
         fprintf(stderr,
-                "scarletnx: %s was left by an older version: this one makes games in %s, and still runs the ones "
-                "in it until they are moved there (docs/DEPRECATIONS.md)\n",
+                "scarletnx: %s was left by an older version: new games go to %s, and the ones in it still run until "
+                "they are moved there (docs/DEPRECATIONS.md)\n",
                 old, now);
     free(old);
     free(now);
@@ -1211,6 +1404,8 @@ unsigned snx_cpu_count(void) {
 }
 /* Code arenas (code_loader.c) reserve their address space once and give each page access only when it is used: the
    loader writes into read-write pages and makes them executable before anything jumps there */
+void snx_abort_request(int on) { g_common.abort_requested = on; }
+int snx_abort_requested(void) { return g_common.abort_requested; }
 size_t snx_vm_page_size(void) {
 #ifdef _WIN32
     SYSTEM_INFO info;
@@ -1219,6 +1414,83 @@ size_t snx_vm_page_size(void) {
 #else
     long size = sysconf(_SC_PAGESIZE);
     return size > 0 ? (size_t)size : 4096;
+#endif
+}
+SnxU64 snx_footprint(void) {
+#if defined(__APPLE__)
+    task_vm_info_data_t info;
+    mach_msg_type_number_t count = TASK_VM_INFO_COUNT;
+    if (task_info(mach_task_self(), TASK_VM_INFO, (task_info_t)&info, &count) == KERN_SUCCESS)
+        return info.phys_footprint;
+    return 0;
+#elif defined(__linux__)
+    unsigned long long pages = 0, resident = 0;
+    FILE* f = fopen("/proc/self/statm", "r");
+    if (!f) return 0;
+    if (fscanf(f, "%llu %llu", &pages, &resident) != 2) resident = 0;
+    fclose(f);
+    return (SnxU64)resident * snx_vm_page_size();
+#elif defined(_WIN32)
+    PROCESS_MEMORY_COUNTERS info;
+    return GetProcessMemoryInfo(GetCurrentProcess(), &info, sizeof info) ? (SnxU64)info.WorkingSetSize : 0;
+#elif defined(__FreeBSD__)
+    struct kinfo_proc proc;
+    size_t size = sizeof proc;
+    int mib[4] = {CTL_KERN, KERN_PROC, KERN_PROC_PID, (int)getpid()};
+    if (sysctl(mib, 4, &proc, &size, NULL, 0) || size != sizeof proc) return 0;
+    return (SnxU64)proc.ki_rssize * snx_vm_page_size();
+#else
+    return 0;
+#endif
+}
+SnxU64 snx_process_cpu_ns(void) {
+#ifdef _WIN32
+    FILETIME created, exited, kernel, user;
+    if (!GetProcessTimes(GetCurrentProcess(), &created, &exited, &kernel, &user)) return 0;
+    /* 100 ns ticks */
+    return (((SnxU64)kernel.dwHighDateTime << 32 | kernel.dwLowDateTime) +
+            ((SnxU64)user.dwHighDateTime << 32 | user.dwLowDateTime)) *
+           100;
+#else
+    struct timespec t;
+    if (clock_gettime(CLOCK_PROCESS_CPUTIME_ID, &t)) return 0;
+    return (SnxU64)t.tv_sec * 1000000000u + (SnxU64)t.tv_nsec;
+#endif
+}
+int snx_memory_available(SnxU64* bytes) {
+#if defined(__APPLE__) && TARGET_OS_IPHONE
+    size_t left = os_proc_available_memory(); /* 0 in the simulator, which has no limit */
+    if (!left) return 0;
+    *bytes = left;
+    return 1;
+#elif defined(__APPLE__)
+    vm_statistics64_data_t vm;
+    mach_msg_type_number_t count = HOST_VM_INFO64_COUNT;
+    vm_size_t page = 0;
+    if (host_page_size(mach_host_self(), &page) != KERN_SUCCESS ||
+        host_statistics64(mach_host_self(), HOST_VM_INFO64, (host_info64_t)&vm, &count) != KERN_SUCCESS)
+        return 0;
+    *bytes = ((SnxU64)vm.free_count + vm.inactive_count + vm.purgeable_count) * page;
+    return 1;
+#elif defined(__linux__)
+    char line[128];
+    unsigned long long kib = 0;
+    int found = 0;
+    FILE* f = fopen("/proc/meminfo", "r");
+    if (!f) return 0;
+    while (!found && fgets(line, sizeof line, f)) found = sscanf(line, "MemAvailable: %llu kB", &kib) == 1;
+    fclose(f);
+    if (found) *bytes = (SnxU64)kib << 10;
+    return found;
+#elif defined(_WIN32)
+    MEMORYSTATUSEX status;
+    status.dwLength = sizeof status;
+    if (!GlobalMemoryStatusEx(&status)) return 0;
+    *bytes = status.ullAvailPhys;
+    return 1;
+#else
+    (void)bytes;
+    return 0;
 #endif
 }
 void* snx_vm_reserve(size_t size) {

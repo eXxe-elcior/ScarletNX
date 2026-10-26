@@ -5,6 +5,8 @@
    options (seconds, frames, shot, shot_every, press_len, script: platform/unattended.c). */
 #include "nx/runtime/main.h"
 #include "nx/runtime/options.h"
+#include "nx/runtime/pause.h"
+#include "nx/runtime/state.h"
 #include "nx/hle/hle.h" /* g_hle.hid: the players and the touch screen hid samples */
 #include "nx/hle/services/hid.h"
 #include "nx/hle/kernel/kernel.h"
@@ -16,9 +18,6 @@
 #include "nx/runtime/platform/overlay.h"
 #include "nx/runtime/platform/fatal_screen.h"
 #include "nx/runtime/platform/touch.h"
-#ifndef _WIN32
-#include <sys/stat.h>
-#endif
 #include "nx/runtime/platform/ui.h"
 #include "nx/runtime/platform/vpad.h"
 #include "nx/runtime/platform/gamepad.h"
@@ -167,14 +166,14 @@ static u64 g_touch_ids[SNX_HID_TOUCHES]; /* the finger in each slot of g_hle.hid
    the touch screen under (hid_take_input) */
 enum { TOUCH_DOWN, TOUCH_MOVE, TOUCH_UP };
 static void touch_set(int how, u64 id, const int picture[4], float px, float py) {
-    pm_lock(&g_hle.hid.input_lock);
+    pm_lock(&g_host.hid.input_lock);
     if (how == TOUCH_DOWN)
         touch_down(&g_hle.hid.touch, g_touch_ids, id, picture, px, py);
     else if (how == TOUCH_MOVE)
         touch_move(&g_hle.hid.touch, g_touch_ids, id, picture, px, py);
     else
         touch_up(&g_hle.hid.touch, g_touch_ids, id);
-    pm_unlock(&g_hle.hid.input_lock);
+    pm_unlock(&g_host.hid.input_lock);
 }
 
 /* the touch screen's setting changed (the .ini's setter, on the main thread): the fingers or the mouse it no longer
@@ -329,7 +328,7 @@ void video_init(const char* title, const char* addons) {
     SDL_SetHint(SDL_HINT_MOUSE_TOUCH_EVENTS, "0");
     SDL_SetHint(SDL_HINT_PEN_MOUSE_EVENTS, "0");
 #ifdef __APPLE__
-    { /* the apps carry their MoltenVK (scripts/apple-app.sh), in the bundle's Frameworks, which SDL does not search:
+    { /* the apps carry their MoltenVK (cmake/apple_package.cmake), in the bundle's Frameworks, which SDL does not search:
          macOS's beside Resources/ (SDL's base folder), iOS's in the bundle itself. Elsewhere the system's loader */
         const char* base = SDL_GetBasePath();
         const char* const own[] = {"../Frameworks/libMoltenVK.dylib", "Frameworks/MoltenVK.framework/MoltenVK"};
@@ -393,19 +392,35 @@ int backend_vk_surface(VkInstance instance, VkSurfaceKHR* surface) {
     LOG("video: no Vulkan surface: %s\n", SDL_GetError());
     return 0;
 }
-static const char* HELP = "Controller: A, B, X and Y where the console's are (gamepad_swap_ab=1 swaps A and B). Home: "
-                          "the game's menu.\n\n"
-                          "Keyboard (keys by position, as on a US layout):\n"
-                          "  Arrows = D-Pad     W A S D = left stick    I J K L = right stick\n"
-                          "  X / Space = A    Z = B    C = X    V = Y\n"
-                          "  Q = L   E = R   1 = ZL   3 = ZR   Enter = +   Backspace = -\n\n"
-                          "F1 = this help   F2 = the game's menu   F3 = screenshot   F4 = FPS limit on / off\n"
-                          "F5 = thread dump   F6 = showcase on / off   "
+/* F1's text. It follows keymap (the game's buttons), hotkey and menu_event (the runtime's keys): a binding changed there
+   changes here */
+static const char* HELP =
+    "Controller: A, B, X and Y sit where the console has them (gamepad_swap_ab=1 swaps A and B). "
+    "Home opens the game's menu.\n\n"
+    "Keyboard, by key position on a US layout:\n"
+    "  Buttons      A: X or Space    B: Z    X: C    Y: V\n"
+    "  Shoulders    L: Q    R: E    ZL: 1    ZR: 3\n"
+    "  Plus, minus  +: Enter    -: Backspace\n"
+    "  D-Pad        the arrow keys\n"
+    "  Left stick   W, A, S and D\n"
+    "  Right stick  I, J, K and L\n\n"
+    "Runtime keys:\n"
+    "  F1  this help\n"
+    "  F2  open or close the game's menu (arrows move, Enter or Space picks, Esc or Backspace goes back)\n"
+    "  F3  take a screenshot\n"
+    "  F4  turn the FPS limit off or back on\n"
+    "  F5  write every thread's state to the log\n"
+    "  F6  turn showcase mode on or off\n"
+    "  F7  save the game's state to the selected slot\n"
+    "  F8  load the selected slot's state\n"
+    "  F9  select the next save state slot\n"
 #if defined(SNX_TRACY)
-                          "F7 = 60 s Tracy capture   "
+    "  F10 record a 60 second Tracy capture\n"
 #endif
-                          "F11 / Alt+Enter = fullscreen\n"
-                          "Esc = quit";
+    "  Pause  pause the whole game, and resume it\n"
+    "  F11 or Alt+Enter  switch fullscreen\n"
+    "  F12  turn the stats on or off\n"
+    "  Esc  quit the game";
 
 static PadKind gamepad_kind(int type) {
     switch (type) {
@@ -503,7 +518,7 @@ static int android_share(const char* path) {
     return ok;
 }
 #endif
-/* Share log, as the launcher's: scarletnx.log beside the game's log, sent to the app the player picks on Android; its
+/* Share Log, as the launcher's: scarletnx.log beside the game's log, sent to the app the player picks on Android; its
    path in saved once written (else left as it was), what it did in said */
 static void fatal_share(const char* msg, const char* game_log, char* saved, size_t saved_size, char* said,
                         size_t size) {
@@ -519,7 +534,7 @@ static void fatal_share(const char* msg, const char* game_log, char* saved, size
     if (ok) snprintf(saved, saved_size, "%s", made);
     free(folder);
 }
-/* Copy path: the log Share log saved, else the game's own, to paste where it is asked for */
+/* Copy path: the log Share Log saved, else the game's own, to paste where it is asked for */
 static void fatal_copy(const char* path, char* said, size_t size) {
     if (SDL_SetClipboardText(path))
         snprintf(said, size, "Path copied: %s", path);
@@ -537,7 +552,7 @@ static int fatal_at(const SnxOverlayError* panel, float x, float y) {
 }
 static int fatal_screen(const char* msg) {
 #ifdef __ANDROID__
-    static const char* const how = "Share log sends the game's log, which has what ran last.";
+    static const char* const how = "Share Log sends the game's log, which has what ran last.";
 #else
     static const char* const how = "The game's log has what ran last: ";
     char log_url[3608];
@@ -589,7 +604,7 @@ static int fatal_screen(const char* msg) {
     panel.how = what;
     panel.focus = SNX_OVERLAY_ERROR_CLOSE;
     /* the log plat.c writes, in the state folder. Beside the game that is argv[0]'s folder, which may be relative (./
-       for ./MyGame): Share log and a file URI need an absolute path */
+       for ./MyGame): Share Log and a file URI need an absolute path */
     snprintf(log_path, sizeof log_path, "%s%s.log", g_statedir, g_exename);
     full = snx_absolute(log_path);
     if (full && strlen(full) < sizeof log_path) memcpy(log_path, full, strlen(full) + 1);
@@ -716,18 +731,33 @@ static int fatal_screen(const char* msg) {
    thread doesn't come (held up elsewhere), Windows' own box (it takes any thread) and none on Linux: the error is in
    the log and on stderr. Nothing for an unattended run, where nobody would close it */
 void win_fatal_box(const char* msg) {
-#ifdef SDL_PLATFORM_IOS
-    /* a phone shows no stderr and no log of the app's: the Files app shows this file, in the app's Documents */
+    /* beside the launcher's log (docs/USAGE.md#folders), whose Share Log sends it, for a game of a data folder: in that
+       folder's state folder; another folder's game beside its own log, or before it has one in its folder; on iOS in
+       the app's Documents' logs/, which the Files app shows, since a phone shows no stderr */
     {
-        FILE* file;
-        mkdir("logs", 0755);
-        file = fopen("logs/scarletnx-error.log", "a");
-        if (file) {
-            fprintf(file, "%s\n", msg);
-            fclose(file);
-        }
-    }
+#ifdef SDL_PLATFORM_IOS
+        char* folder = snx_strdup("logs");
+#else
+        char here[sizeof g_exedir], *moved, *folder;
+        size_t n = strlen(g_exedir);
+        snprintf(here, sizeof here, "%.*s", (int)(n ? n - 1 : 0), g_exedir); /* without its separator */
+        moved = snx_user_path(here[0] ? here : ".", SNX_USER_STATE);
+        folder = moved && strcmp(moved, here[0] ? here : ".") ? snx_menu_dir(here[0] ? here : ".", SNX_USER_STATE)
+                 : g_statedir[0]                              ? snx_strdup(g_statedir)
+                 : here[0]                                    ? snx_strdup(here)
+                                                              : NULL; /* nothing known yet: stderr has it */
+        free(moved);
 #endif
+        char* path = folder && !snx_mkdirs(folder) ? snx_path_join(folder, SNX_ERROR_LOG) : NULL;
+        char* line = snx_format("%s: %s", g_exename[0] ? g_exename : "scarletnx", msg);
+        if (path && snx_log_lines(path, line)) {
+            char why[256];
+            fprintf(stderr, "%s could not be written (%s)\n", path, snx_os_error(why, sizeof why));
+        }
+        free(line);
+        free(path);
+        free(folder);
+    }
     if (g_opt_headless || unattended_active()) return;
     if (SDL_IsMainThread()) {
         /* an error another thread left first: this one followed from it */
@@ -761,6 +791,18 @@ void win_fatal_box(const char* msg) {
 #endif
 }
 
+/* the window's title says so while the player has the game paused */
+static void title_paused(int paused) {
+    static const char mark[] = " (paused)";
+    const char* t = g_win ? SDL_GetWindowTitle(g_win) : NULL;
+    char title[1024];
+    size_t n;
+    if (!t) return;
+    n = strlen(t);
+    if (n >= sizeof mark - 1 && !strcmp(t + n - (sizeof mark - 1), mark)) n -= sizeof mark - 1;
+    snprintf(title, sizeof title, "%.*s%s", (int)n, t, paused ? mark : "");
+    SDL_SetWindowTitle(g_win, title);
+}
 static void hotkey(SDL_Keycode k) {
     switch (k) {
         case SDLK_F1: {
@@ -802,10 +844,27 @@ static void hotkey(SDL_Keycode k) {
                 LOG("showcase: off\n");
             break;
         }
+        case SDLK_F7: state_ask(STATE_SAVE, -1); break;
+        case SDLK_F8: state_ask(STATE_LOAD, -1); break;
+        case SDLK_F9: state_slot_next(); break;
+        case SDLK_F12: {
+            int on = !__atomic_load_n(&g_settings.stats, __ATOMIC_RELAXED);
+            __atomic_store_n(&g_settings.stats, on, __ATOMIC_RELAXED);
+            ini_set("stats", on ? "1" : "0");
+            if (on)
+                LOG("stats: on, stats_corner=%s\n", g_settings.stats_corner);
+            else
+                LOG("stats: off\n");
+            break;
+        }
 #if defined(SNX_TRACY)
-        case SDLK_F7: snx_tracy_capture_now(); break;
+        case SDLK_F10: snx_tracy_capture_now(); break;
 #endif
         case SDLK_F11: set_fullscreen(!g_fullscreen); break;
+        case SDLK_PAUSE:
+            game_pause_toggle();
+            title_paused(game_paused());
+            break;
     }
 }
 
@@ -827,6 +886,13 @@ static void menu_open(int open) {
 static void overlay_do(int action) {
     if (action == OVERLAY_EXIT) g_quit = 1;
     if (action == OVERLAY_CLOSE) menu_open(0);
+    /* the frontend's loop does them (state_poll), the menu closed first for a load: the game it goes back to shows */
+    if (action == OVERLAY_SAVE) state_ask(STATE_SAVE, overlay_slot());
+    if (action == OVERLAY_DELETE) state_ask(STATE_DELETE, overlay_slot());
+    if (action == OVERLAY_LOAD) {
+        menu_open(0);
+        state_ask(STATE_LOAD, overlay_slot());
+    }
     if (action == OVERLAY_EDIT) {
         menu_open(0);
         vpad_edit(1);
@@ -1183,13 +1249,20 @@ void video_poll(void) {
     }
     /* the scripted presses act like keys, stick keys included. Bits 16..23 (the stick directions as buttons) can be
        scripted too, but the stick keys (40..47) are no npad buttons */
+    static u64 script_was; /* the scripted buttons of the last poll: a Home press opens or closes the menu */
     u64 s = unattended_buttons(), k = keys_held | s;
+    if (s & ~script_was & SNX_SCRIPT_HOME) {
+        ui_lock();
+        menu_open(!overlay_shown());
+        ui_unlock();
+    }
+    script_was = s;
     u64 nonpad = (k & 0xFFFFull) | (s & 0xFF0000ull), b;
     i32 st[4], pad[4], pad0[4];
     u64 pb;
     input_key_sticks(k, st);
     i32 lx = st[0], ly = st[1], rx = st[2], ry = st[3];
-    pm_lock(&g_hle.hid.input_lock);
+    pm_lock(&g_host.hid.input_lock);
     touch_lift();
     /* Each SDL slot is one guest Npad. Keyboard, scripted and on-screen input also drive No1. */
     static u32 previous_ids[SNX_GAMEPADS];
@@ -1245,7 +1318,7 @@ void video_poll(void) {
         acts = vpad_actions();
         if (acts & SNX_VPAD_DO_MENU) menu_open(1);
         /* with the menu open, the pads move it: the on-screen controls' and the connected ones', sticks too */
-        overlay_do(overlay_controls(vb | pb, vs[0] || vs[1] ? vs : pad, SDL_GetTicks()));
+        overlay_do(overlay_controls(vb | pb | (s & 0xFFFFFull), vs[0] || vs[1] ? vs : pad, SDL_GetTicks()));
         ui_unlock();
         nonpad |= vb;
         if (vs[0] || vs[1]) {
@@ -1299,7 +1372,7 @@ void video_poll(void) {
         vpad_showcase_input(b, shown);
         ui_unlock();
     }
-    pm_unlock(&g_hle.hid.input_lock);
+    pm_unlock(&g_host.hid.input_lock);
 }
 
 char* backend_launcher_folder(void) {
@@ -1335,9 +1408,11 @@ void frontend_frame(void) {
     char p[1200];
     g_press.listening = 0; /* the game's first thread runs: its presses are its own */
     g_press.kind = PRESS_NONE;
-    /* the controls and the menu stay on the window while the game shows nothing new */
-    if (g_renderer->refresh &&
-        (overlay_shown() || vpad_shown() || __atomic_load_n(&g_settings.showcase, __ATOMIC_RELAXED)))
+    /* the controls and the menu stay on the window while the game shows nothing new, and so does its last frame while
+       it is paused */
+    if (g_renderer->refresh && (overlay_shown() || vpad_shown() || game_paused() || overlay_toasting(plat_ns()) ||
+                                __atomic_load_n(&g_settings.showcase, __ATOMIC_RELAXED) ||
+                                __atomic_load_n(&g_settings.stats, __ATOMIC_RELAXED)))
         g_renderer->refresh();
     if (g_shot_req) {
         g_shot_req = 0;
@@ -1353,6 +1428,9 @@ void frontend_frame(void) {
         snprintf(p, sizeof p, "%scaptures/screenshot_%04d%02d%02d_%02d%02d%02d", g_exedir, t.tm_year + 1900,
                  t.tm_mon + 1, t.tm_mday, t.tm_hour, t.tm_min, t.tm_sec);
         g_renderer->screenshot(p);
+        ui_lock();
+        overlay_toast("Screenshot saved in captures", plat_ns());
+        ui_unlock();
     }
     if (unattended_periodic_shot(p, sizeof p)) g_renderer->screenshot(p);
     if (unattended_done()) {

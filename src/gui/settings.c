@@ -23,6 +23,9 @@ static GuiSetting* row(GuiSettings* s, const char* section, const char* key, con
                                  : (size_t)((char*)v->text - (char*)s->values);
     k->size = type == GUI_KEY_WORD ? sizeof v->word : sizeof v->text;
     k->max = 0;
+    k->numeric = k->whole = 0;
+    k->lo = k->hi = 0;
+    k->def = NULL;
     v->key = key;
     return v;
 }
@@ -116,7 +119,16 @@ int gui_settings_read(GuiSettings* s, const char* runtime) {
         if (*field[8]) words = words_of(field[8], &free_words, &values);
         v = row(s, field[0], field[1], field[7], field[6], words, words ? GUI_KEY_WORD : GUI_KEY_TEXT);
         v->values = values;
+        v->type_text = !strcmp(field[3], "text");
+        if (!words && (field[3][0] == 'i' || field[3][0] == 'f')) { /* typed, not picked: a number of its range */
+            GuiThemeKey* k = &s->keys[s->count - 1];
+            k->numeric = 1;
+            k->whole = field[3][0] == 'i';
+            k->lo = strtod(field[4], NULL);
+            k->hi = strtod(field[5], NULL);
+        }
         v->fallback = v->def = field[2];
+        s->keys[s->count - 1].def = v->def; /* what a number's row shows when it is emptied */
         for (w = 1; words && words[w]; ++w) /* the word of the default's value */
             if (!strcmp(values ? values[w] : words[w], field[2])) v->fallback = words[w];
         if (page) {
@@ -227,6 +239,17 @@ void gui_settings_reset(GuiSettings* s, int row) {
     for (i = first; i < end && i < s->count; ++i) set(s, i, s->values[i].start);
     gui_settings_sync(s);
 }
+int gui_settings_at_start(const GuiSettings* s, int row) {
+    int i, first = row, end = row + 1;
+    if (row < 0 || row >= s->count) return 1;
+    if (s->values[row].kind) { /* a page's or an All's: their rows */
+        first = s->values[row].first;
+        end = first + s->values[row].count;
+    }
+    for (i = first; i < end && i < s->count; ++i)
+        if (strcmp(kept(s, i), s->values[i].start)) return 0;
+    return 1;
+}
 int gui_settings_changed(const GuiSettings* s) {
     int i, n = 0;
     for (i = 0; i < s->count; ++i)
@@ -312,6 +335,50 @@ static int own_on(const GuiSettings* s, const char* key) {
     const char* value = i < s->own ? picked(s, i) : NULL;
     return value && !strcmp(value, "on");
 }
+/* a and b the same value: the same number when both are one, else the same text */
+static int same_value(const char* a, const char* b) {
+    char *a_end, *b_end;
+    double x = strtod(a, &a_end), y = strtod(b, &b_end);
+    if (a_end != a && !*a_end && b_end != b && !*b_end) return x == y;
+    return !strcmp(a, b);
+}
+/* row i in the Debug section, or a page of it */
+static int debug_row(const GuiSettings* s, int i) {
+    const char* section = s->keys[i].section;
+    return !s->values[i].kind && section && !strncmp(section, "Debug", 5) && (!section[5] || section[5] == '/');
+}
+int gui_settings_debug(const GuiSettings* s, const char* ini, int picks, char* out, size_t size) {
+    size_t at = 0, bytes;
+    char *text = ini ? (char*)snx_read_file(ini, &bytes) : NULL, *key, *value;
+    const char** file = s->count ? (const char**)calloc((size_t)s->count, sizeof *file) : NULL; /* by row */
+    int count = 0, i;
+    SnxIni lines;
+    if (size) out[0] = 0;
+    if (text && file) {
+        snx_ini_start(&lines, text);
+        while (snx_ini_next(&lines, &key, &value))
+            if ((i = find(s, key)) < s->count) file[i] = value; /* the last one's, as the runtime reads it */
+    }
+    for (i = 0; i < s->count; ++i) {
+        const char* now = picks ? picked(s, i) : NULL;
+        const GuiSetting* v = &s->values[i];
+        if (!debug_row(s, i) || !v->def) continue;
+        if (!now) now = file && file[i] ? file[i] : v->def;
+        if (same_value(now, v->def)) continue;
+        if (at < size && v->type_text)
+            at += (size_t)snprintf(out + at, size - at, "%s%s", count ? ", " : "", v->key);
+        else if (at < size)
+            at += (size_t)snprintf(out + at, size - at, "%s%s=%s", count ? ", " : "", v->key, now);
+        ++count;
+    }
+    if (picks && own_on(s, "gdbstub")) {
+        if (at < size) snprintf(out + at, size - at, "%sgdbstub", count ? ", " : "");
+        ++count;
+    }
+    free(file);
+    free(text);
+    return count;
+}
 const char* gui_settings_tmpfs(const GuiSettings* s) { return own_on(s, "tmpfs") ? "--tmpfs" : NULL; }
 const char* gui_settings_extract(const GuiSettings* s) { return own_on(s, "extract") ? "--extract-container" : NULL; }
 size_t gui_settings_recompile(GuiSettings* s, const char** argv) {
@@ -327,6 +394,13 @@ size_t gui_settings_recompile(GuiSettings* s, const char** argv) {
         argv[n++] = s->values[i].option;
     }
     return n;
+}
+size_t gui_settings_one(GuiSettings* s, const char* key, const char** argv) {
+    int i = find(s, key);
+    if (i < s->own || i >= s->count || !picked(s, i)) return 0;
+    snprintf(s->values[i].option, sizeof s->values[i].option, "--%s=%s", key, picked(s, i));
+    argv[0] = s->values[i].option;
+    return 1;
 }
 size_t gui_settings_options(GuiSettings* s, int launch, const char** argv) {
     size_t n = 0;

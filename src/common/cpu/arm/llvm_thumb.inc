@@ -78,7 +78,8 @@ static void thumb_dual(ArmIR* a, const SnxThumb* t) {
 
 static void thumb_alu(ArmIR* a, const SnxThumb* t, int hi) {
     LLVMValueRef x, y, r;
-    int flags = hi ? t->op == 1 /* CMP hi sets flags */ : 1;
+    /* CMP hi sets flags; the 16-bit ones set them outside an IT block (CMP, CMN and TST always) */
+    int flags = hi ? t->op == 1 : !a->in_it;
     x = hi ? treg(a, t->rn) : treg(a, t->rd); /* most 16-bit ALU ops read rd as first source */
     y = treg(a, t->rm);
     if (t->op == ALU_ADD || t->op == ALU_SUB) {
@@ -95,15 +96,15 @@ static void thumb_alu(ArmIR* a, const SnxThumb* t, int hi) {
         case ALU_MVN: r = LLVMBuildNot(a->b, y, ""); setreg(a, t->rd, r); if (flags) nz(a, r, NULL, NULL); break;
         case ALU_TST: r = band(a, x, y); nz(a, r, NULL, NULL); break;
         case ALU_NEG: r = taddsub(a, c32(a, 0), y, 1, flags); setreg(a, t->rd, r); break;
-        case ALU_CMP: taddsub(a, x, y, 1, flags); break;
-        case ALU_CMN: taddsub(a, x, y, 0, flags); break;
+        case ALU_CMP: taddsub(a, x, y, 1, hi ? flags : 1); break;
+        case ALU_CMN: taddsub(a, x, y, 0, 1); break;
         case ALU_MUL: r = LLVMBuildMul(a->b, x, y, ""); setreg(a, t->rd, r); if (flags) nz(a, r, NULL, NULL); break;
         case ALU_LSL: case ALU_LSR: case ALU_ASR: case ALU_ROR: {
             LLVMValueRef carry;
             unsigned type = t->op == ALU_LSL ? 0 : t->op == ALU_LSR ? 1 : t->op == ALU_ASR ? 2 : 3;
             r = shift(a, x, type, y, 0, 0, &carry); /* register amount */
             setreg(a, t->rd, r);
-            nz(a, r, carry, NULL);
+            if (flags) nz(a, r, carry, NULL);
             break;
         }
         case ALU_ADC: r = arithmetic(a, x, y, flag(a, 29), flags); setreg(a, t->rd, r); break;
@@ -117,10 +118,10 @@ static void thumb_alu(ArmIR* a, const SnxThumb* t, int hi) {
 static void thumb_imm8(ArmIR* a, const SnxThumb* t) {
     LLVMValueRef imm = c32(a, t->imm), r;
     switch (t->op) {
-        case I8_MOV: r = imm; setreg(a, t->rd, r); nz(a, r, NULL, NULL); break;
+        case I8_MOV: r = imm; setreg(a, t->rd, r); if (!a->in_it) nz(a, r, NULL, NULL); break;
         case I8_CMP: taddsub(a, treg(a, t->rd), imm, 1, 1); break;
-        case I8_ADD: r = taddsub(a, treg(a, t->rd), imm, 0, 1); setreg(a, t->rd, r); break;
-        case I8_SUB: r = taddsub(a, treg(a, t->rd), imm, 1, 1); setreg(a, t->rd, r); break;
+        case I8_ADD: r = taddsub(a, treg(a, t->rd), imm, 0, !a->in_it); setreg(a, t->rd, r); break;
+        case I8_SUB: r = taddsub(a, treg(a, t->rd), imm, 1, !a->in_it); setreg(a, t->rd, r); break;
         default: trap(a, SNX_ARM_UNDEFINED, c32(a, a->word)); break;
     }
 }
@@ -143,20 +144,26 @@ static void thumb_pushpop(ArmIR* a, const SnxThumb* t) {
     LLVMValueRef sp = treg(a, 13);
     if (t->op == 0) { /* PUSH */
         LLVMValueRef start = sub(a, sp, c32(a, count * 4));
-        transfer_begin(a, start, count * 4, 4, 1, 1);
+        /* the ARM7TDMI transfers at an unaligned SP */
+        transfer_begin(a, start, count * 4, arm7tdmi(a) ? 1 : 4, 1, 1);
         unsigned index = 0;
-        for (i = 0; i < 8; ++i) if (list & (1u << i)) writemem(a, add(a, start, c32(a, index++ * 4)), 4, treg(a, i));
-        if (t->ra) writemem(a, add(a, start, c32(a, index * 4)), 4, treg(a, 14));
+        for (i = 0; i < 8; ++i) if (list & (1u << i)) writemem_list(a, add(a, start, c32(a, index++ * 4)), 4, treg(a, i));
+        if (t->ra) writemem_list(a, add(a, start, c32(a, index * 4)), 4, treg(a, 14));
         transfer_commit(a);
         setreg(a, 13, start);
     } else { /* POP */
         LLVMValueRef start = sp, value;
-        transfer_begin(a, start, count * 4, 4, 0, 1);
+        transfer_begin(a, start, count * 4, arm7tdmi(a) ? 1 : 4, 0, 1);
         unsigned index = 0;
-        for (i = 0; i < 8; ++i) if (list & (1u << i)) setreg(a, i, readmem(a, add(a, start, c32(a, index++ * 4)), 4, 0));
+        for (i = 0; i < 8; ++i) if (list & (1u << i)) setreg(a, i, readmem_list(a, add(a, start, c32(a, index++ * 4)), 4));
         if (t->ra) {
-            value = readmem(a, add(a, start, c32(a, index * 4)), 4, 0);
-            branch_exchange(a, value);
+            value = readmem_list(a, add(a, start, c32(a, index * 4)), 4);
+            /* The GBA's ARM7TDMI keeps the Thumb state on POP {pc}: interworking takes BX, and the
+               target keeps only bit 0 clear (ARMv8-A would branch with the state from bit 0). */
+            if (arm7tdmi(a))
+                setreg(a, 15, band(a, value, c32(a, ~1u)));
+            else
+                branch_exchange(a, value);
         }
         setreg(a, 13, add(a, start, c32(a, count * 4)));
     }
@@ -167,13 +174,19 @@ static void thumb_ldmstm(ArmIR* a, const SnxThumb* t) {
     for (i = 0; i < 8; ++i) count += (list >> i) & 1;
     if (!count) { trap(a, SNX_ARM_UNDEFINED, c32(a, a->word)); return; }
     LLVMValueRef base = treg(a, t->rn), values[8];
-    transfer_begin(a, base, count * 4, 4, !t->op, 1);
+    /* the ARM7TDMI transfers at an unaligned base */
+    transfer_begin(a, base, count * 4, arm7tdmi(a) ? 1 : 4, !t->op, 1);
     unsigned index = 0;
     if (t->op == 1) { /* LDMIA: snapshot before writeback */
         for (i = 0; i < 8; ++i) if (list & (1u << i)) values[i] = readmem(a, add(a, base, c32(a, index++ * 4)), 4, 0);
         for (i = 0; i < 8; ++i) if (list & (1u << i)) if (i != t->rn || !(t->flags & TH_WB)) setreg(a, i, values[i]);
-    } else { /* STMIA */
-        for (i = 0; i < 8; ++i) if (list & (1u << i)) writemem(a, add(a, base, c32(a, index++ * 4)), 4, treg(a, i));
+    } else { /* STMIA: the ARM7TDMI stores the written back base when the base is not the first in the list */
+        for (i = 0; i < 8; ++i)
+            if (list & (1u << i))
+                writemem_list(a, add(a, base, c32(a, index++ * 4)), 4,
+                              arm7tdmi(a) && i == (unsigned)t->rn && (t->flags & TH_WB) && (list & ((1u << i) - 1))
+                                  ? add(a, base, c32(a, count * 4))
+                                  : treg(a, i));
         transfer_commit(a);
     }
     if (t->flags & TH_WB) setreg(a, t->rn, add(a, base, c32(a, count * 4)));
@@ -257,8 +270,9 @@ static void thumb_mul(ArmIR* a, const SnxThumb* t) {
     else setreg(a, t->rd, sub(a, treg(a, t->ra), r)); /* MLS */
 }
 
+/* TBB reads the byte at Rn + Rm, TBH the halfword at Rn + Rm * 2 */
 static void thumb_table(ArmIR* a, const SnxThumb* t) {
-    LLVMValueRef base = add(a, treg(a, t->rn), treg(a, t->rm));
+    LLVMValueRef base = add(a, treg(a, t->rn), t->op ? shl(a, treg(a, t->rm), 1) : treg(a, t->rm));
     LLVMValueRef index = t->op ? readmem(a, base, 2, 0) : readmem(a, base, 1, 0);
     LLVMValueRef target = add(a, shl(a, index, 1), tpcbase(a));
     setreg(a, 15, target);
@@ -283,6 +297,12 @@ static uint32_t thumb_branch_offset(const SnxThumb* t, uint32_t pc, unsigned* th
         if (imm24 & 0x800000) imm24 |= 0xFF000000u;
         return (pc + 4) + (imm24 << 1);
     }
+}
+
+/* ITSTATE (firstcond:mask, advanced as the instructions run) in CPSR's IT bits: [1:0] in 26:25, [7:2] in 15:10 */
+#define IT_BITS 0x0600FC00u
+static void it_leave(ArmIR* a, unsigned itstate) {
+    PUT(a, cpsr, bor(a, GET(a, cpsr), c32(a, (itstate & 3u) << 25 | (itstate >> 2) << 10)));
 }
 
 /* Returns 1 when the instruction ends the block (control transfer). */
@@ -319,12 +339,12 @@ static int thumb_instruction(ArmIR* a, const SnxThumb* t) {
             LLVMValueRef carry, r = shift(a, treg(a, t->rm), t->op == ALU_LSL ? 0 : t->op == ALU_LSR ? 1 : 2,
                                           NULL, 1, t->imm, &carry);
             setreg(a, t->rd, r);
-            nz(a, r, carry, NULL);
+            if (!a->in_it) nz(a, r, carry, NULL);
             return 0;
         }
         case TH_ADDSUB: {
             LLVMValueRef y = (t->flags & TH_REG) ? treg(a, t->rm) : c32(a, t->imm);
-            setreg(a, t->rd, taddsub(a, treg(a, t->rn), y, t->op == ALU_SUB, 1));
+            setreg(a, t->rd, taddsub(a, treg(a, t->rn), y, t->op == ALU_SUB, !a->in_it));
             return 0;
         }
         case TH_IMM8: thumb_imm8(a, t); return 0;
@@ -354,7 +374,11 @@ static int thumb_instruction(ArmIR* a, const SnxThumb* t) {
             return t->shape == TH_LOAD && t->rd == 15; /* LoadWritePC: a branch, which ends the block */
         case TH_ADDR:
             if (t->rd == 13 && t->rn == 13) setreg(a, 13, taddsub(a, treg(a, 13), c32(a, t->imm), t->op == ALU_SUB, 0));
-            else setreg(a, t->rd, add(a, t->rn == 15 ? c32(a, (a->pc + 4) & ~3u) : treg(a, t->rn), c32(a, t->imm)));
+            else if (t->rd == 15) { /* a write to the PC branches */
+                setreg(a, 15, band(a, add(a, treg(a, t->rn), c32(a, t->imm)), c32(a, ~1u)));
+                return 1;
+            } else
+                setreg(a, t->rd, add(a, t->rn == 15 ? c32(a, (a->pc + 4) & ~3u) : treg(a, t->rn), c32(a, t->imm)));
             return 0;
         case TH_EXTEND: thumb_extend(a, t); return 0;
         case TH_PUSHPOP: thumb_pushpop(a, t); return t->op == 1 && t->ra;
@@ -370,9 +394,11 @@ static int thumb_instruction(ArmIR* a, const SnxThumb* t) {
             int stop;
             a->word = t->imm;
             a->pair = t->ra;
+            a->offset = t->rd;
             stop = instruction(a, (SnxA32Kind)t->op);
             a->word = word;
             a->pair = 0;
+            a->offset = 0;
             return stop;
         }
         case TH_DUAL: thumb_dual(a, t); return 0;
@@ -382,6 +408,7 @@ static int thumb_instruction(ArmIR* a, const SnxThumb* t) {
             switch (t->op) {
                 case BR_SVC: case BR_BKPT:
                     setreg(a, 15, c32(a, a->pc + 2));
+                    if (a->it_next) it_leave(a, a->it_next);
                     trap(a, t->op == BR_SVC ? SNX_ARM_SVC : SNX_ARM_BREAKPOINT, c32(a, t->imm));
                     return 1;
                 case BR_BX: case BR_BLX_REG:
@@ -427,17 +454,11 @@ static int thumb_instruction(ArmIR* a, const SnxThumb* t) {
     }
 }
 
-static unsigned thumb_ctz(unsigned v) {
-    unsigned n = 0;
-    while (!(v & 1)) {
-        v >>= 1;
-        ++n;
-    }
-    return n;
-}
-
 /* Emits one Thumb block: 16-bit and 32-bit instructions from the halfword
-   stream, honouring IT conditions, ending at a control transfer or the end. */
+   stream, honouring IT conditions, ending at a control transfer or the end. An IT block's conditions are the
+   block's, decided when it compiles: an instruction that traps under one that fails lets the block go on, a block
+   the code ends inside one (callers give the rest of the code) or an SVC or BKPT inside one leaves ITSTATE in
+   CPSR, and a block entered with ITSTATE there stops (SNX_ARM_IT_ENTRY, the ITSTATE its syndrome) */
 LLVMValueRef snx_thumb_llvm_block(LLVMModuleRef module, const char* name, const uint16_t* halfwords,
                                   size_t count, uint32_t pc, size_t* consumed) {
     return snx_thumb_llvm_block_ex(module, name, halfwords, count, pc, consumed, NULL);
@@ -447,7 +468,7 @@ LLVMValueRef snx_thumb_llvm_block_ex(LLVMModuleRef module, const char* name, con
     ArmIR a = {0};
     LLVMTypeRef ft;
     size_t used = 0;
-    unsigned it_len = 0, it_idx = 0, it_conds[4];
+    unsigned itstate = 0; /* ITSTATE before the instruction being emitted */
     if (consumed) *consumed = 0;
     if (!options_valid(options) || !module || !name || !*name || !halfwords || !count || count > 65536 || (pc & 1) ||
         LLVMGetNamedFunction(module, name) || LLVMGetNamedGlobal(module, name))
@@ -473,6 +494,11 @@ LLVMValueRef snx_thumb_llvm_block_ex(LLVMModuleRef module, const char* name, con
             c32(&a, pc));
     require(&a, cmp(&a, LLVMIntNE, band(&a, GET(&a, cpsr), c32(&a, SNX_ARM_T)), c32(&a, 0)), SNX_ARM_BAD_ENTRY,
             c32(&a, halfwords[0]));
+    {
+        LLVMValueRef cpsr = GET(&a, cpsr), itstate;
+        itstate = bor(&a, band(&a, lsr(&a, cpsr, 25), c32(&a, 3)), band(&a, lsr(&a, cpsr, 8), c32(&a, 0xFC)));
+        require(&a, cmp(&a, LLVMIntEQ, itstate, c32(&a, 0)), SNX_ARM_IT_ENTRY, itstate);
+    }
     require(&a, cmp(&a, LLVMIntEQ, band(&a, GET(&a, cpsr), c32(&a, SNX_ARM_E)), c32(&a, 0)), SNX_ARM_ENDIAN_UNSUPPORTED,
             c32(&a, halfwords[0]));
     memory_entry(&a);
@@ -496,18 +522,22 @@ LLVMValueRef snx_thumb_llvm_block_ex(LLVMModuleRef module, const char* name, con
             break;
         }
         a.pc = pc + (uint32_t)used * 2;
-        a.word = hw1;
+        a.word = len == TH_F32 ? (uint32_t)hw1 | ((uint32_t)hw2 << 16) : hw1; /* what an undefined one reports */
         next_pc = a.pc + len * 2;
         a.next = next_pc;
         setreg(&a, 15, c32(&a, a.pc));
-        instruction_fetch(&a, len == TH_F32 ? (uint32_t)hw1 | ((uint32_t)hw2 << 16) : hw1, len * 2);
-        if (it_idx < it_len) cond = it_conds[it_idx++];
+        instruction_fetch(&a, a.word, len * 2);
+        a.in_it = itstate != 0;
+        if (itstate) { /* ITAdvance */
+            cond = itstate >> 4;
+            itstate = itstate & 7 ? (itstate & 0xE0) | ((itstate << 1) & 0x1F) : 0;
+        }
+        a.it_next = itstate;
         if (cond != 14) {
             LLVMBasicBlockRef execute = block(&a, "execute"), skip = block(&a, "skip"), next = block(&a, "next");
             LLVMBuildCondBr(a.b, condition(&a, cond), execute, skip);
             LLVMPositionBuilderAtEnd(a.b, execute);
-            stop = thumb_instruction(&a, &t);
-            if (LLVMGetBasicBlockTerminator(LLVMGetInsertBlock(a.b))) stop = 1; /* trapped */
+            stop = thumb_instruction(&a, &t); /* one that traps here goes on when its condition fails */
             if (!LLVMGetBasicBlockTerminator(LLVMGetInsertBlock(a.b))) {
                 if (!stop) setreg(&a, 15, c32(&a, next_pc));
                 LLVMBuildBr(a.b, next);
@@ -522,16 +552,13 @@ LLVMValueRef snx_thumb_llvm_block_ex(LLVMModuleRef module, const char* name, con
             if (!stop) setreg(&a, 15, c32(&a, next_pc));
         }
         used += len;
-        if (t.shape == TH_IT) {
-            unsigned mask = t.imm & 15, firstcond = (t.imm >> 4) & 15, i;
-            it_len = 4 - thumb_ctz(mask);
-            it_idx = 0;
-            for (i = 0; i < it_len; ++i)
-                it_conds[i] = i == 0 ? firstcond : ((firstcond & 0xE) | ((mask >> (4 - i)) & 1));
-        }
+        if (t.shape == TH_IT) itstate = t.imm & 0xFF;
         if (stop) break;
     }
-    if (!LLVMGetBasicBlockTerminator(LLVMGetInsertBlock(a.b))) LLVMBuildRetVoid(a.b);
+    if (!LLVMGetBasicBlockTerminator(LLVMGetInsertBlock(a.b))) {
+        if (itstate) it_leave(&a, itstate); /* the code given ends inside an IT block */
+        LLVMBuildRetVoid(a.b);
+    }
     LLVMDisposeBuilder(a.b);
     if (consumed) *consumed = used;
     return a.fn;
